@@ -359,6 +359,8 @@ pub struct GcReport {
     pub max_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_protocol: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_executable_bytes: Option<u64>,
     /// Compiler candidates plus declared and archive records before collection.
     #[serde(default)]
     pub records: u64,
@@ -411,6 +413,9 @@ pub struct GcRequest {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_protocol: Option<u32>,
+    /// Separate budget for final executables; see `GcOptions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_executable_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

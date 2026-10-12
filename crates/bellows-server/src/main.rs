@@ -635,6 +635,7 @@ async fn gc(
         max_bytes: request.max_bytes,
         dry_run: request.dry_run,
         min_protocol: request.min_protocol,
+        max_executable_bytes: request.max_executable_bytes,
     };
     collect(&state, options).await.map(Json).map_err(internal)
 }

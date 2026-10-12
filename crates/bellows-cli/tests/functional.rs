@@ -2027,8 +2027,35 @@ fn collection_dry_runs_change_nothing_and_reuse_is_journaled() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|bucket| bucket["group"] == "kind" && bucket["label"] == "linked output"),
+            .any(|bucket| bucket["group"] == "kind" && bucket["label"] == "executable"),
         "{reused}"
+    );
+
+    // An executable budget of zero plans to evict the binary alone, however
+    // generous the overall budget, and keeps the library it links.
+    let executables = gc(&[
+        "--max-mb",
+        "100000",
+        "--max-executable-mb",
+        "0",
+        "--dry-run",
+    ]);
+    assert_eq!(executables["records_evicted"], 1, "{executables}");
+    assert_eq!(
+        executables["max_executable_bytes"], 0,
+        "the collection applied the executable budget: {executables}"
+    );
+    assert!(
+        executables["breakdown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|bucket| {
+                bucket["group"] == "kind"
+                    && bucket["label"] == "executable"
+                    && bucket["evicted_records"] == 1
+            }),
+        "{executables}"
     );
 
     // Within budget nothing is evicted; at zero every record goes, and the

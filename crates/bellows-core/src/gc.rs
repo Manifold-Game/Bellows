@@ -42,6 +42,14 @@ pub struct GcOptions {
     /// Evict every compiler candidate older than this protocol, whatever the
     /// budget. Such candidates are unreachable from current clients.
     pub min_protocol: Option<u32>,
+    /// A separate budget for final executables (binaries, test harnesses,
+    /// examples). The least recently used are evicted until the bytes only
+    /// they reference fit, before the overall budget is applied to every
+    /// record. Libraries, procedural macros and build scripts are never
+    /// evicted to make room for executables, which matters when one build
+    /// links far more than it compiles: by recency alone its newest outputs,
+    /// the links, would push out the libraries the next build needs most.
+    pub max_executable_bytes: Option<u64>,
 }
 
 /// Runs each batch of mutations; a server wraps them in its own write lock.
@@ -116,6 +124,10 @@ impl Store {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     Library,
+    /// A binary, test harness or example: a final link nothing else consumes.
+    Executable,
+    /// Procedural macros, dylibs and build-script programs: linked, but inputs
+    /// to other compilations.
     Linked,
     BuildScript,
     Declared,
@@ -126,6 +138,7 @@ impl Kind {
     fn label(self) -> &'static str {
         match self {
             Kind::Library => "library",
+            Kind::Executable => "executable",
             Kind::Linked => "linked output",
             Kind::BuildScript => "build-script run",
             Kind::Declared => "declared action",
@@ -347,19 +360,54 @@ impl Plan {
             .collect::<Vec<_>>();
         let mut evicted = vec![false; snapshot.units.len()];
         let mut freed = Vec::new();
-        for index in order {
-            let unit = &snapshot.units[index as usize];
-            if bytes_after <= options.max_bytes && !obsolete(unit) {
-                break;
+        let mut evict = |index: u32, bytes_after: &mut u64, executable_bytes: &mut u64| {
+            if evicted[index as usize] {
+                return;
             }
+            let unit = &snapshot.units[index as usize];
             evicted[index as usize] = true;
             for &blob in &unit.blobs {
                 remaining[blob as usize] -= 1;
                 if remaining[blob as usize] == 0 {
                     freed.push((blob, index));
-                    bytes_after = bytes_after.saturating_sub(snapshot.blobs[blob as usize].bytes);
+                    let bytes = snapshot.blobs[blob as usize].bytes;
+                    *bytes_after = bytes_after.saturating_sub(bytes);
+                    if unit.kind == Kind::Executable {
+                        *executable_bytes = executable_bytes.saturating_sub(bytes);
+                    }
                 }
             }
+        };
+        // Bytes that only executables reference: what evicting all of them
+        // would free.
+        let mut executable_bytes = snapshot
+            .referrers
+            .iter()
+            .enumerate()
+            .filter(|(_, referrers)| {
+                !referrers.is_empty()
+                    && referrers
+                        .iter()
+                        .all(|&unit| snapshot.units[unit as usize].kind == Kind::Executable)
+            })
+            .map(|(blob, _)| snapshot.blobs[blob].bytes)
+            .sum::<u64>();
+        if let Some(budget) = options.max_executable_bytes {
+            for &index in &order {
+                if executable_bytes <= budget {
+                    break;
+                }
+                if snapshot.units[index as usize].kind == Kind::Executable {
+                    evict(index, &mut bytes_after, &mut executable_bytes);
+                }
+            }
+        }
+        for index in order {
+            let unit = &snapshot.units[index as usize];
+            if bytes_after <= options.max_bytes && !obsolete(unit) {
+                break;
+            }
+            evict(index, &mut bytes_after, &mut executable_bytes);
         }
         Self {
             evicted,
@@ -437,6 +485,7 @@ impl Plan {
             dry_run: options.dry_run,
             max_bytes: options.max_bytes,
             min_protocol: options.min_protocol,
+            max_executable_bytes: options.max_executable_bytes,
             records: units.len() as u64,
             candidates: candidates.count() as u64,
             blobs: snapshot.blobs.len() as u64,
@@ -678,7 +727,18 @@ fn candidate_kind(crate_name: &str, artifacts: &[crate::Artifact]) -> Kind {
         let name = artifact.file_name.as_str();
         !(name.ends_with(".rlib") || name.ends_with(".rmeta") || name.ends_with(".d"))
     }) {
-        Kind::Linked
+        // A build script's program and any shared object (a procedural
+        // macro or dylib) feed other compilations; everything else linked is
+        // a final executable.
+        let shared_object = artifacts.iter().any(|artifact| {
+            let name = artifact.file_name.as_str();
+            name.ends_with(".so") || name.ends_with(".dylib") || name.ends_with(".dll")
+        });
+        if shared_object || crate_name.starts_with("build_script_") {
+            Kind::Linked
+        } else {
+            Kind::Executable
+        }
     } else {
         Kind::Library
     }
@@ -866,6 +926,19 @@ mod tests {
 
         /// Publishes a candidate whose only artifact is 100 bytes of `fill`.
         fn publish(&self, name: &str, fill: u8, created_ms: u64, protocol: u32) -> ActionCandidate {
+            self.publish_output(name, &format!("lib{name}.rlib"), fill, created_ms, protocol)
+        }
+
+        /// Publishes a candidate whose only artifact, `file_name`, is 100
+        /// bytes of `fill`.
+        fn publish_output(
+            &self,
+            name: &str,
+            file_name: &str,
+            fill: u8,
+            created_ms: u64,
+            protocol: u32,
+        ) -> ActionCandidate {
             let payload = vec![fill; 100];
             let digest = digest_bytes(&payload);
             self.store.put_blob(&digest, &payload).unwrap();
@@ -886,9 +959,9 @@ mod tests {
                 host_files: vec![],
                 env: vec![],
                 artifacts: vec![Artifact {
-                    file_name: format!("lib{name}.rlib"),
+                    file_name: file_name.into(),
                     digest,
-                    executable: false,
+                    executable: !file_name.ends_with(".rlib"),
                 }],
                 stdout: StreamArtifact {
                     digest: empty.clone(),
@@ -984,6 +1057,104 @@ mod tests {
         assert_eq!(report.bytes_after, 100);
         assert!(fixture.present(&older) && fixture.blob(&older));
         assert!(!fixture.present(&newer) && !fixture.blob(&newer));
+    }
+
+    #[test]
+    fn executables_are_classified_apart_from_inputs_to_other_compilations() {
+        let output = |file_name: &str| Artifact {
+            file_name: file_name.into(),
+            digest: String::new(),
+            executable: true,
+        };
+        let kind = |crate_name: &str, file_name: &str| {
+            candidate_kind(crate_name, &[output(file_name), output("dep.d")])
+        };
+        assert!(kind("suite", "suite-0123abcd") == Kind::Executable);
+        assert!(kind("flagship", "flagship.exe") == Kind::Executable);
+        assert!(kind("serde_derive", "libserde_derive-0123abcd.so") == Kind::Linked);
+        assert!(kind("serde_derive", "serde_derive-0123abcd.dll") == Kind::Linked);
+        assert!(kind("build_script_build", "build_script_build-0123abcd") == Kind::Linked);
+        assert!(kind("serde", "libserde-0123abcd.rlib") == Kind::Library);
+    }
+
+    #[test]
+    fn executables_never_push_out_libraries_under_their_own_budget() {
+        let fixture = Fixture::new("executables");
+        // Oldest first, as one build publishes them: a procedural macro, the
+        // library using it, then two test harnesses linking both.
+        let proc_macro =
+            fixture.publish_output("derive", "libderive-1.so", 1, 500, PROTOCOL_VERSION);
+        let library = fixture.publish("library", 2, 1_000, PROTOCOL_VERSION);
+        let older_test = fixture.publish_output("suite", "suite-1", 3, 2_000, PROTOCOL_VERSION);
+        let newer_test = fixture.publish_output("other", "other-1", 4, 3_000, PROTOCOL_VERSION);
+        // Publication times alone order them.
+        fixture.uses(&[]);
+        fixture.age_blobs();
+        let report = fixture
+            .store
+            .collect(
+                &GcOptions {
+                    max_executable_bytes: Some(100),
+                    ..fixture.options(300)
+                },
+                &unserialized,
+            )
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert_eq!(report.bytes_after, 300);
+        assert_eq!(report.max_executable_bytes, Some(100));
+        assert!(fixture.present(&proc_macro) && fixture.blob(&proc_macro));
+        assert!(fixture.present(&library) && fixture.blob(&library));
+        assert!(!fixture.present(&older_test) && !fixture.blob(&older_test));
+        assert!(fixture.present(&newer_test) && fixture.blob(&newer_test));
+        let executables = report
+            .breakdown
+            .iter()
+            .find(|bucket| bucket.group == "kind" && bucket.label == "executable")
+            .unwrap();
+        assert_eq!((executables.records, executables.evicted_records), (2, 1));
+    }
+
+    #[test]
+    fn without_an_executable_budget_recency_alone_decides() {
+        let fixture = Fixture::new("recency");
+        let library = fixture.publish("library", 1, 1_000, PROTOCOL_VERSION);
+        let test = fixture.publish_output("suite", "suite-1", 2, 2_000, PROTOCOL_VERSION);
+        // Publication times alone order them.
+        fixture.uses(&[]);
+        fixture.age_blobs();
+        let report = fixture
+            .store
+            .collect(&fixture.options(100), &unserialized)
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert!(!fixture.present(&library));
+        assert!(fixture.present(&test));
+    }
+
+    #[test]
+    fn the_overall_budget_still_applies_after_the_executable_budget() {
+        let fixture = Fixture::new("both-budgets");
+        let older = fixture.publish("older", 1, 1_000, PROTOCOL_VERSION);
+        let newer = fixture.publish("newer", 2, 2_000, PROTOCOL_VERSION);
+        let test = fixture.publish_output("suite", "suite-1", 3, 3_000, PROTOCOL_VERSION);
+        // Publication times alone order them.
+        fixture.uses(&[]);
+        fixture.age_blobs();
+        let report = fixture
+            .store
+            .collect(
+                &GcOptions {
+                    max_executable_bytes: Some(0),
+                    ..fixture.options(100)
+                },
+                &unserialized,
+            )
+            .unwrap();
+        assert_eq!(report.records_evicted, 2);
+        assert!(!fixture.present(&test));
+        assert!(!fixture.present(&older));
+        assert!(fixture.present(&newer));
     }
 
     #[test]

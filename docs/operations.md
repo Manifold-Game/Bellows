@@ -87,6 +87,17 @@ the budget. A blob is deleted only when no remaining record references it.
   directory a running `bellowsd` owns accepts only `--dry-run`.
 - `--min-protocol N` also evicts every compiler record older than protocol
   `N`, whatever the budget. Current clients can never use them.
+- `--max-executable-mb MEBIBYTES` gives final executables (binaries, test
+  harnesses, examples) their own budget inside `--max-mb`. The least recently
+  used executables are evicted first until the bytes only they reference fit;
+  then the overall budget applies to every record as usual. Use it when a
+  build links much more than it compiles, such as a CI lane linking hundreds
+  of test binaries: by recency alone the links, published last, would evict
+  the libraries the next build needs. Libraries, procedural macros, dylibs and
+  build-script programs are never evicted to make room for executables. The
+  report's kind breakdown lists executables separately from other linked
+  outputs. The client refuses to report success from a server too old to
+  apply it.
 - `bellowsd --max-store-gb GIB` (or `BELLOWS_MAX_STORE_GB`) collects to that
   budget every `--gc-interval-mins` (default 30). It is off unless set.
 

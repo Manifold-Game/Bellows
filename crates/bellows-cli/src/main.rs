@@ -124,6 +124,11 @@ enum Commands {
         /// Also evict every compiler record older than this protocol.
         #[arg(long)]
         min_protocol: Option<u32>,
+        /// Give final executables (binaries, test harnesses, examples) their
+        /// own budget, evicted least recently used first, so libraries,
+        /// procedural macros and build scripts never make room for them.
+        #[arg(long)]
+        max_executable_mb: Option<u64>,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -315,6 +320,7 @@ fn run_cli() -> Result<i32> {
             max_mb,
             dry_run,
             min_protocol,
+            max_executable_mb,
             json,
             local,
             cache_dir,
@@ -325,6 +331,7 @@ fn run_cli() -> Result<i32> {
                 max_bytes: max_mb.saturating_mul(1024 * 1024),
                 dry_run,
                 min_protocol,
+                max_executable_bytes: max_executable_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
             };
             let report = if let Some(directory) = store_dir {
                 collect_store_directory(&directory, &options)?
@@ -332,11 +339,17 @@ fn run_cli() -> Result<i32> {
                 // A dry run only reads: no maintenance on open.
                 local_store(cache_dir.as_deref(), !dry_run)?.collect_locally(&options)?
             } else {
-                Remote::new(&connection.server, connection.token)?.gc(&GcRequest {
+                let report = Remote::new(&connection.server, connection.token)?.gc(&GcRequest {
                     max_bytes: options.max_bytes,
                     dry_run,
                     min_protocol,
-                })?
+                    max_executable_bytes: options.max_executable_bytes,
+                })?;
+                // An older server ignores the field and applies only --max-mb.
+                if options.max_executable_bytes.is_some() && report.max_executable_bytes.is_none() {
+                    bail!("this server does not support --max-executable-mb; upgrade bellowsd")
+                }
+                report
             };
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -416,6 +429,12 @@ fn print_gc_report(report: &GcReport) {
         "{}",
         terminal::key_value(color, "budget", human_bytes(report.max_bytes))
     );
+    if let Some(budget) = report.max_executable_bytes {
+        println!(
+            "{}",
+            terminal::key_value(color, "executable budget", human_bytes(budget))
+        );
+    }
     println!(
         "{}",
         terminal::key_value(
