@@ -17,6 +17,16 @@ the same bytes differently.
 Backward compatibility can be added later through explicit decoders and
 migration tests. It must never be inferred from similar JSON shapes.
 
+## Version 0.3.15 / protocol 6 (unchanged)
+
+The latency work changes no wire format, record or key, so protocol 6 clients
+and servers of 0.3.0–0.3.15 interoperate in either order and no data
+directory moves. Clients fetch blobs in parallel, skip the empty blob, upload
+small blobs without a `HEAD`, and negotiate HTTP/2 over TLS; all of it uses the
+existing endpoints. `bellows relay` speaks the same protocol on both sides.
+`bellowsd` streams blob bodies instead of buffering them, with identical
+responses (`413` above `--max-blob-mb`, `400` on a digest mismatch).
+
 ## Version 0.3.0 / protocol 6
 
 Protocol 6 adds linked outputs, build-script runs, checkout pins, normalized

@@ -34,15 +34,17 @@ The showcase proves, with machine-checked assertions:
    publication-race protection.
 
 For the shorter compiler-cache correctness suite, run `./scripts/demo.sh`. It
-proves these seven Phase 1 behaviors in a disposable workspace:
+proves these eight Phase 1 behaviors in a disposable workspace:
 
 1. A cold runner compiles libraries with official `rustc` and publishes them.
 2. A fresh runner restores `.rmeta`, `.rlib`, and dep-info remotely.
 3. Restarting `bellowsd` retains the same durable cache.
 4. Editing a transitive `mod` file produces a safe miss naming that exact file.
 5. Two concurrent cold runners compile each identical library action once.
-6. Corrupted remote blobs fail integrity checks and are rebuilt, never used.
-7. Stopping `bellowsd` still leaves a successful ordinary Cargo build.
+6. Wrappers publishing through a standalone `bellows relay` have their
+   uploads drained on SIGTERM, and a fresh runner reuses them.
+7. Corrupted remote blobs fail integrity checks and are rebuilt, never used.
+8. Stopping `bellowsd` still leaves a successful ordinary Cargo build.
 
 Nothing from the demo is retained outside its temporary directory.
 
@@ -130,6 +132,13 @@ The second build uses a completely empty local target directory. Bellows checks
 its verified runner-local L1 before the organization cache; set `BELLOWS_L1=0`
 when measuring remote behavior in isolation.
 
+For a server across a network, `bellows run` puts a loopback relay between
+Cargo's wrapper processes and the server: one warm connection pool for the
+whole build, and uploads sent in the background, so a warm restore costs about
+two round trips per crate. Start `bellows relay` yourself when Cargo runs with
+`RUSTC_WRAPPER` set directly, as in CI. See
+[far servers](docs/operations.md#far-servers-the-relay).
+
 For authentication, start `bellowsd` with `--auth-token` or
 `BELLOWS_AUTH_TOKEN` and give the client the same environment variable. A
 non-loopback listener refuses to start without authentication. Server data is
@@ -207,6 +216,7 @@ still use consistent checkout layouts for the best hit rate.
 |---|---|
 | `bellows cargo <args>` | Run Cargo through the daemonless local cache |
 | `bellows run -- <command>` | Run Cargo-compatible work with the wrapper installed |
+| `bellows relay [--env-file F]` | Relay wrappers to a far server over warm connections, uploading in the background |
 | `bellows local -- <command>` | Run with a daemonless, durable user-level cache |
 | `bellows doctor` | Verify protocol, server, compiler, and fallback |
 | `bellows stats [--local]` | Show CAS size and decisions grouped as reused, rebuilt (with causes), not cacheable by design, and problems |
@@ -225,7 +235,9 @@ ceiling is 512 MiB and the default concurrent request ceiling is 128.
 Client connection and overall request timeouts can be bounded with
 `BELLOWS_CONNECT_TIMEOUT_MS` (100–30,000) and `BELLOWS_REQUEST_TIMEOUT_MS`
 (1,000–600,000). `BELLOWS_MAX_WAIT_MS` bounds single-flight waiting from zero
-to 600,000 ms.
+to 600,000 ms. `BELLOWS_FETCH_CONCURRENCY` (default 16) bounds one wrapper's
+parallel blob requests; `BELLOWS_RELAY`, `BELLOWS_RELAY_UPLOADS`,
+`BELLOWS_RELAY_SPOOL_MB` and `BELLOWS_RELAY_DRAIN_SECS` configure the relay.
 
 Terminal output uses aligned, Cargo-style status labels and semantic color.
 Color is automatic for interactive terminals and supported CI providers,

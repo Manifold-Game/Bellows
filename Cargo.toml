@@ -8,7 +8,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.14"
+version = "0.3.15"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/logan-mcduffie/Bellows"
@@ -20,7 +20,7 @@ axum = "0.8.9"
 blake3 = "1.8.3"
 clap = { version = "4.6.0", features = ["derive", "env"] }
 fs2 = "0.4.3"
-reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "http2", "stream"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tempfile = "3.24.0"

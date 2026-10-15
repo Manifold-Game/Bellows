@@ -796,27 +796,67 @@ impl Store {
     }
 
     pub fn put_blob(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
-        self.with_mutation_lock(|| self.put_blob_unlocked(expected, bytes))
-    }
-
-    fn put_blob_unlocked(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
         let actual = digest_bytes(bytes);
         if actual != expected {
             bail!("blob digest mismatch: expected {expected}, got {actual}")
         }
-        let path = self.blob_path(expected)?;
-        if path.exists() {
-            if self.read_blob(expected).is_ok() {
-                // A running collection keeps a blob offered again just now.
-                self.touch_blob(expected)?;
-                return Ok(false);
-            }
-            fs::remove_file(&path).with_context(|| format!("remove corrupt blob {expected}"))?;
+        let temp = self.blob_temp_path(expected)?;
+        let written = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
         }
+        self.commit_blob(expected, &temp)
+    }
+
+    /// A fresh temporary path beside the blob's final location, for writing
+    /// it before [`Store::commit_blob`]. Orphans are collected like any other
+    /// temporary file.
+    pub fn blob_temp_path(&self, digest: &str) -> Result<PathBuf> {
+        let path = self.blob_path(digest)?;
         let parent = path.parent().context("blob path has no parent")?;
         fs::create_dir_all(parent)?;
-        atomic_write(&path, bytes)?;
-        Ok(true)
+        Ok(parent.join(format!(
+            ".tmp-{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )))
+    }
+
+    /// Moves `temp`, a synced file the caller has verified hashes to
+    /// `expected`, into place. Only the existence check and the rename hold
+    /// the store's mutation lock, so hashing and writing a large blob never
+    /// block other writers or a collection. Returns false (and removes
+    /// `temp`) when a verified copy was already present, refreshing it so a
+    /// running collection keeps it.
+    pub fn commit_blob(&self, expected: &str, temp: &Path) -> Result<bool> {
+        let path = self.blob_path(expected)?;
+        let committed = self.with_mutation_lock(|| {
+            if path.exists() {
+                if self.read_blob(expected).is_ok() {
+                    self.touch_blob(expected)?;
+                    return Ok(false);
+                }
+                fs::remove_file(&path)
+                    .with_context(|| format!("remove corrupt blob {expected}"))?;
+            }
+            fs::rename(temp, &path).with_context(|| format!("move blob {expected} into place"))?;
+            sync_parent(&path)?;
+            Ok(true)
+        });
+        if !matches!(committed, Ok(true)) {
+            let _ = fs::remove_file(temp);
+        }
+        committed
     }
 
     pub fn read_blob(&self, digest: &str) -> Result<Vec<u8>> {
