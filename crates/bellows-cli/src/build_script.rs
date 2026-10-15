@@ -223,32 +223,39 @@ fn cached_run(
                 reasons.push(reason);
                 continue;
             }
-            let fetch = |digest: &str| -> Result<Vec<u8>> {
+            let fetch = |digests: &[&str]| -> Result<Vec<Vec<u8>>> {
                 match (remote, &stores.remote) {
                     (true, Some(client)) => {
-                        let bytes = client.blob(digest)?;
+                        let blobs = client.blobs(digests)?;
                         if let Some(store) = &stores.l1 {
-                            let _ = store.put_blob(digest, &bytes);
+                            for (digest, bytes) in digests.iter().zip(&blobs) {
+                                let _ = store.put_blob(digest, bytes);
+                            }
                         }
-                        Ok(bytes)
+                        Ok(blobs)
                     }
-                    _ => stores
-                        .l1
-                        .as_ref()
-                        .context("no local cache")?
-                        .read_blob(digest),
+                    _ => super::read_blobs(stores.l1.as_ref().context("no local cache")?, digests),
                 }
             };
-            match restore(candidate, &identity, out_dir, fetch) {
+            // The remote use is recorded during the restore, not after it.
+            let restored = std::thread::scope(|scope| {
+                let used = stores
+                    .remote
+                    .as_ref()
+                    .map(|client| scope.spawn(|| client.record_use(candidate)));
+                let restored = restore(candidate, &identity, out_dir, fetch);
+                if let Some(used) = used {
+                    let _ = used.join();
+                }
+                restored
+            });
+            match restored {
                 Ok(()) => {
                     if remote && let Some(store) = &stores.l1 {
                         let _ = store.put_candidate(candidate.clone(), 8);
                     }
                     if !remote && let Some(store) = &stores.l1 {
                         let _ = store.record_use(&candidate.static_key, &candidate.action_key);
-                    }
-                    if let Some(client) = &stores.remote {
-                        client.record_use(candidate);
                     }
                     record_event(
                         if remote { "hit" } else { "l1_hit" },
@@ -336,9 +343,7 @@ fn cached_run(
                 store.put_candidate(candidate.clone(), 8)?;
             }
             if let Some(remote) = &stores.remote {
-                for (digest, bytes) in blobs {
-                    remote.put_blob(&digest, bytes)?;
-                }
+                remote.put_blobs(blobs)?;
                 remote.put_candidate(&candidate)?;
             }
             let scope = if pinned {
@@ -814,7 +819,7 @@ fn restore(
     candidate: &ActionCandidate,
     identity: &Identity,
     out_dir: &Path,
-    fetch: impl Fn(&str) -> Result<Vec<u8>>,
+    fetch: impl FnOnce(&[&str]) -> Result<Vec<Vec<u8>>>,
 ) -> Result<()> {
     validate_candidate_manifest(candidate)?;
     let [artifact] = candidate.artifacts.as_slice() else {
@@ -823,10 +828,14 @@ fn restore(
     if artifact.file_name != TREE {
         bail!("unexpected build-script artifact {}", artifact.file_name)
     }
-    let archive = fetch(&artifact.digest)?;
+    let [archive, stdout, stderr]: [Vec<u8>; 3] = fetch(&[
+        &artifact.digest,
+        &candidate.stdout.digest,
+        &candidate.stderr.digest,
+    ])?
+    .try_into()
+    .map_err(|_| anyhow!("blob fetch returned the wrong number of blobs"))?;
     let files = unpack_tree(&archive)?;
-    let stdout = fetch(&candidate.stdout.digest)?;
-    let stderr = fetch(&candidate.stderr.digest)?;
     if stdout.len() as u64 != candidate.stdout.len || stderr.len() as u64 != candidate.stderr.len {
         bail!("build-script stream length does not match manifest")
     }

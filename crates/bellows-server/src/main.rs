@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, bail};
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
+use axum::serve::ListenerExt;
 use axum::{Json, Router};
 use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord,
@@ -16,6 +17,7 @@ use bellows_core::{
 };
 use clap::Parser;
 use fs2::FileExt;
+use futures_util::StreamExt;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -25,7 +27,9 @@ use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio_util::io::ReaderStream;
 use tower::limit::ConcurrencyLimitLayer;
 
 const MAX_JSON_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -66,6 +70,8 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    /// The largest blob `PUT /v1/blobs` accepts.
+    max_blob_bytes: u64,
     _server_lock: Arc<File>,
     auth_token: Option<String>,
     max_candidates: usize,
@@ -191,6 +197,7 @@ async fn serve() -> Result<()> {
     })?;
     let state = AppState {
         store,
+        max_blob_bytes: (args.max_blob_mb as u64).saturating_mul(1024 * 1024),
         _server_lock: Arc::new(server_lock),
         auth_token: args.auth_token,
         max_candidates: args.max_candidates,
@@ -230,17 +237,21 @@ async fn serve() -> Result<()> {
             "/v1/blobs/{digest}",
             get(get_blob).head(head_blob).put(put_blob),
         )
-        .layer(DefaultBodyLimit::max(
-            args.max_blob_mb.saturating_mul(1024 * 1024),
-        ));
+        // `put_blob` streams to disk and enforces `--max-blob-mb` itself.
+        .layer(DefaultBodyLimit::disable());
     let app = api
         .merge(blobs)
         .layer(ConcurrencyLimitLayer::new(args.max_requests))
         .with_state(state);
 
+    // Streamed blob bodies are written in pieces; without TCP_NODELAY the
+    // last piece of each can wait on a delayed acknowledgement.
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
-        .with_context(|| format!("bind {}", args.listen))?;
+        .with_context(|| format!("bind {}", args.listen))?
+        .tap_io(|stream| {
+            let _ = stream.set_nodelay(true);
+        });
     eprintln!(
         "bellowsd {} listening on http://{}",
         env!("CARGO_PKG_VERSION"),
@@ -302,24 +313,37 @@ async fn health(
     }))
 }
 
+/// Streams the blob from disk, so a large blob costs the server a read
+/// buffer rather than its whole size in memory. Clients verify every digest,
+/// so a blob corrupted on disk reads as a client-side integrity failure, the
+/// client rebuilds and republishes, and `PUT` (through `HEAD`) replaces it.
 async fn get_blob(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     headers: HeaderMap,
-) -> ApiResult<Vec<u8>> {
+) -> ApiResult<Response> {
     authorize(&state, &headers)?;
-    let store = state.store.clone();
-    tokio::task::spawn_blocking(move || {
-        store.read_blob(&digest).map_err(|error| {
-            if store.blob_path(&digest).is_ok_and(|p| !p.exists()) {
-                ApiError(StatusCode::NOT_FOUND, "blob not found".into())
-            } else {
-                internal(error)
-            }
-        })
-    })
-    .await
-    .map_err(internal)?
+    let path = state
+        .store
+        .blob_path(&digest)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError(StatusCode::NOT_FOUND, "blob not found".into()));
+        }
+        Err(error) => return Err(internal(error)),
+    };
+    let length = file.metadata().await.map_err(internal)?.len();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from_stream(ReaderStream::with_capacity(
+            file,
+            256 * 1024,
+        )))
+        .map_err(internal)
 }
 
 /// Existence check before an upload. It refreshes the blob's time so a
@@ -349,21 +373,38 @@ async fn head_blob(
     .map_err(internal)?
 }
 
+/// Streams the upload to a temporary file beside its final location while
+/// hashing it, then commits it with a rename. Memory stays bounded by the
+/// read buffer however large the blob, and the store lock is held only for
+/// the rename.
 async fn put_blob(
     State(state): State<AppState>,
     Path(digest): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> ApiResult<StatusCode> {
     authorize(&state, &headers)?;
-    if digest_bytes(&body) != digest {
+    let temp = state
+        .store
+        .blob_temp_path(&digest)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let received = receive_blob(&temp, body, state.max_blob_bytes).await;
+    let actual = match received {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    };
+    if actual != digest {
+        let _ = tokio::fs::remove_file(&temp).await;
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             "blob digest mismatch".into(),
         ));
     }
     let store = state.store.clone();
-    let created = tokio::task::spawn_blocking(move || store.put_blob(&digest, &body))
+    let created = tokio::task::spawn_blocking(move || store.commit_blob(&digest, &temp))
         .await
         .map_err(internal)?
         .map_err(internal)?;
@@ -372,6 +413,34 @@ async fn put_blob(
     } else {
         StatusCode::NO_CONTENT
     })
+}
+
+/// Writes `body` to `temp`, synced, and returns its digest.
+async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(temp)
+        .await
+        .map_err(internal)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0u64;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, format!("read upload: {error}")))?;
+        length += chunk.len() as u64;
+        if length > limit {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "blob exceeds the server's size limit".into(),
+            ));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(internal)?;
+    }
+    file.sync_all().await.map_err(internal)?;
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 async fn get_candidates(
@@ -400,6 +469,14 @@ async fn put_candidate(
             "action key does not match path".into(),
         ));
     }
+    // Verification rereads every referenced blob: do it off the async
+    // workers, which a large linked output would otherwise stall.
+    tokio::task::spawn_blocking(move || store_candidate(&state, candidate))
+        .await
+        .map_err(internal)?
+}
+
+fn store_candidate(state: &AppState, candidate: ActionCandidate) -> ApiResult<StatusCode> {
     let _guard = state
         .writes
         .lock()

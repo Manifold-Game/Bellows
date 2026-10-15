@@ -12,12 +12,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 bellows-core = { path = "../bellows-core" }
 blake3.workspace = true
 clap.workspace = true
 fs2.workspace = true
+futures-util = { version = "0.3.32", default-features = false }
+getrandom = "0.4"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio-util = { version = "0.7.18", features = ["io", "rt"] }
 memchr = "2.7"

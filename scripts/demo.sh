@@ -4,8 +4,12 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/bellows-demo.XXXXXX")"
 server_pid=""
+relay_pid=""
 
 cleanup() {
+  if [ -n "$relay_pid" ]; then
+    kill "$relay_pid" 2>/dev/null || true
+  fi
   if [ -n "$server_pid" ]; then
     kill "$server_pid" 2>/dev/null || true
     wait "$server_pid" 2>/dev/null || true
@@ -115,6 +119,47 @@ wait "$second"
 cat "$scratch/runner-d.log" "$scratch/runner-e.log" | grep -E 'WAITING|SHARED HIT|CACHE HIT|CACHE MISS' || true
 grep -q 'SHARED HIT' "$scratch/runner-d.log" "$scratch/runner-e.log"
 
+section "Relay: CI-style wrappers restore and publish through a standalone relay"
+relay_env="$scratch/relay.env"
+"$bellows" relay --server "$server" --env-file "$relay_env" >"$scratch/relay.log" 2>&1 &
+relay_pid=$!
+for _ in $(seq 1 100); do
+  [ -s "$relay_env" ] && break
+  sleep 0.1
+done
+relay_server="$(sed -n 's/^BELLOWS_SERVER=//p' "$relay_env")"
+relay_token="$(sed -n 's/^BELLOWS_AUTH_TOKEN=//p' "$relay_env")"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: Bearer wrong' "$relay_server/v1/health")" = 401 ]
+relay_build() {
+  rm -rf "$scratch/runner-r-target"
+  (
+    cd "$workspace"
+    CARGO_TARGET_DIR="$scratch/runner-r-target" BELLOWS_SERVER="$relay_server" \
+      BELLOWS_AUTH_TOKEN="$relay_token" RUSTC_WRAPPER="$bellows" cargo build
+  ) 2>&1 | tee "$1"
+}
+relay_build "$scratch/relay-restore.log"
+grep -q 'CACHE HIT.*forge_core' "$scratch/relay-restore.log"
+sed -i 's/    44/    45/' "$workspace/crates/forge-core/src/temperature.rs"
+# Outside the change guard's window: a source modified within 50 ms of a
+# compile's start is kept local, never published.
+sleep 0.2
+relay_build "$scratch/relay-publish.log"
+grep -q 'CACHE MISS.*forge_core' "$scratch/relay-publish.log"
+# SIGTERM drains the background uploads before the relay exits.
+kill -TERM "$relay_pid"
+wait "$relay_pid"
+relay_pid=""
+cat "$scratch/relay.log"
+grep -q 'PUBLISHED.*relay.*record' "$scratch/relay.log"
+rm -rf "$scratch/runner-s-target"
+(
+  cd "$workspace"
+  CARGO_TARGET_DIR="$scratch/runner-s-target" BELLOWS_RELAY=0 \
+    "$bellows" run --server "$server" -- cargo build
+) 2>&1 | tee "$scratch/relay-after.log"
+grep -q 'CACHE HIT.*forge_core' "$scratch/relay-after.log"
+
 section "Integrity: corrupt remote content and recover with a safe miss"
 while IFS= read -r victim; do
   printf 'deliberately corrupt' > "$victim"
@@ -139,5 +184,5 @@ rm -rf "$scratch/runner-g-target"
 )
 
 section "Demo complete"
-echo "Remote hits, transitive invalidation, single-flight, integrity recovery,"
-echo "and offline fallback all passed. Feed the forge. Skip the wait."
+echo "Remote hits, transitive invalidation, single-flight, relayed publication,"
+echo "integrity recovery and offline fallback all passed. Feed the forge. Skip the wait."

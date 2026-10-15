@@ -29,6 +29,7 @@ mod diagnostics;
 mod digests;
 mod leak;
 mod link;
+mod relay;
 mod restore;
 mod terminal;
 
@@ -62,6 +63,27 @@ enum Commands {
         cache_dir: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
+    },
+    /// Relay a build's wrappers to a remote server over warm connections,
+    /// publishing in the background. `bellows run` starts one itself for a
+    /// non-loopback server; start this one when Cargo runs with
+    /// RUSTC_WRAPPER set directly (as in CI), then point the wrappers at it.
+    Relay {
+        #[arg(long, env = "BELLOWS_SERVER", default_value = "http://127.0.0.1:7878")]
+        server: String,
+        #[arg(long, env = "BELLOWS_AUTH_TOKEN")]
+        token: Option<String>,
+        /// Loopback address to listen on (port 0 picks a free port).
+        #[arg(long, default_value = "127.0.0.1:0")]
+        listen: std::net::SocketAddr,
+        /// Write `BELLOWS_SERVER=` and `BELLOWS_AUTH_TOKEN=` lines for the
+        /// wrappers here (mode 0600), once the relay is listening.
+        #[arg(long)]
+        env_file: Option<PathBuf>,
+        /// Directory under which accepted blobs wait for upload, in a fresh
+        /// subdirectory removed on exit (default: the state directory).
+        #[arg(long)]
+        spool_dir: Option<PathBuf>,
     },
     /// Check server connectivity and the local toolchain.
     Doctor {
@@ -265,6 +287,13 @@ fn run_cli() -> Result<i32> {
             command,
         } => run_command(server, token, command),
         Commands::Local { cache_dir, command } => run_local_command(cache_dir, command),
+        Commands::Relay {
+            server,
+            token,
+            listen,
+            env_file,
+            spool_dir,
+        } => run_relay(server, token, listen, env_file, spool_dir),
         Commands::Doctor { server, token } => {
             doctor(&server, token.as_deref())?;
             Ok(0)
@@ -532,16 +561,49 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
         );
     }
     let wrapper = env::current_exe()?.canonicalize()?;
+    let relay = if unreachable.is_none() && relay_wanted(&server)? {
+        match start_relay(
+            &server,
+            token.clone(),
+            "127.0.0.1:0".parse()?,
+            None,
+            &state_dir,
+        ) {
+            Ok(relay) => Some(relay),
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    terminal::warning(
+                        terminal::stderr_color(),
+                        "relay disabled",
+                        &format!("wrappers connect to {server} directly: {error:#}")
+                    )
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut child = Command::new(program);
     child
         .args(arguments)
         .env("RUSTC_WRAPPER", &wrapper)
-        .env("BELLOWS_SERVER", &server)
         .env_remove("BELLOWS_LOCAL_ONLY")
         .env("BELLOWS_WORKSPACE", &workspace)
         .env("BELLOWS_STATE_DIR", &state_dir);
-    if let Some(token) = token {
-        child.env("BELLOWS_AUTH_TOKEN", token);
+    match &relay {
+        Some(relay) => {
+            child
+                .env("BELLOWS_SERVER", &relay.url)
+                .env("BELLOWS_AUTH_TOKEN", &relay.token);
+        }
+        None => {
+            child.env("BELLOWS_SERVER", &server);
+            if let Some(token) = token {
+                child.env("BELLOWS_AUTH_TOKEN", token);
+            }
+        }
     }
     eprintln!(
         "{}",
@@ -556,6 +618,9 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
     let result = child.status().context("start wrapped command");
+    if let Some(relay) = relay {
+        finish_relay(relay)?;
+    }
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
     if let Some(message) = &unreachable {
         eprintln!(
@@ -581,6 +646,176 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
         }
     }
     Ok(result?.code().unwrap_or(1))
+}
+
+/// Whether `bellows run` puts a relay between its wrappers and `server`:
+/// `BELLOWS_RELAY=1` or `0` decides, and otherwise any server off this host
+/// gets one (a loopback server has no round trip worth hiding).
+fn relay_wanted(server: &str) -> Result<bool> {
+    match env::var("BELLOWS_RELAY").as_deref() {
+        Ok("1") => return Ok(true),
+        Ok("0") => return Ok(false),
+        Ok(other) if !other.is_empty() => bail!("BELLOWS_RELAY must be 0 or 1, not {other}"),
+        _ => {}
+    }
+    let url = Url::parse(server).context("parse Bellows server URL")?;
+    let host = url.host_str().unwrap_or_default();
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Ok(match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => !host.is_empty() && !host.eq_ignore_ascii_case("localhost"),
+    })
+}
+
+fn bounded_env(name: &str, default: u64, minimum: u64, maximum: u64) -> Result<u64> {
+    let Ok(value) = env::var(name) else {
+        return Ok(default);
+    };
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("{name} must be a whole number"))?;
+    if !(minimum..=maximum).contains(&parsed) {
+        bail!("{name} must be between {minimum} and {maximum}")
+    }
+    Ok(parsed)
+}
+
+fn start_relay(
+    server: &str,
+    token: Option<String>,
+    listen: std::net::SocketAddr,
+    spool_dir: Option<PathBuf>,
+    state_dir: &Path,
+) -> Result<relay::Relay> {
+    if !listen.ip().is_loopback() {
+        bail!("the relay listens on loopback only, not {listen}")
+    }
+    let base = Remote::new(server, token.clone())?.base;
+    // A directory of its own, which the relay removes when it finishes.
+    let spool_dir = spool_dir
+        .unwrap_or_else(|| state_dir.to_path_buf())
+        .join(format!("relay-spool-{}-{}", std::process::id(), now_ms()));
+    relay::Relay::start(relay::RelayOptions {
+        upstream: base,
+        upstream_token: token.filter(|value| !value.is_empty()),
+        listen,
+        spool_dir,
+        spool_limit_bytes: bounded_env("BELLOWS_RELAY_SPOOL_MB", 4096, 1, 1 << 20)? * 1024 * 1024,
+        upload_concurrency: bounded_env("BELLOWS_RELAY_UPLOADS", 8, 1, 64)? as usize,
+        connect_timeout: bounded_timeout(
+            "BELLOWS_CONNECT_TIMEOUT_MS",
+            env::var("BELLOWS_CONNECT_TIMEOUT_MS").ok().as_deref(),
+            2_000,
+            100,
+            30_000,
+        )?,
+    })
+}
+
+/// Waits for the relay's background uploads and says what they did.
+fn finish_relay(relay: relay::Relay) -> Result<()> {
+    let drain = Duration::from_secs(bounded_env("BELLOWS_RELAY_DRAIN_SECS", 600, 1, 86_400)?);
+    let summary = relay.finish(drain);
+    let quiet = summary.blobs_uploaded == 0
+        && summary.blobs_present == 0
+        && summary.records == 0
+        && summary.failures == 0
+        && !summary.abandoned;
+    if !quiet {
+        let color = terminal::stderr_color();
+        let line = if summary.failures > 0 || summary.abandoned {
+            terminal::warning(color, "relay", &summary.describe())
+        } else {
+            terminal::status(color, "published", "relay", &summary.describe())
+        };
+        eprintln!("{line}");
+    }
+    Ok(())
+}
+
+fn run_relay(
+    server: String,
+    token: Option<String>,
+    listen: std::net::SocketAddr,
+    env_file: Option<PathBuf>,
+    spool_dir: Option<PathBuf>,
+) -> Result<i32> {
+    let workspace = env::current_dir()?;
+    let state_dir = state_dir(&workspace);
+    if let Err(error) = Remote::new(&server, token.clone()).and_then(|remote| remote.reachable()) {
+        eprintln!(
+            "{}",
+            terminal::attention(
+                terminal::stderr_color(),
+                "server unreachable",
+                &format!(
+                    "{server}: {error:#}; the relay starts anyway and wrappers fall back while it stays down"
+                )
+            )
+        );
+    }
+    let relay = start_relay(&server, token, listen, spool_dir, &state_dir)?;
+    if let Some(path) = &env_file {
+        write_private_file(
+            path,
+            format!(
+                "BELLOWS_SERVER={}\nBELLOWS_AUTH_TOKEN={}\n",
+                relay.url, relay.token
+            )
+            .as_bytes(),
+        )
+        .with_context(|| format!("write relay environment {}", path.display()))?;
+    }
+    eprintln!(
+        "{}",
+        terminal::status(
+            terminal::stderr_color(),
+            "relaying",
+            &relay.url,
+            &format!("to {server}; stop with SIGTERM or Ctrl-C to drain uploads"),
+        )
+    );
+    relay.block_on(async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {},
+                    _ = terminate.recv() => {},
+                }
+                return;
+            }
+        }
+        let _ = tokio::signal::ctrl_c().await;
+    });
+    if let Some(path) = &env_file {
+        let _ = fs::remove_file(path);
+    }
+    finish_relay(relay)?;
+    Ok(0)
+}
+
+/// Writes `bytes` to `path` readable only by this user, replacing it whole.
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".bellows-relay-env-")
+        .tempfile_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
 }
 
 fn unreachable_message(server: &str, error: &anyhow::Error) -> String {
@@ -701,6 +936,61 @@ struct Remote {
     base: String,
     token: Option<String>,
     client: Client,
+    /// Most blob requests one restore or publication has in flight at once.
+    fetch_concurrency: usize,
+}
+
+/// Blobs at or below this size are uploaded without asking first whether the
+/// server has them: the upload costs about the same round trip as the
+/// question, and the server keeps (and refreshes) a copy it already holds.
+const UPLOAD_WITHOUT_ASKING_BYTES: usize = 256 * 1024;
+
+fn fetch_concurrency() -> Result<usize> {
+    let name = "BELLOWS_FETCH_CONCURRENCY";
+    let Ok(value) = env::var(name) else {
+        return Ok(16);
+    };
+    let parsed = value
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a whole number"))?;
+    if !(1..=64).contains(&parsed) {
+        bail!("{name} must be between 1 and 64")
+    }
+    Ok(parsed)
+}
+
+/// Applies `f` to every item on up to `limit` threads, keeping input order.
+/// Remote requests are latency-bound, so a restore that needs several blobs
+/// waits about one round trip instead of one per blob.
+fn parallel_map<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() <= 1 || limit <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots = items
+        .iter()
+        .map(|_| std::sync::Mutex::new(None))
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        for _ in 0..limit.min(items.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(index) else { break };
+                    let result = f(item);
+                    *slots[index].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every item was mapped")
+        })
+        .collect()
 }
 
 impl Remote {
@@ -734,10 +1024,18 @@ impl Remote {
         Ok(Self {
             base: parsed.as_str().trim_end_matches('/').to_owned(),
             token: token.filter(|value| !value.is_empty()),
+            // One pooled client per process: requests after the first reuse its
+            // connection. Over HTTPS, ALPN picks HTTP/2, so a restore's parallel
+            // blob requests share that one connection (and its TLS handshake)
+            // instead of opening one each. Plain HTTP stays HTTP/1.1.
             client: Client::builder()
                 .connect_timeout(connect_timeout)
                 .timeout(request_timeout)
+                .tcp_nodelay(true)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .http2_adaptive_window(true)
                 .build()?,
+            fetch_concurrency: fetch_concurrency()?,
         })
     }
 
@@ -801,12 +1099,70 @@ impl Remote {
         Ok(bytes)
     }
 
+    /// Fetches and verifies several blobs, in request order. Requests run in
+    /// parallel; a repeated digest is fetched once, and the empty blob (most
+    /// compiler streams) is never requested, since its digest is its proof.
+    fn blobs(&self, digests: &[&str]) -> Result<Vec<Vec<u8>>> {
+        let empty = digest_bytes(&[]);
+        let mut seen = BTreeSet::new();
+        let unique = digests
+            .iter()
+            .copied()
+            .filter(|digest| *digest != empty && seen.insert(*digest))
+            .collect::<Vec<_>>();
+        let fetched = parallel_map(&unique, self.fetch_concurrency, |digest| self.blob(digest));
+        let mut by_digest = BTreeMap::new();
+        for (digest, result) in unique.iter().zip(fetched) {
+            by_digest.insert(*digest, result?);
+        }
+        let mut remaining = BTreeMap::<&str, usize>::new();
+        for digest in digests {
+            *remaining.entry(digest).or_default() += 1;
+        }
+        Ok(digests
+            .iter()
+            .map(|digest| {
+                if *digest == empty {
+                    return Vec::new();
+                }
+                let left = remaining.get_mut(digest).expect("counted above");
+                *left -= 1;
+                if *left == 0 {
+                    by_digest.remove(digest).expect("fetched above")
+                } else {
+                    by_digest[digest].clone()
+                }
+            })
+            .collect())
+    }
+
+    /// Uploads several blobs in parallel; see [`Remote::put_blob`].
+    fn put_blobs(&self, blobs: impl IntoIterator<Item = (String, Vec<u8>)>) -> Result<()> {
+        let blobs = blobs
+            .into_iter()
+            .map(|blob| std::sync::Mutex::new(Some(blob)))
+            .collect::<Vec<_>>();
+        for result in parallel_map(&blobs, self.fetch_concurrency, |slot| {
+            let (digest, bytes) = slot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+                .expect("each blob is uploaded once");
+            self.put_blob(&digest, bytes)
+        }) {
+            result?;
+        }
+        Ok(())
+    }
+
     fn put_blob(&self, digest: &str, bytes: Vec<u8>) -> Result<()> {
-        let present = self
-            .auth(self.client.head(format!("{}/v1/blobs/{digest}", self.base)))
-            .send()?;
-        if present.status().is_success() {
-            return Ok(());
+        if bytes.len() > UPLOAD_WITHOUT_ASKING_BYTES {
+            let present = self
+                .auth(self.client.head(format!("{}/v1/blobs/{digest}", self.base)))
+                .send()?;
+            if present.status().is_success() {
+                return Ok(());
+            }
         }
         self.auth(self.client.put(format!("{}/v1/blobs/{digest}", self.base)))
             .body(bytes)
@@ -2749,12 +3105,21 @@ fn try_candidates(
             );
             continue;
         }
-        match restore(remote, l1, invocation, identity, candidate) {
+        // The use is recorded while the blobs download rather than after, so
+        // it costs no round trip of its own. A candidate that then fails its
+        // restore keeps a fresher time than it earned; that only delays its
+        // collection.
+        let restored = thread::scope(|scope| {
+            let used = scope.spawn(|| remote.record_use(candidate));
+            let restored = restore(remote, l1, invocation, identity, candidate);
+            let _ = used.join();
+            restored
+        });
+        match restored {
             Ok(()) => {
                 if let Some(store) = l1 {
                     let _ = store.put_candidate(candidate.clone(), 8);
                 }
-                remote.record_use(candidate);
                 record_event(
                     "hit",
                     &invocation.crate_name,
@@ -2794,13 +3159,19 @@ fn try_l1_candidates(
             );
             continue;
         }
-        match restore_l1(store, invocation, identity, candidate) {
+        // Both stores collect least recently used records first. The remote
+        // use is recorded while the outputs are written, not after.
+        let restored = thread::scope(|scope| {
+            let used = remote.map(|remote| scope.spawn(|| remote.record_use(candidate)));
+            let restored = restore_l1(store, invocation, identity, candidate);
+            if let Some(used) = used {
+                let _ = used.join();
+            }
+            restored
+        });
+        match restored {
             Ok(()) => {
-                // Both stores collect least recently used records first.
                 let _ = store.record_use(&candidate.static_key, &candidate.action_key);
-                if let Some(remote) = remote {
-                    remote.record_use(candidate);
-                }
                 record_event(
                     "l1_hit",
                     &invocation.crate_name,
@@ -2857,13 +3228,23 @@ fn restore(
     identity: &Identity,
     candidate: &ActionCandidate,
 ) -> Result<()> {
-    restore_with(invocation, identity, candidate, |digest| {
-        let bytes = remote.blob(digest)?;
+    restore_with(invocation, identity, candidate, |digests| {
+        let blobs = remote.blobs(digests)?;
         if let Some(store) = l1 {
-            let _ = store.put_blob(digest, &bytes);
+            for (digest, bytes) in digests.iter().zip(&blobs) {
+                let _ = store.put_blob(digest, bytes);
+            }
         }
-        Ok(bytes)
+        Ok(blobs)
     })
+}
+
+/// Reads several blobs from a store, in request order.
+fn read_blobs(store: &Store, digests: &[&str]) -> Result<Vec<Vec<u8>>> {
+    digests
+        .iter()
+        .map(|digest| store.read_blob(digest))
+        .collect()
 }
 
 fn restore_l1(
@@ -2872,19 +3253,20 @@ fn restore_l1(
     identity: &Identity,
     candidate: &ActionCandidate,
 ) -> Result<()> {
-    restore_with(invocation, identity, candidate, |digest| {
-        store.read_blob(digest)
+    restore_with(invocation, identity, candidate, |digests| {
+        read_blobs(store, digests)
     })
     .context("L1")
 }
 
 /// Verify the manifest describes exactly this unit's outputs, fetch and verify
-/// every blob, then write each output atomically with its mode.
+/// every blob (in one batch, so a remote fetch costs about one round trip),
+/// then write each output atomically with its mode.
 fn restore_with(
     invocation: &Invocation,
     identity: &Identity,
     candidate: &ActionCandidate,
-    fetch: impl Fn(&str) -> Result<Vec<u8>>,
+    fetch: impl FnOnce(&[&str]) -> Result<Vec<Vec<u8>>>,
 ) -> Result<()> {
     validate_candidate_manifest(candidate)?;
     let supplied = candidate
@@ -2902,7 +3284,6 @@ fn restore_with(
             bail!("manifest is missing expected output {expected}")
         }
     }
-    let mut downloaded = Vec::with_capacity(candidate.artifacts.len());
     for artifact in &candidate.artifacts {
         let allowed = match invocation.kind {
             OutputKind::Library => invocation.expected_names.contains(&artifact.file_name),
@@ -2911,10 +3292,27 @@ fn restore_with(
         if !allowed {
             bail!("manifest contains unexpected output {}", artifact.file_name)
         }
-        downloaded.push((artifact, fetch(&artifact.digest)?));
     }
-    let stdout_blob = fetch(&candidate.stdout.digest)?;
-    let stderr_blob = fetch(&candidate.stderr.digest)?;
+    let digests = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.digest.as_str())
+        .chain([
+            candidate.stdout.digest.as_str(),
+            candidate.stderr.digest.as_str(),
+        ])
+        .collect::<Vec<_>>();
+    let mut blobs = fetch(&digests)?;
+    if blobs.len() != digests.len() {
+        bail!(
+            "blob fetch returned {} of {} blobs",
+            blobs.len(),
+            digests.len()
+        )
+    }
+    let stderr_blob = blobs.pop().expect("stderr requested");
+    let stdout_blob = blobs.pop().expect("stdout requested");
+    let downloaded = candidate.artifacts.iter().zip(blobs).collect::<Vec<_>>();
     if stdout_blob.len() as u64 != candidate.stdout.len
         || stderr_blob.len() as u64 != candidate.stderr.len
     {
@@ -3936,9 +4334,7 @@ fn tee(mut reader: impl Read, mut writer: impl Write) -> Result<Vec<u8>> {
 
 fn publish(remote: &Remote, captured: Captured) -> Result<String> {
     validate_candidate_manifest(&captured.candidate).context("validate captured candidate")?;
-    for (digest, bytes) in captured.blobs {
-        remote.put_blob(&digest, bytes)?;
-    }
+    remote.put_blobs(captured.blobs)?;
     let action_key = captured.candidate.action_key.clone();
     remote.put_candidate(&captured.candidate)?;
     Ok(action_key)
@@ -4517,10 +4913,12 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
                 bail!("cannot publish an empty archive")
             }
             let mut artifacts = Vec::new();
+            let mut blobs = Vec::new();
             for (artifact, bytes) in files {
-                remote.put_blob(&artifact.digest, bytes)?;
+                blobs.push((artifact.digest.clone(), bytes));
                 artifacts.push(artifact);
             }
+            remote.put_blobs(blobs)?;
             artifacts.sort_by(|left, right| left.file_name.cmp(&right.file_name));
             let manifest = ArchiveManifest {
                 protocol: PROTOCOL_VERSION,
@@ -4555,10 +4953,12 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
                 .archive(&name)?
                 .with_context(|| format!("archive {name} does not exist"))?;
             validate_archive_manifest(&manifest)?;
-            let mut staged = Vec::with_capacity(manifest.files.len());
-            for artifact in &manifest.files {
-                staged.push((artifact, remote.blob(&artifact.digest)?));
-            }
+            let digests = manifest
+                .files
+                .iter()
+                .map(|artifact| artifact.digest.as_str())
+                .collect::<Vec<_>>();
+            let staged = manifest.files.iter().zip(remote.blobs(&digests)?);
             fs::create_dir_all(&path)?;
             let restore_root = path.canonicalize()?;
             for (artifact, bytes) in staged {
@@ -4636,9 +5036,11 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
         return Ok(());
     }
 
-    for (artifact, bytes) in &inputs_with_bytes {
-        remote.put_blob(&artifact.digest, bytes.clone())?;
-    }
+    remote.put_blobs(
+        inputs_with_bytes
+            .iter()
+            .map(|(artifact, bytes)| (artifact.digest.clone(), bytes.clone())),
+    )?;
     let record = if remote_execution {
         let response = remote.execute(&request)?;
         println!(
@@ -4657,9 +5059,7 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
         response.record
     } else {
         let (record, blobs) = execute_local_declared(&workspace, request, &inputs_with_bytes)?;
-        for (digest, bytes) in blobs {
-            remote.put_blob(&digest, bytes)?;
-        }
+        remote.put_blobs(blobs)?;
         remote.put_declared(&record)?;
         println!(
             "{}",
@@ -4934,13 +5334,16 @@ fn restore_declared_record(
     record: &DeclaredActionRecord,
 ) -> Result<()> {
     validate_declared_record(record)?;
-    let mut staged = Vec::with_capacity(record.outputs.len());
-    for artifact in &record.outputs {
-        let bytes = remote.blob(&artifact.digest)?;
-        staged.push((artifact, bytes));
-    }
-    let stdout = remote.blob(&record.stdout.digest)?;
-    let stderr = remote.blob(&record.stderr.digest)?;
+    let digests = record
+        .outputs
+        .iter()
+        .map(|artifact| artifact.digest.as_str())
+        .chain([record.stdout.digest.as_str(), record.stderr.digest.as_str()])
+        .collect::<Vec<_>>();
+    let mut blobs = remote.blobs(&digests)?;
+    let stderr = blobs.pop().context("stderr blob missing")?;
+    let stdout = blobs.pop().context("stdout blob missing")?;
+    let staged = record.outputs.iter().zip(blobs).collect::<Vec<_>>();
     if stdout.len() as u64 != record.stdout.len || stderr.len() as u64 != record.stderr.len {
         bail!("declared stream length does not match manifest")
     }

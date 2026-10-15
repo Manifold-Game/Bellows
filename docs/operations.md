@@ -67,6 +67,85 @@ Rolling mixed-version deployments are unsupported. A protocol mismatch is a
 clean miss or an explicit doctor failure, never authorization to restore an old
 artifact.
 
+## Far servers: the relay
+
+Cargo starts a new wrapper process for every rustc invocation, and each one
+talks to the server on its own. Against a server tens of milliseconds away,
+round trips, not bandwidth, decide how long a warm build takes. Every wrapper
+keeps its own requests few and overlapping:
+
+- A restore requests all of a unit's blobs at once, at most
+  `BELLOWS_FETCH_CONCURRENCY` (1–64, default 16) at a time, instead of one after
+  another. Archive and declared-action restores and uploads do the same.
+- The empty blob (most compiler streams) is never requested: its digest is its
+  proof.
+- Blobs of 256 KiB or less are uploaded without asking first (`HEAD`) whether
+  the server has them; the server keeps and refreshes a copy it already holds.
+- The reuse mark (`POST …/used`) is sent while the blobs download, not after.
+- Over HTTPS the client negotiates HTTP/2, so the requests of one wrapper share
+  a single connection and TLS handshake. Plain HTTP stays HTTP/1.1.
+
+A wrapper still pays a TCP and TLS handshake of its own, and waits for its
+uploads before Cargo may start the units that depend on it. The **relay**
+removes both. It is a loopback HTTP service that holds a warm connection pool
+to the server for the whole build:
+
+- A wrapper's request then costs one round trip to the server: a restore is
+  about two (candidates, then blobs), however many blobs it needs.
+- Uploads are answered once they are spooled to local disk and sent in the
+  background, at most `BELLOWS_RELAY_UPLOADS` (1–64, default 8) at a time. A
+  record goes up only after every blob accepted before it, a lease release
+  only after every record before it, and any other change (archives, declared
+  records, execution, collection) waits for earlier uploads before it is
+  forwarded. Past `BELLOWS_RELAY_SPOOL_MB` (default 4096) of unsent blobs, a
+  further upload waits for room, so the spool cannot grow without bound.
+- Reads pass straight through. Wrappers verify every digest, and the relay
+  verifies each spooled blob before uploading it.
+- Wrappers authenticate to the relay with a random per-session token. The
+  server's token stays in the relay process, out of Cargo's environment and
+  so out of reach of build scripts and procedural macros.
+- The pool uses several HTTP/1.1 connections rather than one HTTP/2 connection,
+  so large blobs download on parallel TCP streams.
+
+`bellows run` starts a relay for any server that is not on loopback, and drains
+it after the command exits (up to `BELLOWS_RELAY_DRAIN_SECS`, default 600),
+printing what it uploaded and any upload that failed. `BELLOWS_RELAY=0` turns
+it off; `BELLOWS_RELAY=1` forces it on for a loopback server. A failed
+background upload is a cache miss for a later build, never a failed build.
+
+When Cargo runs with `RUSTC_WRAPPER` set directly, as CI usually does, start a
+standalone relay before the first build and stop it with SIGTERM after the
+last; it drains before it exits:
+
+```bash
+bellows relay --server https://bellows.example --env-file "$RUNNER_TEMP/bellows-relay.env" &
+echo "BELLOWS_RELAY_PID=$!" >> "$GITHUB_ENV"
+# The env file appears once the relay listens; hand its two lines to later steps.
+for _ in $(seq 100); do [ -s "$RUNNER_TEMP/bellows-relay.env" ] && break; sleep 0.1; done
+cat "$RUNNER_TEMP/bellows-relay.env" >> "$GITHUB_ENV"   # BELLOWS_SERVER, BELLOWS_AUTH_TOKEN
+# ... builds ...
+kill -TERM "$BELLOWS_RELAY_PID"; wait "$BELLOWS_RELAY_PID"   # in the teardown step
+```
+
+The relay reads the server's token from `--token` or `BELLOWS_AUTH_TOKEN`, as
+any client does. Its env file (mode 0600) holds the session token, not the
+server's. Mask it in CI logs like any secret. Run `bellows doctor` and
+`bellows stats` through the relay or straight at the server; both work.
+
+`scripts/latency/bench.sh` measures a warm build through
+`scripts/latency/delay-proxy.py`, a TCP proxy that adds a fixed round trip
+(and a handshake's worth of round trips per new connection), so changes to
+this path can be compared at 0, 50, 100 and 250 ms without root.
+
+### Server memory
+
+`bellowsd` streams blob downloads from disk and blob uploads to a temporary
+file beside their final location, hashing as they arrive; the store's
+mutation lock is held only for the final rename. A large blob costs the
+server a read buffer, not its size in memory, so `--max-requests` bounds
+memory rather than `--max-requests` times `--max-blob-mb`. A record upload
+rereads and rehashes every blob it names, off the async workers.
+
 ## Capacity and recovery
 
 Use `bellows stats` for blob bytes, record counts, candidates, and leases.
