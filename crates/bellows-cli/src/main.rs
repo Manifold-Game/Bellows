@@ -2686,11 +2686,24 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "remap",
         b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
-    for (name, value) in relevant_environment(&normalizer) {
+    let path_use = path_use(invocation);
+    for (name, value) in compile_environment(&normalizer, &path_use) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
             format!("environment changed: {name}"),
             digest_bytes(value.as_bytes()),
+        );
+    }
+    if let PathUse::Linker(program) = path_use {
+        let path_env = env::var("PATH").unwrap_or_default();
+        let found = match link::resolve_program(program, &path_env, &workspace) {
+            Ok(path) => format!("{program}:{}", digests.file(&path)?),
+            Err(_) => format!("{program}:not on PATH"),
+        };
+        hash_field(&mut hasher, "linker-on-path", found.as_bytes());
+        components.insert(
+            format!("linker on PATH changed: {program}"),
+            digest_bytes(found.as_bytes()),
         );
     }
     let mut inputs = invocation.explicit_inputs.clone();
@@ -2892,6 +2905,68 @@ fn relevant_environment(normalizer: &PathNormalizer) -> BTreeMap<String, String>
         .collect()
 }
 
+/// The environment a compile's key covers: the relevant environment without
+/// the variables that describe the shell rather than the compile. Two shells
+/// on one machine (a POSIX shell sets HOME, LANG and LC_ALL and prepends its
+/// own PATH entries; PowerShell sets none) otherwise never share a result.
+/// rustc reads none of them; `env!` and `option_env!` reads are tracked
+/// through dep-info. PATH stays only where it can choose the program rustc
+/// runs ([`PathUse`]). Build-script runs keep all of them: a build script
+/// may run any program on PATH.
+fn compile_environment(
+    normalizer: &PathNormalizer,
+    path_use: &PathUse,
+) -> BTreeMap<String, String> {
+    let mut environment = relevant_environment(normalizer);
+    for name in SHELL_ENVIRONMENT {
+        environment.remove(*name);
+    }
+    if cfg!(windows) {
+        // The Windows loader never reads them.
+        environment.remove("LD_LIBRARY_PATH");
+        environment.remove("DYLD_LIBRARY_PATH");
+    }
+    if !matches!(path_use, PathUse::Whole) {
+        environment.remove("PATH");
+    }
+    environment
+}
+
+const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// What PATH can change about one compile.
+#[derive(Debug, PartialEq, Eq)]
+enum PathUse {
+    /// Nothing: rustc runs no program for a library, and finds a wasm or
+    /// Windows-default linker without PATH (the sysroot's rust-lld; Visual
+    /// Studio's link.exe through the keyed VC*/WindowsSdk* variables).
+    None,
+    /// Only which program of this name rustc runs as the linker. The key
+    /// holds that program's content digest, so another shell's PATH that
+    /// finds the same linker shares results, and a different one misses.
+    Linker(&'static str),
+    /// Anything: a C compiler driver searches PATH for its own tools, and an
+    /// explicit `-C linker` may be a script. The key keeps all of PATH.
+    Whole,
+}
+
+fn path_use(invocation: &Invocation) -> PathUse {
+    if invocation.kind != OutputKind::Linked {
+        return PathUse::None;
+    }
+    if codegen_value(&invocation.args, "linker").is_some() {
+        return PathUse::Whole;
+    }
+    let flavor = codegen_value(&invocation.args, "linker-flavor");
+    let wasm =
+        option_value(&invocation.args, "--target").is_some_and(|target| target.starts_with("wasm"));
+    match flavor.as_deref() {
+        Some("lld-link") => PathUse::Linker("lld-link"),
+        None if invocation.naming.msvc || wasm => PathUse::None,
+        _ => PathUse::Whole,
+    }
+}
+
 fn is_relevant_environment_name(name: &str) -> bool {
     // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
     // output. A crate that reads one with env!/option_env! is still tracked
@@ -2910,6 +2985,7 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CLIPPY_TERMINAL_WIDTH",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_AUTO_INSTALL",
         "RUSTUP_TOOLCHAIN_SOURCE",
         "RUST_BACKTRACE",
         "RUST_LOG",
@@ -6746,6 +6822,83 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn analyzed(crate_type: &str, extra: &[&str]) -> Invocation {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("out")).unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}").unwrap();
+        let mut raw = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name"),
+            OsString::from("demo"),
+            temp.path().join("main.rs").into_os_string(),
+            OsString::from("--crate-type"),
+            OsString::from(crate_type),
+            OsString::from("--emit=dep-info,link"),
+            OsString::from("-C"),
+            OsString::from("extra-filename=-abc"),
+            OsString::from("--out-dir"),
+            temp.path().join("out").into_os_string(),
+        ];
+        raw.extend(extra.iter().map(OsString::from));
+        Invocation::analyze(&raw).unwrap()
+    }
+
+    #[test]
+    fn path_reaches_a_key_only_where_it_can_choose_the_linker() {
+        assert_eq!(path_use(&analyzed("lib", &[])), PathUse::None);
+        assert_eq!(
+            path_use(&analyzed("lib", &["-Clinker-flavor=lld-link"])),
+            PathUse::None
+        );
+        let msvc = ["--target", "x86_64-pc-windows-msvc"];
+        assert_eq!(path_use(&analyzed("bin", &msvc)), PathUse::None);
+        assert_eq!(
+            path_use(&analyzed(
+                "bin",
+                &[msvc[0], msvc[1], "-C", "linker-flavor=lld-link"]
+            )),
+            PathUse::Linker("lld-link")
+        );
+        assert_eq!(
+            path_use(&analyzed("cdylib", &["--target", "wasm32-unknown-unknown"])),
+            PathUse::None
+        );
+        assert_eq!(
+            path_use(&analyzed("bin", &["--target", "x86_64-unknown-linux-gnu"])),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path_use(&analyzed(
+                "bin",
+                &[
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-Clinker-flavor=gcc"
+                ]
+            )),
+            PathUse::Whole
+        );
+    }
+
+    #[test]
+    fn compile_keys_leave_out_the_shell_but_build_scripts_keep_it() {
+        // Build-script runs use the full relevant environment.
+        for name in ["PATH", "HOME", "LANG", "LC_ALL", "TZ"] {
+            assert!(is_relevant_environment_name(name), "{name}");
+        }
+        assert!(!is_relevant_environment_name("RUSTUP_AUTO_INSTALL"));
+        let normalizer = PathNormalizer::new(Vec::new());
+        // The test process has PATH; the others may be unset, so only check
+        // that none of them survives.
+        for path_use in [PathUse::None, PathUse::Linker("lld-link")] {
+            let environment = compile_environment(&normalizer, &path_use);
+            for name in ["PATH", "HOME", "LANG", "LC_ALL", "TZ"] {
+                assert!(!environment.contains_key(name), "{name} in {path_use:?}");
+            }
+        }
+        assert!(compile_environment(&normalizer, &PathUse::Whole).contains_key("PATH"));
     }
 
     #[test]
