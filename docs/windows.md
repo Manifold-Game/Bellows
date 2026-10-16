@@ -55,7 +55,7 @@ for the compiler/linker components. Use a normal PowerShell 7 window; the tests
 use NTFS junctions and do not require enabling symlink privileges.
 
 ```powershell
-git clone --branch main https://github.com/logan-mcduffie/Bellows.git
+git clone --branch main https://github.com/Manifold-Game/Bellows.git
 cd Bellows
 rustup toolchain install 1.92.0-x86_64-pc-windows-msvc --profile minimal --component rustfmt,clippy
 pwsh -NoProfile -File .\scripts\windows-check.ps1
