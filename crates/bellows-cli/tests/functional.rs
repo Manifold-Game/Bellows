@@ -1599,7 +1599,8 @@ build=\"build.rs\"
         script()[again..moved].first().map(String::as_str),
         Some("miss")
     );
-    let relanged = build(Some(&empty), Some("C.UTF-8"));
+    // A value no CI image sets, so it is always a change.
+    let relanged = build(Some(&empty), Some("bellows-test-lang"));
     assert_eq!(
         script()[moved..relanged].first().map(String::as_str),
         Some("miss")
