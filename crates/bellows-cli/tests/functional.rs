@@ -1401,6 +1401,212 @@ fn restore_replaces_an_executable_that_is_still_running() {
     let _ = running.wait();
 }
 
+/// PATH with `first` in front, and the inherited entries in reverse order:
+/// the same programs, spelled as a different shell would.
+fn shell_path(first: &Path) -> std::ffi::OsString {
+    let mut entries: Vec<PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect();
+    entries.reverse();
+    entries.insert(0, first.to_owned());
+    std::env::join_paths(entries).unwrap()
+}
+
+#[test]
+fn the_same_compile_from_another_shell_is_a_hit() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let empty = f.temp.path().join("empty bin");
+    fs::create_dir_all(&empty).unwrap();
+    // rustup finds its toolchains through HOME outside Windows: the same
+    // directory, spelled differently, is still another value.
+    let home = match std::env::var_os("HOME") {
+        Some(home) if !cfg!(windows) => Path::new(&home).join("."),
+        _ => f.temp.path().to_owned(),
+    };
+    // A POSIX shell: HOME, LANG and LC_ALL set, its own PATH in front.
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("HOME", &home)
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("TZ", "UTC")
+            .env("PATH", shell_path(&empty)),
+    );
+    f.clean();
+    // Another shell: none of them (HOME as inherited outside Windows), the
+    // inherited PATH as it is.
+    let mut other = f.local();
+    if cfg!(windows) {
+        other.env_remove("HOME");
+    }
+    let other = checked(
+        other
+            .args(["cargo", "build", "--release", "--offline"])
+            .env_remove("LANG")
+            .env_remove("LC_ALL")
+            .env_remove("TZ"),
+    );
+    let log = stderr(&other);
+    // A C compiler driver (the default on Linux and macOS) may find its own
+    // tools through PATH, so there the linked binary keeps PATH in its key.
+    let expected: &[&str] = if cfg!(windows) {
+        &["LOCAL HIT", "LOCAL HIT"]
+    } else {
+        &["LOCAL HIT", "CACHE MISS"]
+    };
+    assert_eq!(decisions(&other, "fixture"), expected, "{log}");
+    assert!(!log.contains("environment changed: HOME"), "{log}");
+    assert_eq!(f.value("target"), "42");
+}
+
+/// Keys still follow the linker that PATH selects: the same lld-link found
+/// through another directory shares results, a different one misses.
+#[cfg(windows)]
+#[test]
+fn a_different_lld_link_on_path_misses() {
+    let found = Command::new("where").arg("lld-link").output();
+    let Some(lld) = found
+        .ok()
+        .and_then(|found| {
+            String::from_utf8_lossy(&found.stdout)
+                .lines()
+                .next()
+                .map(|line| PathBuf::from(line.trim()))
+        })
+        .filter(|path| path.is_file())
+    else {
+        // The only end-to-end proof that a different linker misses: CI must
+        // not pass without running it.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "lld-link is not on PATH, so the linker-on-PATH key is untested"
+        );
+        eprintln!("skipped: no lld-link on PATH");
+        return;
+    };
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 7 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let build = |dir: &Path| {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--release", "--offline"])
+                .env("RUSTFLAGS", "-Clinker-flavor=lld-link")
+                .env("PATH", shell_path(dir)),
+        )
+    };
+    let same = f.temp.path().join("same lld");
+    let other = f.temp.path().join("other lld");
+    for dir in [&same, &other] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    fs::copy(&lld, same.join("lld-link.exe")).unwrap();
+    // The same program with trailing bytes: it still links, but it is not
+    // the linker the cached binary was made with.
+    let mut bytes = fs::read(&lld).unwrap();
+    bytes.extend_from_slice(b"another build");
+    fs::write(other.join("lld-link.exe"), bytes).unwrap();
+
+    build(&same);
+    f.clean();
+    let empty = f.temp.path().join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let again = build(&empty);
+    assert_eq!(
+        decisions(&again, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{}",
+        stderr(&again)
+    );
+    f.clean();
+    let changed = build(&other);
+    let log = stderr(&changed);
+    assert_eq!(
+        decisions(&changed, "fixture"),
+        ["LOCAL HIT", "CACHE MISS"],
+        "{log}"
+    );
+    assert!(log.contains("linker on PATH changed: lld-link"), "{log}");
+    assert_eq!(f.value("target"), "7");
+}
+
+/// Build scripts may run any program and read any variable, so their runs
+/// keep the shell in the key: unlike a compile, another PATH or LANG misses.
+#[test]
+fn a_build_script_run_misses_when_path_or_lang_change() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]
+name=\"fixture\"
+version=\"0.1.0\"
+edition=\"2024\"
+build=\"build.rs\"
+[workspace]
+",
+            ),
+            (
+                "build.rs",
+                "fn main() {
+    let out = std::env::var(\"OUT_DIR\").unwrap();
+    std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap();
+}
+",
+            ),
+        ],
+    );
+    f.lock();
+    let script = || {
+        events(&f)
+            .into_iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    let empty = f.temp.path().join("empty bin");
+    fs::create_dir_all(&empty).unwrap();
+    let build = |path: Option<&Path>, lang: Option<&str>| {
+        let mut command = f.local();
+        command.args(["cargo", "build", "--release", "--offline"]);
+        if let Some(path) = path {
+            command.env("PATH", shell_path(path));
+        }
+        if let Some(lang) = lang {
+            command.env("LANG", lang);
+        }
+        checked(&mut command);
+        f.clean();
+        script().len()
+    };
+    let first = build(None, None);
+    assert_eq!(first, 2, "{:?}", script());
+    // The same environment restores the run: no new miss.
+    let again = build(None, None);
+    assert_eq!(script()[first..again], ["l1_hit"], "{:?}", script());
+    // Another PATH or LANG is another run.
+    let moved = build(Some(&empty), None);
+    assert_eq!(
+        script()[again..moved].first().map(String::as_str),
+        Some("miss")
+    );
+    // A value no CI image sets, so it is always a change.
+    let relanged = build(Some(&empty), Some("bellows-test-lang"));
+    assert_eq!(
+        script()[moved..relanged].first().map(String::as_str),
+        Some("miss")
+    );
+}
+
 #[test]
 fn profiles_with_identical_compiler_arguments_share_results() {
     let f = Fixture::new(

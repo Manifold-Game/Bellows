@@ -2686,11 +2686,24 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "remap",
         b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
-    for (name, value) in relevant_environment(&normalizer) {
+    let path_use = path_use(invocation, host_triple(&compiler.stdout).as_deref());
+    for (name, value) in compile_environment(&normalizer, &path_use) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
             format!("environment changed: {name}"),
             digest_bytes(value.as_bytes()),
+        );
+    }
+    if let PathUse::Linker(program) = path_use {
+        let path_env = env::var("PATH").unwrap_or_default();
+        let found = match link::resolve_program(program, &path_env, &workspace) {
+            Ok(path) => format!("{program}:{}", digests.file(&path)?),
+            Err(_) => format!("{program}:not on PATH"),
+        };
+        hash_field(&mut hasher, "linker-on-path", found.as_bytes());
+        components.insert(
+            format!("linker on PATH changed: {program}"),
+            digest_bytes(found.as_bytes()),
         );
     }
     let mut inputs = invocation.explicit_inputs.clone();
@@ -2886,11 +2899,184 @@ fn resolve_static_libraries(invocation: &Invocation, workspace: &Path) -> Result
 }
 
 fn relevant_environment(normalizer: &PathNormalizer) -> BTreeMap<String, String> {
-    env::vars()
+    relevant_environment_of(env::vars(), normalizer, cfg!(windows))
+}
+
+/// Windows variable names are case-insensitive, and the same variable reaches
+/// a build spelled differently (`Path` from Explorer and PowerShell, `PATH`
+/// from a POSIX shell), so on Windows each name is keyed in one spelling.
+fn relevant_environment_of(
+    vars: impl IntoIterator<Item = (String, String)>,
+    normalizer: &PathNormalizer,
+    case_insensitive: bool,
+) -> BTreeMap<String, String> {
+    vars.into_iter()
+        .map(|(name, value)| {
+            let name = if case_insensitive {
+                environment_spelling(&name)
+            } else {
+                name
+            };
+            (name, value)
+        })
         .filter(|(name, _)| is_relevant_environment_name(name))
         .map(|(name, value)| (name, normalizer.normalize(&value)))
         .collect()
 }
+
+/// The spelling a case-insensitive variable name is keyed under: its entry in
+/// [`EXACT_ENVIRONMENT`], else upper case (every other list is upper case).
+fn environment_spelling(name: &str) -> String {
+    EXACT_ENVIRONMENT
+        .iter()
+        .find(|listed| listed.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_ascii_uppercase(), |listed| (*listed).to_string())
+}
+
+/// The environment a compile's key covers: the relevant environment without
+/// the variables that describe the shell rather than the compile. Two shells
+/// on one machine (a POSIX shell sets HOME, LANG and LC_ALL and prepends its
+/// own PATH entries; PowerShell sets none) otherwise never share a result.
+/// rustc reads none of them; `env!` and `option_env!` reads are tracked
+/// through dep-info. A proc macro can still read them, or run a program from
+/// PATH, without any record, so its output can differ between shells and a
+/// compile that uses one is shared across them. PATH stays only where it can
+/// choose the program rustc runs ([`PathUse`]). Build-script runs keep all of
+/// them: a build script may run any program on PATH.
+fn compile_environment(
+    normalizer: &PathNormalizer,
+    path_use: &PathUse,
+) -> BTreeMap<String, String> {
+    without_shell(relevant_environment(normalizer), path_use)
+}
+
+fn without_shell(
+    mut environment: BTreeMap<String, String>,
+    path_use: &PathUse,
+) -> BTreeMap<String, String> {
+    for name in SHELL_ENVIRONMENT {
+        environment.remove(*name);
+    }
+    if cfg!(windows) {
+        // The Windows loader never reads them.
+        environment.remove("LD_LIBRARY_PATH");
+        environment.remove("DYLD_LIBRARY_PATH");
+    }
+    if !matches!(path_use, PathUse::Whole) {
+        environment.remove("PATH");
+    }
+    environment
+}
+
+const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// What PATH can change about one compile.
+#[derive(Debug, PartialEq, Eq)]
+enum PathUse {
+    /// Nothing: rustc runs no program for a library, and finds a wasm or
+    /// Windows-default linker without PATH (the sysroot's rust-lld; Visual
+    /// Studio's link.exe through the registry and the keyed VC*/WindowsSdk*
+    /// variables).
+    None,
+    /// Only which program of this name rustc runs as the linker. The key
+    /// holds that program's content digest, so another shell's PATH that
+    /// finds the same linker shares results, and a different one misses.
+    Linker(&'static str),
+    /// Anything: a C compiler driver searches PATH for its own tools, and an
+    /// explicit `-C linker` may be a script. The key keeps all of PATH.
+    Whole,
+}
+
+/// The `host:` triple from `rustc -vV` output.
+fn host_triple(version: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(version)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_owned())
+}
+
+/// What PATH can change about this compile, judged from the target rustc
+/// links for (its `--target`, else its host) and the environment the linker
+/// lookup reads.
+fn path_use(invocation: &Invocation, host: Option<&str>) -> PathUse {
+    path_use_with(invocation, host, env::var_os("VCINSTALLDIR").is_some())
+}
+
+fn path_use_with(invocation: &Invocation, host: Option<&str>, vc_environment: bool) -> PathUse {
+    if invocation.kind != OutputKind::Linked {
+        return PathUse::None;
+    }
+    if codegen_value(&invocation.args, "linker").is_some() {
+        return PathUse::Whole;
+    }
+    let flavor = codegen_value(&invocation.args, "linker-flavor");
+    match flavor.as_deref() {
+        Some("lld-link") => return PathUse::Linker("lld-link"),
+        Some(_) => return PathUse::Whole,
+        None => {}
+    }
+    // Without a `--target` rustc links for its own host. When the host is
+    // unknown, assume nothing.
+    let target = option_value(&invocation.args, "--target");
+    let Some(triple) = target.as_deref().or(host) else {
+        return PathUse::Whole;
+    };
+    if triple.starts_with("wasm") && !triple.contains("emscripten") {
+        // The sysroot's rust-lld. Emscripten links with `emcc` from PATH.
+        PathUse::None
+    } else if triple.contains("msvc") {
+        // rustc asks the Visual Studio installation for link.exe, which needs
+        // no PATH. It takes link.exe from PATH when the Visual Studio
+        // environment is loaded, and when it runs on another system (an xwin
+        // cross build). A Windows host that finds no Visual Studio also falls
+        // back to PATH; that is not detected here.
+        if vc_environment || !host.is_some_and(|host| host.contains("windows")) {
+            PathUse::Linker("link.exe")
+        } else {
+            PathUse::None
+        }
+    } else {
+        PathUse::Whole
+    }
+}
+
+const EXACT_ENVIRONMENT: &[&str] = &[
+    "AR",
+    "CC",
+    "CXX",
+    "DEBUG",
+    "DYLD_LIBRARY_PATH",
+    "HOME",
+    "HOST",
+    "INCLUDE",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "LIB",
+    "LIBPATH",
+    "LIBRARY_PATH",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "NM",
+    "OBJCOPY",
+    "OPT_LEVEL",
+    "OUT_DIR",
+    "PATH",
+    "PROFILE",
+    "RANLIB",
+    "SDKROOT",
+    "SOURCE_DATE_EPOCH",
+    "STRIP",
+    "TARGET",
+    "TZ",
+    "UCRTVersion",
+    "UniversalCRTSdkDir",
+    "VCINSTALLDIR",
+    "VCToolsInstallDir",
+    "VCToolsVersion",
+    "VSINSTALLDIR",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+];
 
 fn is_relevant_environment_name(name: &str) -> bool {
     // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
@@ -2910,49 +3096,13 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CLIPPY_TERMINAL_WIDTH",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_AUTO_INSTALL",
         "RUSTUP_TOOLCHAIN_SOURCE",
         "RUST_BACKTRACE",
         "RUST_LOG",
         "RUST_MIN_STACK",
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
-    ];
-    const EXACT: &[&str] = &[
-        "AR",
-        "CC",
-        "CXX",
-        "DEBUG",
-        "DYLD_LIBRARY_PATH",
-        "HOME",
-        "HOST",
-        "INCLUDE",
-        "LANG",
-        "LC_ALL",
-        "LD_LIBRARY_PATH",
-        "LIB",
-        "LIBPATH",
-        "LIBRARY_PATH",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "NM",
-        "OBJCOPY",
-        "OPT_LEVEL",
-        "OUT_DIR",
-        "PATH",
-        "PROFILE",
-        "RANLIB",
-        "SDKROOT",
-        "SOURCE_DATE_EPOCH",
-        "STRIP",
-        "TARGET",
-        "TZ",
-        "UCRTVersion",
-        "UniversalCRTSdkDir",
-        "VCINSTALLDIR",
-        "VCToolsInstallDir",
-        "VCToolsVersion",
-        "VSINSTALLDIR",
-        "WindowsSdkDir",
-        "WindowsSDKVersion",
     ];
     const PREFIXES: &[&str] = &[
         "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
@@ -2970,7 +3120,8 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     !BELLOWS_CONTROL.contains(&name)
         && !EXCLUDED_CARGO_CONTROL.contains(&name)
-        && (EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+        && (EXACT_ENVIRONMENT.contains(&name)
+            || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
 }
 
 fn hash_field(hasher: &mut blake3::Hasher, name: &str, bytes: &[u8]) {
@@ -6746,6 +6897,212 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn analyzed(crate_type: &str, extra: &[&str]) -> Invocation {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("out")).unwrap();
+        fs::write(temp.path().join("main.rs"), "fn main() {}").unwrap();
+        let mut raw = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name"),
+            OsString::from("demo"),
+            temp.path().join("main.rs").into_os_string(),
+            OsString::from("--crate-type"),
+            OsString::from(crate_type),
+            OsString::from("--emit=dep-info,link"),
+            OsString::from("-C"),
+            OsString::from("extra-filename=-abc"),
+            OsString::from("--out-dir"),
+            temp.path().join("out").into_os_string(),
+        ];
+        raw.extend(extra.iter().map(OsString::from));
+        Invocation::analyze(&raw).unwrap()
+    }
+
+    const WINDOWS_HOST: Option<&str> = Some("x86_64-pc-windows-msvc");
+    const LINUX_HOST: Option<&str> = Some("x86_64-unknown-linux-gnu");
+
+    #[test]
+    fn path_reaches_a_key_only_where_it_can_choose_the_linker() {
+        let path = |crate_type: &str, extra: &[&str], host, vc_environment| {
+            path_use_with(&analyzed(crate_type, extra), host, vc_environment)
+        };
+        assert_eq!(path("lib", &[], WINDOWS_HOST, false), PathUse::None);
+        assert_eq!(
+            path("lib", &["-Clinker-flavor=lld-link"], LINUX_HOST, false),
+            PathUse::None
+        );
+        let msvc = ["--target", "x86_64-pc-windows-msvc"];
+        assert_eq!(path("bin", &msvc, WINDOWS_HOST, false), PathUse::None);
+        assert_eq!(
+            path(
+                "bin",
+                &[msvc[0], msvc[1], "-C", "linker-flavor=lld-link"],
+                WINDOWS_HOST,
+                false
+            ),
+            PathUse::Linker("lld-link")
+        );
+        assert_eq!(
+            path(
+                "cdylib",
+                &["--target", "wasm32-unknown-unknown"],
+                LINUX_HOST,
+                false
+            ),
+            PathUse::None
+        );
+        assert_eq!(
+            path(
+                "bin",
+                &["--target", "x86_64-unknown-linux-gnu"],
+                LINUX_HOST,
+                false
+            ),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path(
+                "bin",
+                &[
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-Clinker-flavor=gcc"
+                ],
+                LINUX_HOST,
+                false
+            ),
+            PathUse::Whole
+        );
+    }
+
+    #[test]
+    fn emscripten_links_with_the_emcc_on_path() {
+        // The other wasm targets link with the sysroot's rust-lld.
+        for target in ["wasm32-unknown-emscripten", "asmjs-unknown-emscripten"] {
+            assert_eq!(
+                path_use_with(&analyzed("bin", &["--target", target]), WINDOWS_HOST, false),
+                PathUse::Whole,
+                "{target}"
+            );
+        }
+        for target in ["wasm32-unknown-unknown", "wasm32-wasip1", "wasm32v1-none"] {
+            assert_eq!(
+                path_use_with(&analyzed("bin", &["--target", target]), LINUX_HOST, false),
+                PathUse::None,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_build_follows_the_hosts_linker_not_the_bellows_binary() {
+        // No `--target`: rustc links for its own host, whatever Bellows was
+        // built for. A gcc-linked windows-gnu host keeps PATH in the key.
+        let host_build = analyzed("bin", &[]);
+        assert_eq!(
+            path_use_with(&host_build, Some("x86_64-pc-windows-gnu"), false),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path_use_with(&host_build, LINUX_HOST, false),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path_use_with(&host_build, WINDOWS_HOST, false),
+            PathUse::None
+        );
+        // An unknown host assumes nothing.
+        assert_eq!(path_use_with(&host_build, None, false), PathUse::Whole);
+    }
+
+    #[test]
+    fn msvc_links_with_the_link_exe_on_path_when_visual_studio_is_not_asked() {
+        let msvc = analyzed("bin", &["--target", "x86_64-pc-windows-msvc"]);
+        // A loaded Visual Studio environment puts its link.exe first on PATH.
+        assert_eq!(
+            path_use_with(&msvc, WINDOWS_HOST, true),
+            PathUse::Linker("link.exe")
+        );
+        // A cross build from another system has no Visual Studio to ask.
+        assert_eq!(
+            path_use_with(&msvc, LINUX_HOST, false),
+            PathUse::Linker("link.exe")
+        );
+        assert_eq!(path_use_with(&msvc, WINDOWS_HOST, false), PathUse::None);
+    }
+
+    #[test]
+    fn the_host_is_read_from_the_compiler_version() {
+        let version = b"rustc 1.92.0 (abc 2026-01-01)
+binary: rustc
+host: x86_64-pc-windows-gnu
+release: 1.92.0
+";
+        assert_eq!(
+            host_triple(version).as_deref(),
+            Some("x86_64-pc-windows-gnu")
+        );
+        assert_eq!(
+            host_triple(
+                b"rustc 1.92.0
+"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn compile_keys_leave_out_the_shell_but_build_scripts_keep_it() {
+        // Build-script runs use the full relevant environment.
+        for name in ["PATH", "HOME", "LANG", "LC_ALL", "TZ"] {
+            assert!(is_relevant_environment_name(name), "{name}");
+        }
+        assert!(!is_relevant_environment_name("RUSTUP_AUTO_INSTALL"));
+        let normalizer = PathNormalizer::new(Vec::new());
+        // The test process has PATH; the others may be unset, so only check
+        // that none of them survives.
+        for path_use in [PathUse::None, PathUse::Linker("lld-link")] {
+            let environment = compile_environment(&normalizer, &path_use);
+            for name in ["PATH", "HOME", "LANG", "LC_ALL", "TZ"] {
+                assert!(!environment.contains_key(name), "{name} in {path_use:?}");
+            }
+        }
+        assert!(compile_environment(&normalizer, &PathUse::Whole).contains_key("PATH"));
+    }
+
+    #[test]
+    fn windows_keys_each_variable_in_one_spelling() {
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = || {
+            [
+                ("Path", r"C:\bin"),
+                ("Home", r"C:\Users\me"),
+                ("ucrtversion", "10.0"),
+                ("Cargo_Pkg_Name", "demo"),
+                ("RUSTFLAGS", "-Dwarnings"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        };
+        let windows = relevant_environment_of(vars(), &normalizer, true);
+        assert_eq!(
+            windows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "HOME", "PATH", "RUSTFLAGS", "UCRTVersion"]
+        );
+        // On other systems `Path` is a different variable from `PATH`.
+        let posix = relevant_environment_of(vars(), &normalizer, false);
+        assert_eq!(
+            posix.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["RUSTFLAGS"]
+        );
+        // So the shell's variables leave a compile key however they are spelled.
+        let compile = without_shell(windows.clone(), &PathUse::None);
+        assert_eq!(
+            compile.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "RUSTFLAGS", "UCRTVersion"]
+        );
+        assert!(without_shell(windows, &PathUse::Whole).contains_key("PATH"));
     }
 
     #[test]
