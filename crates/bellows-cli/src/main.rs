@@ -2686,7 +2686,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "remap",
         b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
-    let path_use = path_use(invocation);
+    let path_use = path_use(invocation, host_triple(&compiler.stdout).as_deref());
     for (name, value) in compile_environment(&normalizer, &path_use) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
@@ -2938,9 +2938,11 @@ fn environment_spelling(name: &str) -> String {
 /// on one machine (a POSIX shell sets HOME, LANG and LC_ALL and prepends its
 /// own PATH entries; PowerShell sets none) otherwise never share a result.
 /// rustc reads none of them; `env!` and `option_env!` reads are tracked
-/// through dep-info. PATH stays only where it can choose the program rustc
-/// runs ([`PathUse`]). Build-script runs keep all of them: a build script
-/// may run any program on PATH.
+/// through dep-info. A proc macro can still read them, or run a program from
+/// PATH, without any record, so its output can differ between shells and a
+/// compile that uses one is shared across them. PATH stays only where it can
+/// choose the program rustc runs ([`PathUse`]). Build-script runs keep all of
+/// them: a build script may run any program on PATH.
 fn compile_environment(
     normalizer: &PathNormalizer,
     path_use: &PathUse,
@@ -2973,7 +2975,8 @@ const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
 enum PathUse {
     /// Nothing: rustc runs no program for a library, and finds a wasm or
     /// Windows-default linker without PATH (the sysroot's rust-lld; Visual
-    /// Studio's link.exe through the keyed VC*/WindowsSdk* variables).
+    /// Studio's link.exe through the registry and the keyed VC*/WindowsSdk*
+    /// variables).
     None,
     /// Only which program of this name rustc runs as the linker. The key
     /// holds that program's content digest, so another shell's PATH that
@@ -2984,7 +2987,22 @@ enum PathUse {
     Whole,
 }
 
-fn path_use(invocation: &Invocation) -> PathUse {
+/// The `host:` triple from `rustc -vV` output.
+fn host_triple(version: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(version)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .map(|host| host.trim().to_owned())
+}
+
+/// What PATH can change about this compile, judged from the target rustc
+/// links for (its `--target`, else its host) and the environment the linker
+/// lookup reads.
+fn path_use(invocation: &Invocation, host: Option<&str>) -> PathUse {
+    path_use_with(invocation, host, env::var_os("VCINSTALLDIR").is_some())
+}
+
+fn path_use_with(invocation: &Invocation, host: Option<&str>, vc_environment: bool) -> PathUse {
     if invocation.kind != OutputKind::Linked {
         return PathUse::None;
     }
@@ -2992,12 +3010,33 @@ fn path_use(invocation: &Invocation) -> PathUse {
         return PathUse::Whole;
     }
     let flavor = codegen_value(&invocation.args, "linker-flavor");
-    let wasm =
-        option_value(&invocation.args, "--target").is_some_and(|target| target.starts_with("wasm"));
     match flavor.as_deref() {
-        Some("lld-link") => PathUse::Linker("lld-link"),
-        None if invocation.naming.msvc || wasm => PathUse::None,
-        _ => PathUse::Whole,
+        Some("lld-link") => return PathUse::Linker("lld-link"),
+        Some(_) => return PathUse::Whole,
+        None => {}
+    }
+    // Without a `--target` rustc links for its own host. When the host is
+    // unknown, assume nothing.
+    let target = option_value(&invocation.args, "--target");
+    let Some(triple) = target.as_deref().or(host) else {
+        return PathUse::Whole;
+    };
+    if triple.starts_with("wasm") && !triple.contains("emscripten") {
+        // The sysroot's rust-lld. Emscripten links with `emcc` from PATH.
+        PathUse::None
+    } else if triple.contains("msvc") {
+        // rustc asks the Visual Studio installation for link.exe, which needs
+        // no PATH. It takes link.exe from PATH when the Visual Studio
+        // environment is loaded, and when it runs on another system (an xwin
+        // cross build). A Windows host that finds no Visual Studio also falls
+        // back to PATH; that is not detected here.
+        if vc_environment || !host.is_some_and(|host| host.contains("windows")) {
+            PathUse::Linker("link.exe")
+        } else {
+            PathUse::None
+        }
+    } else {
+        PathUse::Whole
     }
 }
 
@@ -6881,40 +6920,136 @@ mod tests {
         Invocation::analyze(&raw).unwrap()
     }
 
+    const WINDOWS_HOST: Option<&str> = Some("x86_64-pc-windows-msvc");
+    const LINUX_HOST: Option<&str> = Some("x86_64-unknown-linux-gnu");
+
     #[test]
     fn path_reaches_a_key_only_where_it_can_choose_the_linker() {
-        assert_eq!(path_use(&analyzed("lib", &[])), PathUse::None);
+        let path = |crate_type: &str, extra: &[&str], host, vc_environment| {
+            path_use_with(&analyzed(crate_type, extra), host, vc_environment)
+        };
+        assert_eq!(path("lib", &[], WINDOWS_HOST, false), PathUse::None);
         assert_eq!(
-            path_use(&analyzed("lib", &["-Clinker-flavor=lld-link"])),
+            path("lib", &["-Clinker-flavor=lld-link"], LINUX_HOST, false),
             PathUse::None
         );
         let msvc = ["--target", "x86_64-pc-windows-msvc"];
-        assert_eq!(path_use(&analyzed("bin", &msvc)), PathUse::None);
+        assert_eq!(path("bin", &msvc, WINDOWS_HOST, false), PathUse::None);
         assert_eq!(
-            path_use(&analyzed(
+            path(
                 "bin",
-                &[msvc[0], msvc[1], "-C", "linker-flavor=lld-link"]
-            )),
+                &[msvc[0], msvc[1], "-C", "linker-flavor=lld-link"],
+                WINDOWS_HOST,
+                false
+            ),
             PathUse::Linker("lld-link")
         );
         assert_eq!(
-            path_use(&analyzed("cdylib", &["--target", "wasm32-unknown-unknown"])),
+            path(
+                "cdylib",
+                &["--target", "wasm32-unknown-unknown"],
+                LINUX_HOST,
+                false
+            ),
             PathUse::None
         );
         assert_eq!(
-            path_use(&analyzed("bin", &["--target", "x86_64-unknown-linux-gnu"])),
+            path(
+                "bin",
+                &["--target", "x86_64-unknown-linux-gnu"],
+                LINUX_HOST,
+                false
+            ),
             PathUse::Whole
         );
         assert_eq!(
-            path_use(&analyzed(
+            path(
                 "bin",
                 &[
                     "--target",
                     "x86_64-unknown-linux-gnu",
                     "-Clinker-flavor=gcc"
-                ]
-            )),
+                ],
+                LINUX_HOST,
+                false
+            ),
             PathUse::Whole
+        );
+    }
+
+    #[test]
+    fn emscripten_links_with_the_emcc_on_path() {
+        // The other wasm targets link with the sysroot's rust-lld.
+        for target in ["wasm32-unknown-emscripten", "asmjs-unknown-emscripten"] {
+            assert_eq!(
+                path_use_with(&analyzed("bin", &["--target", target]), WINDOWS_HOST, false),
+                PathUse::Whole,
+                "{target}"
+            );
+        }
+        for target in ["wasm32-unknown-unknown", "wasm32-wasip1", "wasm32v1-none"] {
+            assert_eq!(
+                path_use_with(&analyzed("bin", &["--target", target]), LINUX_HOST, false),
+                PathUse::None,
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_build_follows_the_hosts_linker_not_the_bellows_binary() {
+        // No `--target`: rustc links for its own host, whatever Bellows was
+        // built for. A gcc-linked windows-gnu host keeps PATH in the key.
+        let host_build = analyzed("bin", &[]);
+        assert_eq!(
+            path_use_with(&host_build, Some("x86_64-pc-windows-gnu"), false),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path_use_with(&host_build, LINUX_HOST, false),
+            PathUse::Whole
+        );
+        assert_eq!(
+            path_use_with(&host_build, WINDOWS_HOST, false),
+            PathUse::None
+        );
+        // An unknown host assumes nothing.
+        assert_eq!(path_use_with(&host_build, None, false), PathUse::Whole);
+    }
+
+    #[test]
+    fn msvc_links_with_the_link_exe_on_path_when_visual_studio_is_not_asked() {
+        let msvc = analyzed("bin", &["--target", "x86_64-pc-windows-msvc"]);
+        // A loaded Visual Studio environment puts its link.exe first on PATH.
+        assert_eq!(
+            path_use_with(&msvc, WINDOWS_HOST, true),
+            PathUse::Linker("link.exe")
+        );
+        // A cross build from another system has no Visual Studio to ask.
+        assert_eq!(
+            path_use_with(&msvc, LINUX_HOST, false),
+            PathUse::Linker("link.exe")
+        );
+        assert_eq!(path_use_with(&msvc, WINDOWS_HOST, false), PathUse::None);
+    }
+
+    #[test]
+    fn the_host_is_read_from_the_compiler_version() {
+        let version = b"rustc 1.92.0 (abc 2026-01-01)
+binary: rustc
+host: x86_64-pc-windows-gnu
+release: 1.92.0
+";
+        assert_eq!(
+            host_triple(version).as_deref(),
+            Some("x86_64-pc-windows-gnu")
+        );
+        assert_eq!(
+            host_triple(
+                b"rustc 1.92.0
+"
+            ),
+            None
         );
     }
 

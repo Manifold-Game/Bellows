@@ -1467,15 +1467,23 @@ fn the_same_compile_from_another_shell_is_a_hit() {
 #[cfg(windows)]
 #[test]
 fn a_different_lld_link_on_path_misses() {
-    let Ok(found) = Command::new("where").arg("lld-link").output() else {
-        return;
-    };
-    let Some(lld) = String::from_utf8_lossy(&found.stdout)
-        .lines()
-        .next()
-        .map(|line| PathBuf::from(line.trim()))
+    let found = Command::new("where").arg("lld-link").output();
+    let Some(lld) = found
+        .ok()
+        .and_then(|found| {
+            String::from_utf8_lossy(&found.stdout)
+                .lines()
+                .next()
+                .map(|line| PathBuf::from(line.trim()))
+        })
         .filter(|path| path.is_file())
     else {
+        // The only end-to-end proof that a different linker misses: CI must
+        // not pass without running it.
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "lld-link is not on PATH, so the linker-on-PATH key is untested"
+        );
         eprintln!("skipped: no lld-link on PATH");
         return;
     };
@@ -1524,6 +1532,78 @@ fn a_different_lld_link_on_path_misses() {
     );
     assert!(log.contains("linker on PATH changed: lld-link"), "{log}");
     assert_eq!(f.value("target"), "7");
+}
+
+/// Build scripts may run any program and read any variable, so their runs
+/// keep the shell in the key: unlike a compile, another PATH or LANG misses.
+#[test]
+fn a_build_script_run_misses_when_path_or_lang_change() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]
+name=\"fixture\"
+version=\"0.1.0\"
+edition=\"2024\"
+build=\"build.rs\"
+[workspace]
+",
+            ),
+            (
+                "build.rs",
+                "fn main() {
+    let out = std::env::var(\"OUT_DIR\").unwrap();
+    std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap();
+}
+",
+            ),
+        ],
+    );
+    f.lock();
+    let script = || {
+        events(&f)
+            .into_iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    let empty = f.temp.path().join("empty bin");
+    fs::create_dir_all(&empty).unwrap();
+    let build = |path: Option<&Path>, lang: Option<&str>| {
+        let mut command = f.local();
+        command.args(["cargo", "build", "--release", "--offline"]);
+        if let Some(path) = path {
+            command.env("PATH", shell_path(path));
+        }
+        if let Some(lang) = lang {
+            command.env("LANG", lang);
+        }
+        checked(&mut command);
+        f.clean();
+        script().len()
+    };
+    let first = build(None, None);
+    assert_eq!(first, 2, "{:?}", script());
+    // The same environment restores the run: no new miss.
+    let again = build(None, None);
+    assert_eq!(script()[first..again], ["l1_hit"], "{:?}", script());
+    // Another PATH or LANG is another run.
+    let moved = build(Some(&empty), None);
+    assert_eq!(
+        script()[again..moved].first().map(String::as_str),
+        Some("miss")
+    );
+    let relanged = build(Some(&empty), Some("C.UTF-8"));
+    assert_eq!(
+        script()[moved..relanged].first().map(String::as_str),
+        Some("miss")
+    );
 }
 
 #[test]
