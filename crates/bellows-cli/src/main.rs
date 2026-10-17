@@ -2899,10 +2899,38 @@ fn resolve_static_libraries(invocation: &Invocation, workspace: &Path) -> Result
 }
 
 fn relevant_environment(normalizer: &PathNormalizer) -> BTreeMap<String, String> {
-    env::vars()
+    relevant_environment_of(env::vars(), normalizer, cfg!(windows))
+}
+
+/// Windows variable names are case-insensitive, and the same variable reaches
+/// a build spelled differently (`Path` from Explorer and PowerShell, `PATH`
+/// from a POSIX shell), so on Windows each name is keyed in one spelling.
+fn relevant_environment_of(
+    vars: impl IntoIterator<Item = (String, String)>,
+    normalizer: &PathNormalizer,
+    case_insensitive: bool,
+) -> BTreeMap<String, String> {
+    vars.into_iter()
+        .map(|(name, value)| {
+            let name = if case_insensitive {
+                environment_spelling(&name)
+            } else {
+                name
+            };
+            (name, value)
+        })
         .filter(|(name, _)| is_relevant_environment_name(name))
         .map(|(name, value)| (name, normalizer.normalize(&value)))
         .collect()
+}
+
+/// The spelling a case-insensitive variable name is keyed under: its entry in
+/// [`EXACT_ENVIRONMENT`], else upper case (every other list is upper case).
+fn environment_spelling(name: &str) -> String {
+    EXACT_ENVIRONMENT
+        .iter()
+        .find(|listed| listed.eq_ignore_ascii_case(name))
+        .map_or_else(|| name.to_ascii_uppercase(), |listed| (*listed).to_string())
 }
 
 /// The environment a compile's key covers: the relevant environment without
@@ -2917,7 +2945,13 @@ fn compile_environment(
     normalizer: &PathNormalizer,
     path_use: &PathUse,
 ) -> BTreeMap<String, String> {
-    let mut environment = relevant_environment(normalizer);
+    without_shell(relevant_environment(normalizer), path_use)
+}
+
+fn without_shell(
+    mut environment: BTreeMap<String, String>,
+    path_use: &PathUse,
+) -> BTreeMap<String, String> {
     for name in SHELL_ENVIRONMENT {
         environment.remove(*name);
     }
@@ -2967,6 +3001,44 @@ fn path_use(invocation: &Invocation) -> PathUse {
     }
 }
 
+const EXACT_ENVIRONMENT: &[&str] = &[
+    "AR",
+    "CC",
+    "CXX",
+    "DEBUG",
+    "DYLD_LIBRARY_PATH",
+    "HOME",
+    "HOST",
+    "INCLUDE",
+    "LANG",
+    "LC_ALL",
+    "LD_LIBRARY_PATH",
+    "LIB",
+    "LIBPATH",
+    "LIBRARY_PATH",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "NM",
+    "OBJCOPY",
+    "OPT_LEVEL",
+    "OUT_DIR",
+    "PATH",
+    "PROFILE",
+    "RANLIB",
+    "SDKROOT",
+    "SOURCE_DATE_EPOCH",
+    "STRIP",
+    "TARGET",
+    "TZ",
+    "UCRTVersion",
+    "UniversalCRTSdkDir",
+    "VCINSTALLDIR",
+    "VCToolsInstallDir",
+    "VCToolsVersion",
+    "VSINSTALLDIR",
+    "WindowsSdkDir",
+    "WindowsSDKVersion",
+];
+
 fn is_relevant_environment_name(name: &str) -> bool {
     // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
     // output. A crate that reads one with env!/option_env! is still tracked
@@ -2993,43 +3065,6 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
     ];
-    const EXACT: &[&str] = &[
-        "AR",
-        "CC",
-        "CXX",
-        "DEBUG",
-        "DYLD_LIBRARY_PATH",
-        "HOME",
-        "HOST",
-        "INCLUDE",
-        "LANG",
-        "LC_ALL",
-        "LD_LIBRARY_PATH",
-        "LIB",
-        "LIBPATH",
-        "LIBRARY_PATH",
-        "MACOSX_DEPLOYMENT_TARGET",
-        "NM",
-        "OBJCOPY",
-        "OPT_LEVEL",
-        "OUT_DIR",
-        "PATH",
-        "PROFILE",
-        "RANLIB",
-        "SDKROOT",
-        "SOURCE_DATE_EPOCH",
-        "STRIP",
-        "TARGET",
-        "TZ",
-        "UCRTVersion",
-        "UniversalCRTSdkDir",
-        "VCINSTALLDIR",
-        "VCToolsInstallDir",
-        "VCToolsVersion",
-        "VSINSTALLDIR",
-        "WindowsSdkDir",
-        "WindowsSDKVersion",
-    ];
     const PREFIXES: &[&str] = &[
         "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
         "LDFLAGS", "RUST",
@@ -3046,7 +3081,8 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     !BELLOWS_CONTROL.contains(&name)
         && !EXCLUDED_CARGO_CONTROL.contains(&name)
-        && (EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+        && (EXACT_ENVIRONMENT.contains(&name)
+            || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
 }
 
 fn hash_field(hasher: &mut blake3::Hasher, name: &str, bytes: &[u8]) {
@@ -6899,6 +6935,39 @@ mod tests {
             }
         }
         assert!(compile_environment(&normalizer, &PathUse::Whole).contains_key("PATH"));
+    }
+
+    #[test]
+    fn windows_keys_each_variable_in_one_spelling() {
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = || {
+            [
+                ("Path", r"C:\bin"),
+                ("Home", r"C:\Users\me"),
+                ("ucrtversion", "10.0"),
+                ("Cargo_Pkg_Name", "demo"),
+                ("RUSTFLAGS", "-Dwarnings"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        };
+        let windows = relevant_environment_of(vars(), &normalizer, true);
+        assert_eq!(
+            windows.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "HOME", "PATH", "RUSTFLAGS", "UCRTVersion"]
+        );
+        // On other systems `Path` is a different variable from `PATH`.
+        let posix = relevant_environment_of(vars(), &normalizer, false);
+        assert_eq!(
+            posix.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["RUSTFLAGS"]
+        );
+        // So the shell's variables leave a compile key however they are spelled.
+        let compile = without_shell(windows.clone(), &PathUse::None);
+        assert_eq!(
+            compile.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "RUSTFLAGS", "UCRTVersion"]
+        );
+        assert!(without_shell(windows, &PathUse::Whole).contains_key("PATH"));
     }
 
     #[test]
