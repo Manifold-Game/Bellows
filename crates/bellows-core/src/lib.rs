@@ -1061,7 +1061,7 @@ impl Store {
         let path = self.blob_path(expected)?;
         let committed = self.with_mutation_lock(|| {
             if path.exists() {
-                if self.read_blob(expected).is_ok() {
+                if self.verify_blob(expected).is_ok() {
                     self.touch_blob(expected)?;
                     return Ok(false);
                 }
@@ -1086,6 +1086,24 @@ impl Store {
             bail!("corrupt blob {digest}: content hashes to {actual}")
         }
         Ok(bytes)
+    }
+
+    /// Checks that the stored blob is present and hashes to `digest`, reading
+    /// it as a stream: a caller that only checks a blob never holds its bytes.
+    /// Existence checks and publications used `read_blob` for this, one
+    /// whole-blob buffer per concurrent request, and bellowsd sat at 1.7 GB
+    /// resident. Returns the blob's size.
+    pub fn verify_blob(&self, digest: &str) -> Result<u64> {
+        let path = self.blob_path(digest)?;
+        let mut file = File::open(&path).with_context(|| format!("read blob {digest}"))?;
+        let mut hasher = blake3::Hasher::new();
+        let size =
+            std::io::copy(&mut file, &mut hasher).with_context(|| format!("read blob {digest}"))?;
+        let actual = hasher.finalize().to_hex().to_string();
+        if actual != digest {
+            bail!("corrupt blob {digest}: content hashes to {actual}")
+        }
+        Ok(size)
     }
 
     pub fn read_candidates(&self, static_key: &str) -> Result<CandidateIndex> {
@@ -2376,6 +2394,20 @@ mod tests {
         .unwrap();
         assert!(store.gc(0).is_err());
         assert_eq!(store.read_blob(&digest).unwrap(), bytes);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verify_blob_streams_a_good_blob_and_rejects_a_corrupt_or_absent_one() {
+        let root = std::env::temp_dir().join(format!("bellows-verify-test-{}", now_ms()));
+        let store = Store::open(&root).unwrap();
+        let bytes = vec![7u8; 3 * 1024 * 1024 + 5];
+        let digest = digest_bytes(&bytes);
+        store.put_blob(&digest, &bytes).unwrap();
+        assert_eq!(store.verify_blob(&digest).unwrap(), bytes.len() as u64);
+        fs::write(store.blob_path(&digest).unwrap(), b"tampered").unwrap();
+        assert!(store.verify_blob(&digest).is_err());
+        assert!(store.verify_blob(&digest_bytes(b"never stored")).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

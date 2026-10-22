@@ -363,7 +363,7 @@ async fn head_blob(
             return Err(ApiError(StatusCode::NOT_FOUND, "blob not found".into()));
         }
         // A corrupt blob reads as absent, so the client uploads a good copy.
-        if store.read_blob(&digest).is_err() {
+        if store.verify_blob(&digest).is_err() {
             return Err(ApiError(StatusCode::NOT_FOUND, "blob is corrupt".into()));
         }
         store.touch_blob(&digest).map_err(internal)?;
@@ -488,7 +488,7 @@ fn store_candidate(state: &AppState, mut candidate: ActionCandidate) -> ApiResul
     validate_candidate_manifest(&candidate)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     for artifact in &candidate.artifacts {
-        state.store.read_blob(&artifact.digest).map_err(|_| {
+        state.store.verify_blob(&artifact.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("referenced blob {} is absent or corrupt", artifact.digest),
@@ -612,7 +612,7 @@ async fn put_archive(
     for file in &manifest.files {
         validate_relative_path(&file.file_name)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-        state.store.read_blob(&file.digest).map_err(|_| {
+        state.store.verify_blob(&file.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("archive blob {} is absent or corrupt", file.digest),
@@ -786,7 +786,7 @@ fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiRe
     for artifact in record.inputs.iter().chain(&record.outputs) {
         validate_relative_path(&artifact.file_name)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-        store.read_blob(&artifact.digest).map_err(|_| {
+        store.verify_blob(&artifact.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("record blob {} is absent or corrupt", artifact.digest),

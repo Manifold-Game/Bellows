@@ -1187,7 +1187,9 @@ mod tests {
         }
 
         fn blob(&self, candidate: &ActionCandidate) -> bool {
-            self.store.read_blob(&candidate.artifacts[0].digest).is_ok()
+            self.store
+                .verify_blob(&candidate.artifacts[0].digest)
+                .is_ok()
         }
 
         fn options(&self, max_bytes: u64) -> GcOptions {
