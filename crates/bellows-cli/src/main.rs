@@ -3421,7 +3421,7 @@ fn without_shell(
     mut environment: BTreeMap<String, String>,
     path_use: &PathUse,
 ) -> BTreeMap<String, String> {
-    for name in SHELL_ENVIRONMENT {
+    for name in SHELL_ENVIRONMENT.iter().chain(OUTPUT_LOCATION_ENVIRONMENT) {
         environment.remove(*name);
     }
     if cfg!(windows) {
@@ -3436,6 +3436,14 @@ fn without_shell(
 }
 
 const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// Where Cargo puts its outputs never changes what the compiler writes: the
+/// target directory is normalized out of the compile, and a crate that reads
+/// one of these with env!/option_env! is still tracked exactly through
+/// dep-info. A build script can read them at run time, so its runs keep them.
+/// Without this, two builds of one crate that differ only in whether
+/// CARGO_TARGET_DIR is set missed each other's results.
+const OUTPUT_LOCATION_ENVIRONMENT: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"];
 
 /// What PATH can change about one compile.
 #[derive(Debug, PartialEq, Eq)]
@@ -8002,6 +8010,28 @@ release: 1.92.0
             }
         }
         assert!(compile_environment(&normalizer, &PathUse::Whole).contains_key("PATH"));
+    }
+
+    #[test]
+    fn compile_keys_leave_out_the_target_directory_but_build_scripts_keep_it() {
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = |target: Option<&str>| {
+            let mut vars = vec![("RUSTFLAGS".to_string(), "-Dwarnings".to_string())];
+            if let Some(target) = target {
+                vars.push(("CARGO_TARGET_DIR".to_string(), target.to_string()));
+                vars.push(("CARGO_BUILD_TARGET_DIR".to_string(), target.to_string()));
+            }
+            vars
+        };
+        let set = relevant_environment_of(vars(Some("/lanes/a/target")), &normalizer, false);
+        let unset = relevant_environment_of(vars(None), &normalizer, false);
+        // A build script's run sees it.
+        assert!(set.contains_key("CARGO_TARGET_DIR"));
+        // A compile's key is the same, set or unset.
+        assert_eq!(
+            without_shell(set, &PathUse::None),
+            without_shell(unset, &PathUse::None)
+        );
     }
 
     #[test]
