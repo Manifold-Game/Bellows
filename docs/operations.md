@@ -67,6 +67,17 @@ Rolling mixed-version deployments are unsupported. A protocol mismatch is a
 clean miss or an explicit doctor failure, never authorization to restore an old
 artifact.
 
+## Restored outputs and fsync
+
+A restore writes each output to a temporary file beside it and renames it into
+place, so a reader never sees a partial file. By default it also syncs the file
+and then its directory. `BELLOWS_SYNC_OUTPUTS=0` drops those two syncs for
+restored outputs only (compiler results, build-script `OUT_DIR` files, archive
+and declared-action trees): they can always be restored or built again, and a
+hit-heavy build restores thousands of them. On a build host with one SATA SSD,
+2000 files of 200 KB took 16.2 s with the syncs and 0.4 s without. The store's
+own blobs and records keep their syncs whatever this is set to.
+
 ## Far servers: the relay
 
 Cargo starts a new wrapper process for every rustc invocation, and each one

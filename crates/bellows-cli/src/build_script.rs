@@ -23,8 +23,8 @@ use super::{
 use anyhow::{Context, Result, anyhow, bail};
 use bellows_core::{
     ActionCandidate, Artifact, EnvInput, FileInput, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
-    Store, StreamArtifact, atomic_write, compiler_action_key, digest_bytes, now_ms,
-    validate_candidate_manifest, validate_relative_path,
+    Store, StreamArtifact, atomic_write, atomic_write_output, compiler_action_key, digest_bytes,
+    now_ms, validate_candidate_manifest, validate_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -875,7 +875,7 @@ fn restore(
     fs::create_dir_all(out_dir)?;
     for (relative, executable, bytes) in files {
         let destination = super::safe_destination(out_dir, &relative)?;
-        atomic_write(&destination, bytes)?;
+        atomic_write_output(&destination, bytes)?;
         super::set_file_executable(&destination, executable)?;
     }
     std::io::stdout().write_all(&identity.normalizer.localize_bytes(&stdout))?;

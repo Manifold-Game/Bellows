@@ -4,9 +4,10 @@ use bellows_core::{
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcOptions, GcReport, GcRequest,
     HealthResponse, LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
     PinnedCheckout, PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write,
-    compiler_action_key, declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home,
-    tree_digest, validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
-    validate_declared_record, validate_relative_path,
+    atomic_write_output, compiler_action_key, declared_action_key, digest_bytes, now_ms,
+    parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
+    validate_candidate_manifest, validate_declared_command, validate_declared_record,
+    validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
@@ -3971,7 +3972,7 @@ fn restore_with(
 /// that is running (a test binary still executing, or a loaded DLL) but
 /// allows renaming it; move it aside and sweep leftovers on later restores.
 fn install_output(destination: &Path, bytes: &[u8]) -> Result<()> {
-    match atomic_write(destination, bytes) {
+    match atomic_write_output(destination, bytes) {
         Ok(()) => Ok(()),
         #[cfg(windows)]
         Err(error) if destination.exists() => {
@@ -3988,7 +3989,7 @@ fn install_output(destination: &Path, bytes: &[u8]) -> Result<()> {
             fs::rename(destination, &aside).with_context(|| {
                 format!("replace in-use output {}: {error:#}", destination.display())
             })?;
-            atomic_write(destination, bytes)?;
+            atomic_write_output(destination, bytes)?;
             sweep_replaced(parent);
             Ok(())
         }
@@ -5726,7 +5727,7 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
             for (artifact, bytes) in staged {
                 let relative = validate_relative_path(&artifact.file_name)?;
                 let destination = safe_destination(&restore_root, &relative)?;
-                atomic_write(&destination, &bytes)?;
+                atomic_write_output(&destination, &bytes)?;
                 set_file_executable(&destination, artifact.executable)?;
             }
             println!(
