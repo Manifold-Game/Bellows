@@ -3063,17 +3063,27 @@ fn normalized_compiler_arguments(
         if arg.starts_with("--diagnostic-width=") {
             continue;
         }
+        // A `--remap-path-prefix` names a checkout, target or Cargo home path
+        // too (cargo-mod maps its target directory to `target` for every
+        // crate). It rewrites only the embedded paths of files under it, which
+        // enter the key through dep-info, normalized the same way; left
+        // literal, one lane's target path kept each wasm32 guest dependency
+        // from serving any other lane or the `next` warmer.
         let is_path = path_value
             || source.as_deref() == Some(arg.as_str())
             || arg.starts_with("--out-dir=")
             || arg.starts_with("--extern=")
-            || arg.starts_with("-Ldependency=");
+            || arg.starts_with("-Ldependency=")
+            || arg.starts_with("--remap-path-prefix=");
         normalized.push(if is_path {
             normalizer.normalize(arg)
         } else {
             arg.clone()
         });
-        path_value = matches!(arg.as_str(), "--out-dir" | "--extern" | "-L");
+        path_value = matches!(
+            arg.as_str(),
+            "--out-dir" | "--extern" | "-L" | "--remap-path-prefix"
+        );
     }
     normalized
 }
@@ -7494,6 +7504,51 @@ mod tests {
         let args = normalized_compiler_arguments(&plain, &normalizer);
         assert_eq!(normalized_compiler_arguments(&spaced, &normalizer), args);
         assert_eq!(normalized_compiler_arguments(&joined, &normalizer), args);
+    }
+
+    #[test]
+    fn remapped_target_and_cargo_home_paths_share_one_key_across_checkouts() {
+        // cargo-mod's guest builds pass `--remap-path-prefix=<target>=target`
+        // and `<cargo home>=/cargo` to every crate; two lanes differ only in
+        // those paths and must share each dependency's result.
+        let temp = tempfile::tempdir().unwrap();
+        let lane = |name: &str| {
+            let target = format!("/lanes/{name}/target/test-mod-slots/shared");
+            let home = format!("/homes/{name}/cargo");
+            let normalizer = PathNormalizer::new(vec![
+                ("$TARGET".into(), PathBuf::from(&target)),
+                ("$CARGO_HOME".into(), PathBuf::from(&home)),
+            ]);
+            let mut invocation = test_invocation(temp.path(), &[], vec![]);
+            invocation.args = [
+                "--crate-name".into(),
+                "serde_core".into(),
+                format!("--remap-path-prefix={home}=/cargo"),
+                "--remap-path-prefix".into(),
+                format!("{target}=target"),
+            ]
+            .to_vec();
+            normalized_compiler_arguments(&invocation, &normalizer)
+        };
+        let a = lane("a");
+        assert_eq!(a, lane("b"));
+        assert_eq!(
+            a[2..],
+            [
+                "--remap-path-prefix=$CARGO_HOME=/cargo",
+                "--remap-path-prefix",
+                "$TARGET=target"
+            ]
+        );
+        // A remap of a path outside every known base stays literal: it still
+        // tells two compiles apart.
+        let mut other = test_invocation(temp.path(), &[], vec![]);
+        other.args = vec!["--remap-path-prefix=/opt/vendored=v".into()];
+        let none = PathNormalizer::new(vec![]);
+        assert_eq!(
+            normalized_compiler_arguments(&other, &none),
+            ["--remap-path-prefix=/opt/vendored=v"]
+        );
     }
 
     #[test]
