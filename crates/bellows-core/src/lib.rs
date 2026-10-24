@@ -1330,7 +1330,11 @@ fn cleanup_orphan_temps(root: &Path, minimum_age: Duration) -> Result<()> {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= minimum_age);
         if old_enough {
-            fs::remove_file(path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     Ok(())
@@ -1340,48 +1344,67 @@ fn collect_paths(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     collect_paths_internal(root, files, false)
 }
 
+// The store changes while it is walked: a publication renames its `.tmp-`
+// file into place, and a collection deletes what it evicts. An entry listed
+// but gone by the time it is read was renamed or removed, and is skipped; on
+// a build host the bare ENOENT failed a whole collection and left the store
+// over its budget until the next one (2026-10-24).
 fn collect_paths_internal(
     root: &Path,
     files: &mut Vec<PathBuf>,
     include_temps: bool,
 ) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            bail!("store traversal encountered symlink: {}", path.display())
-        }
-        if metadata.is_dir() {
-            collect_paths_internal(&path, files, include_temps)?;
-        } else if metadata.is_file() {
-            if !include_temps
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".tmp-"))
-            {
-                continue;
-            }
-            files.push(path);
-        } else {
-            bail!(
-                "store traversal encountered non-file entry: {}",
-                path.display()
-            )
-        }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        collect_path(entry?.path(), files, include_temps)?;
     }
     Ok(())
+}
+
+fn collect_path(path: PathBuf, files: &mut Vec<PathBuf>, include_temps: bool) -> Result<()> {
+    if !include_temps
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp-"))
+    {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("store traversal encountered symlink: {}", path.display())
+    }
+    if metadata.is_dir() {
+        collect_paths_internal(&path, files, include_temps)
+    } else if metadata.is_file() {
+        files.push(path);
+        Ok(())
+    } else {
+        bail!(
+            "store traversal encountered non-file entry: {}",
+            path.display()
+        )
+    }
 }
 
 fn directory_bytes(root: &Path) -> Result<u64> {
     let mut files = Vec::new();
     collect_paths(root, &mut files)?;
-    files.into_iter().try_fold(0u64, |total, path| {
-        Ok(total.saturating_add(fs::metadata(path)?.len()))
-    })
+    files
+        .into_iter()
+        .try_fold(0u64, |total, path| match fs::metadata(path) {
+            Ok(metadata) => Ok(total.saturating_add(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(total),
+            Err(error) => Err(error.into()),
+        })
 }
 
 pub fn validate_relative_path(value: &str) -> Result<PathBuf> {
@@ -2434,6 +2457,30 @@ mod tests {
         fs::write(&temp, b"partial json").unwrap();
         assert!(store.gc(0).is_ok());
         assert!(temp.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_store_walk_skips_entries_renamed_or_removed_after_the_listing() {
+        // What a collection sees when a publication renames its temporary
+        // file between `read_dir` and the entry's metadata: a listed path
+        // that is gone. The walk skips it instead of failing the collection.
+        let root = std::env::temp_dir().join(format!("bellows-walk-race-test-{}", now_ms()));
+        let directory = root.join("blobs").join("aa");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("kept"), b"blob").unwrap();
+        let mut files = Vec::new();
+        for include_temps in [false, true] {
+            files.clear();
+            collect_path(directory.join("renamed-away"), &mut files, include_temps).unwrap();
+            collect_path(directory.join(".tmp-1-2-3"), &mut files, include_temps).unwrap();
+            collect_path(root.join("removed-directory"), &mut files, include_temps).unwrap();
+            assert!(files.is_empty());
+        }
+        collect_paths_internal(&root.join("blobs").join("gone"), &mut files, false).unwrap();
+        collect_paths(&root.join("blobs"), &mut files).unwrap();
+        assert_eq!(files, vec![directory.join("kept")]);
+        assert_eq!(directory_bytes(&root.join("blobs")).unwrap(), 4);
         let _ = fs::remove_dir_all(root);
     }
 }
