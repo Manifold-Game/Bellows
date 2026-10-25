@@ -57,6 +57,10 @@ pub struct GcOptions {
     /// store on the machine whose checkouts its candidates name, so a local
     /// collection sets it and a server's never does.
     pub evict_missing_checkouts: bool,
+    /// Evict these compiler candidates whatever the budget, each named
+    /// `<static key>/<action key>`: a result that must not be served again,
+    /// such as one published under a key that did not describe it.
+    pub drop: Vec<String>,
 }
 
 /// Runs each batch of mutations; a server wraps them in its own write lock.
@@ -437,6 +441,8 @@ struct Plan {
     unreferenced: Vec<u32>,
     protected_unreferenced: u64,
     bytes_after: u64,
+    /// Candidates evicted because `GcOptions::drop` named them.
+    dropped: u64,
 }
 
 impl Plan {
@@ -457,13 +463,27 @@ impl Plan {
             }
         }
         let mut order = (0..snapshot.units.len() as u32).collect::<Vec<_>>();
+        let dropped = options
+            .drop
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let named = |unit: &Unit| {
+            unit.static_key
+                .as_deref()
+                .zip(unit.candidate.as_ref())
+                .is_some_and(|(static_key, (action_key, _))| {
+                    dropped.contains(format!("{static_key}/{action_key}").as_str())
+                })
+        };
         // Evicted whatever the budget: nothing can use them again.
         let obsolete = |unit: &Unit| {
             unit.candidate.is_some()
-                && (options
-                    .min_protocol
-                    .zip(unit.protocol)
-                    .is_some_and(|(minimum, protocol)| protocol < minimum)
+                && (named(unit)
+                    || options
+                        .min_protocol
+                        .zip(unit.protocol)
+                        .is_some_and(|(minimum, protocol)| protocol < minimum)
                     || (options.evict_missing_checkouts
                         && matches!(unit.scope, Scope::PinnedDeleted(_))))
         };
@@ -527,12 +547,19 @@ impl Plan {
             }
             evict(index, &mut bytes_after, &mut executable_bytes);
         }
+        let dropped = snapshot
+            .units
+            .iter()
+            .zip(&evicted)
+            .filter(|(unit, evicted)| **evicted && named(unit))
+            .count() as u64;
         Self {
             evicted,
             freed,
             unreferenced,
             protected_unreferenced,
             bytes_after,
+            dropped,
         }
     }
 
@@ -635,6 +662,7 @@ impl Plan {
             deleted_checkout_records: deleted_checkouts.iter().map(|c| c.records).sum(),
             deleted_checkout_bytes: deleted_checkouts.iter().map(|c| c.evicted_bytes).sum(),
             deleted_checkouts,
+            dropped: Some(self.dropped),
             breakdown,
         }
     }
@@ -1374,6 +1402,37 @@ mod tests {
         assert_eq!(report.records_evicted, 1);
         assert!(!fixture.present(&old) && !fixture.blob(&old));
         assert!(fixture.present(&current) && fixture.blob(&current));
+    }
+
+    #[test]
+    fn named_candidates_are_dropped_whatever_the_budget_after_a_dry_run_changes_nothing() {
+        let fixture = Fixture::new("named");
+        let wrong = fixture.publish("wrong", 1, now_ms(), PROTOCOL_VERSION);
+        let kept = fixture.publish("kept", 2, 1_000, PROTOCOL_VERSION);
+        fixture.age_blobs();
+        let name = format!("{}/{}", wrong.static_key, wrong.action_key);
+        let absent = format!("{}/{}", kept.static_key, wrong.action_key);
+        let options = GcOptions {
+            drop: vec![name, absent],
+            ..fixture.options(u64::MAX)
+        };
+        let planned = fixture
+            .store
+            .collect(
+                &GcOptions {
+                    dry_run: true,
+                    ..options.clone()
+                },
+                &unserialized,
+            )
+            .unwrap();
+        assert_eq!((planned.records_evicted, planned.dropped), (1, Some(1)));
+        assert!(fixture.present(&wrong) && fixture.blob(&wrong));
+        let report = fixture.store.collect(&options, &unserialized).unwrap();
+        assert_eq!((report.records_evicted, report.dropped), (1, Some(1)));
+        assert!(!fixture.present(&wrong) && !fixture.blob(&wrong));
+        // A name whose action key belongs to another static key drops nothing.
+        assert!(fixture.present(&kept) && fixture.blob(&kept));
     }
 
     #[test]

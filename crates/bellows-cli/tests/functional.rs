@@ -1343,6 +1343,46 @@ fn incremental_compiles_publish_only_from_scratch_sessions() {
 }
 
 #[test]
+fn an_incremental_result_and_a_non_incremental_one_never_stand_in_for_each_other() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 1 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let build = |f: &Fixture, incremental: &str| {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--offline"])
+                .env("CARGO_INCREMENTAL", incremental),
+        )
+    };
+    // A from-scratch incremental compile is stored ...
+    build(&f, "1");
+    // ... but a non-incremental build of the same sources elsewhere does not
+    // restore it, and stores its own result.
+    second_checkout(&mut f, "non-incremental checkout");
+    let plain = build(&f, "0");
+    assert!(
+        !decisions(&plain, "fixture")
+            .iter()
+            .any(|d| d.contains("HIT")),
+        "{}",
+        stderr(&plain)
+    );
+    // Each kind restores its own kind.
+    second_checkout(&mut f, "third checkout");
+    assert_eq!(
+        decisions(&build(&f, "0"), "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"]
+    );
+    second_checkout(&mut f, "fourth checkout");
+    assert_eq!(
+        decisions(&build(&f, "1"), "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"]
+    );
+}
+
+#[test]
 fn proc_macro_consumers_share_across_checkouts() {
     let mut f = Fixture::new(
         "pub fn value() -> u32 { derive::answer!() }",

@@ -6,8 +6,8 @@ use bellows_core::{
     PinnedCheckout, PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write,
     atomic_write_output, compiler_action_key, declared_action_key, digest_bytes, now_ms,
     parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
-    validate_candidate_manifest, validate_declared_command, validate_declared_record,
-    validate_relative_path,
+    validate_candidate_manifest, validate_content_key, validate_declared_command,
+    validate_declared_record, validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
@@ -157,6 +157,14 @@ enum Commands {
         /// whatever the budget (also set by BELLOWS_KEEP_MISSING_CHECKOUTS=1).
         #[arg(long)]
         keep_missing_checkouts: bool,
+        /// Evict this compiler candidate whatever the budget, named
+        /// `<static key>/<action key>` (from the `store` event that published
+        /// it). Repeatable; run with `--dry-run` first.
+        #[arg(long = "drop", value_name = "STATIC/ACTION")]
+        drop: Vec<String>,
+        /// Read more `--drop` names from this file, one per line.
+        #[arg(long, value_name = "FILE")]
+        drop_file: Option<PathBuf>,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -357,12 +365,35 @@ fn run_cli() -> Result<i32> {
             min_protocol,
             max_executable_mb,
             keep_missing_checkouts,
+            mut drop,
+            drop_file,
             json,
             local,
             cache_dir,
             store_dir,
             connection,
         } => {
+            if let Some(file) = &drop_file {
+                let text = fs::read_to_string(file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                drop.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            for name in &drop {
+                let valid = name
+                    .split_once('/')
+                    .is_some_and(|(static_key, action_key)| {
+                        validate_content_key(static_key).is_ok()
+                            && validate_content_key(action_key).is_ok()
+                    });
+                if !valid {
+                    bail!("--drop takes <static key>/<action key>, not {name:?}");
+                }
+            }
             let options = GcOptions {
                 max_bytes: max_mb.saturating_mul(1024 * 1024),
                 dry_run,
@@ -372,6 +403,7 @@ fn run_cli() -> Result<i32> {
                 // looked for here; a server never does (see `PinnedCheckout`).
                 evict_missing_checkouts: (local || store_dir.is_some())
                     && !(keep_missing_checkouts || keep_missing_checkouts_from_env()),
+                drop: drop.clone(),
             };
             let report = if let Some(directory) = store_dir {
                 collect_store_directory(&directory, &options)?
@@ -384,10 +416,14 @@ fn run_cli() -> Result<i32> {
                     dry_run,
                     min_protocol,
                     max_executable_bytes: options.max_executable_bytes,
+                    drop,
                 })?;
                 // An older server ignores the field and applies only --max-mb.
                 if options.max_executable_bytes.is_some() && report.max_executable_bytes.is_none() {
                     bail!("this server does not support --max-executable-mb; upgrade bellowsd")
+                }
+                if !options.drop.is_empty() && report.dropped.is_none() {
+                    bail!("this server does not support --drop; upgrade bellowsd")
                 }
                 report
             };
@@ -473,8 +509,14 @@ fn print_gc_report(report: &GcReport) {
                 if report.dry_run { " (dry run)" } else { "" }
             ),
             &format!(
-                "{verb} {} of {} records · {} blobs",
-                report.records_evicted, report.records, report.blobs_evicted
+                "{verb} {} of {} records · {} blobs{}",
+                report.records_evicted,
+                report.records,
+                report.blobs_evicted,
+                match report.dropped {
+                    Some(dropped) if dropped > 0 => format!(" · {dropped} named by --drop"),
+                    _ => String::new(),
+                }
             ),
         )
     );
@@ -3035,9 +3077,12 @@ fn normalized_compiler_arguments(
     let mut path_value = false;
     let mut skip_next = false;
     for (index, arg) in invocation.args.iter().enumerate() {
-        // The incremental session directory is scratch state, not an input:
-        // incremental and non-incremental compiles of the same crate share
-        // one identity (see the incremental policy in compile_and_capture).
+        // The incremental session directory is scratch state, not an input,
+        // so its path stays out of the key. Whether the compile is
+        // incremental goes in: rustc then splits code into more codegen units
+        // and may reuse session state, so an incremental result must never
+        // be restored into a non-incremental build (a gate that builds like
+        // CI) or the other way round.
         if std::mem::take(&mut skip_next) {
             continue;
         }
@@ -3047,10 +3092,12 @@ fn normalized_compiler_arguments(
                 .get(index + 1)
                 .is_some_and(|value| value.starts_with("incremental="))
         {
+            normalized.push("-Cincremental".to_owned());
             skip_next = true;
             continue;
         }
         if arg.starts_with("-Cincremental=") {
+            normalized.push("-Cincremental".to_owned());
             continue;
         }
         // Terminal width only reflows rendered diagnostics. It is checked
@@ -7488,7 +7535,12 @@ mod tests {
     }
 
     #[test]
-    fn incremental_invocations_share_the_non_incremental_identity() {
+    fn incremental_invocations_share_one_identity_apart_from_non_incremental_ones() {
+        // The session path is scratch state, so every incremental compile of
+        // a crate shares one identity; whether a compile is incremental is
+        // not, so an incremental result never stands in for a
+        // non-incremental one (a gate that builds like CI restored results a
+        // fast-tier incremental probe had published, 2026-10-25).
         let temp = tempfile::tempdir().unwrap();
         let emit = ["--crate-type=rlib", "--emit=dep-info,link"];
         let plain = analyze_with(temp.path(), &emit).unwrap();
@@ -7501,9 +7553,20 @@ mod tests {
             analyze_with(temp.path(), &[emit[0], emit[1], "-Cincremental=/y/incr"]).unwrap();
         assert_eq!(spaced.incremental, Some(PathBuf::from("/x/incr")));
         let normalizer = PathNormalizer::new(vec![]);
-        let args = normalized_compiler_arguments(&plain, &normalizer);
-        assert_eq!(normalized_compiler_arguments(&spaced, &normalizer), args);
-        assert_eq!(normalized_compiler_arguments(&joined, &normalizer), args);
+        let incremental = normalized_compiler_arguments(&spaced, &normalizer);
+        assert_eq!(
+            normalized_compiler_arguments(&joined, &normalizer),
+            incremental
+        );
+        assert_ne!(
+            normalized_compiler_arguments(&plain, &normalizer),
+            incremental
+        );
+        assert!(
+            !incremental
+                .iter()
+                .any(|arg| arg.contains("incr=") || arg.contains("/incr"))
+        );
     }
 
     #[test]

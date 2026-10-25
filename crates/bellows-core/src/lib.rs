@@ -547,6 +547,10 @@ pub struct GcReport {
     /// Planned blob deletions skipped because they were reused mid-collection.
     #[serde(default)]
     pub skipped_blobs: u64,
+    /// Candidates evicted because the request named them (`GcRequest::drop`);
+    /// absent from a server that predates naming them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
     #[serde(default)]
     pub journal_entries: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +604,9 @@ pub struct GcRequest {
     /// Separate budget for final executables; see `GcOptions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_executable_bytes: Option<u64>,
+    /// Compiler candidates to evict whatever the budget; see `GcOptions`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

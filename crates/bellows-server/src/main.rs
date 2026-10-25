@@ -720,6 +720,7 @@ async fn gc(
         // A server holds other machines' records: whether a client's
         // checkout exists is not something it can look up.
         evict_missing_checkouts: false,
+        drop: request.drop,
     };
     collect(&state, options).await.map(Json).map_err(internal)
 }
