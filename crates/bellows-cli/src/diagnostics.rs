@@ -113,7 +113,21 @@ fn rotated(path: &Path, n: usize) -> PathBuf {
 }
 
 pub fn append(path: &Path, event: &Event) -> Result<()> {
-    append_with_limit(path, event, LOG_LIMIT)
+    append_with_limit(
+        path,
+        event,
+        log_limit(std::env::var("BELLOWS_EVENT_LOG_MAX_MB").ok().as_deref()),
+    )
+}
+
+/// The size at which the event log rotates (three files are kept): `BELLOWS_EVENT_LOG_MAX_MB` megabytes, 1 to 1024,
+/// else [`LOG_LIMIT`]. A build host that wants a day of decisions (Manifold, 2026-10-28: 16 MB held about 5 hours)
+/// raises it; appends stay unsynced either way.
+fn log_limit(setting: Option<&str>) -> u64 {
+    match setting.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb @ 1..=1024) => mb * 1024 * 1024,
+        _ => LOG_LIMIT,
+    }
 }
 
 fn append_with_limit(path: &Path, event: &Event, limit: u64) -> Result<()> {
@@ -772,6 +786,16 @@ mod tests {
         assert_eq!(events[0].session_id.as_deref(), Some("4"));
         assert_eq!(events[2].session_id.as_deref(), Some("6"));
         assert!(!rotated(&path, 3).exists());
+    }
+
+    #[test]
+    fn the_rotation_size_comes_from_the_environment_within_bounds() {
+        assert_eq!(log_limit(None), LOG_LIMIT);
+        assert_eq!(log_limit(Some("128")), 128 * 1024 * 1024);
+        assert_eq!(log_limit(Some(" 64 ")), 64 * 1024 * 1024);
+        assert_eq!(log_limit(Some("0")), LOG_LIMIT);
+        assert_eq!(log_limit(Some("5000")), LOG_LIMIT);
+        assert_eq!(log_limit(Some("lots")), LOG_LIMIT);
     }
 
     #[test]

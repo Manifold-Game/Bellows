@@ -1274,6 +1274,16 @@ mod tests {
     /// A write a crash cut short (simulated by truncating the blob) is found by verification and replaced by the next
     /// upload of the same digest.
     #[test]
+    fn a_marker_file_in_the_data_directory_turns_the_stores_fsyncs_off_at_runtime() {
+        let fixture = Fixture::new("sync-marker");
+        assert!(fixture.store.durable(), "durable by default");
+        fs::write(fixture.root.join(crate::STORE_SYNC_OFF), b"").unwrap();
+        assert!(!fixture.store.durable(), "off while the marker exists");
+        fs::remove_file(fixture.root.join(crate::STORE_SYNC_OFF)).unwrap();
+        assert!(fixture.store.durable(), "on again once it's gone");
+    }
+
+    #[test]
     fn a_store_without_fsyncs_still_verifies_and_replaces_a_torn_blob() {
         let fixture = Fixture::new("no-sync");
         let payload = vec![9u8; 4096];

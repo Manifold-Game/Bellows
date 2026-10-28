@@ -1021,8 +1021,15 @@ impl Store {
         Ok(self.root.join("archives").join(format!("{name}.json")))
     }
 
+    /// Whether this store syncs what it writes: not under `BELLOWS_STORE_SYNC=0`, and not while
+    /// [`STORE_SYNC_OFF`] exists in its data directory. The file is a switch a running server reads at every write,
+    /// so an operator turns the fsyncs off or on without a restart or a change to the service's environment.
+    pub fn durable(&self) -> bool {
+        store_durable() && !self.root.join(STORE_SYNC_OFF).exists()
+    }
+
     pub fn put_blob(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
-        self.put_blob_with(expected, bytes, store_durable())
+        self.put_blob_with(expected, bytes, self.durable())
     }
 
     /// [`Store::put_blob`] with the store's durability given: `durable` false skips the blob's fsync and its
@@ -1073,7 +1080,7 @@ impl Store {
     /// `temp`) when a verified copy was already present, refreshing it so a
     /// running collection keeps it.
     pub fn commit_blob(&self, expected: &str, temp: &Path) -> Result<bool> {
-        self.commit_blob_with(expected, temp, store_durable())
+        self.commit_blob_with(expected, temp, self.durable())
     }
 
     /// [`Store::commit_blob`] with the store's durability given ([`store_durable`]).
@@ -1167,7 +1174,7 @@ impl Store {
         let (static_key, action_key) = (candidate.static_key.clone(), candidate.action_key.clone());
         index.candidates.insert(0, candidate);
         index.candidates.truncate(max_candidates.max(1));
-        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, store_durable())?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, self.durable())?;
         self.record_use(&static_key, &action_key)
     }
 
@@ -1213,7 +1220,7 @@ impl Store {
             bail!("declared action key already exists with different content")
         }
         fs::create_dir_all(path.parent().context("declared path has no parent")?)?;
-        atomic_write_with(&path, &serde_json::to_vec_pretty(record)?, store_durable())?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(record)?, self.durable())?;
         Ok(true)
     }
 
@@ -1246,11 +1253,7 @@ impl Store {
             }
             bail!("archive name is already bound to a different tree")
         }
-        atomic_write_with(
-            &path,
-            &serde_json::to_vec_pretty(manifest)?,
-            store_durable(),
-        )?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(manifest)?, self.durable())?;
         Ok(true)
     }
 
@@ -1557,6 +1560,9 @@ pub fn atomic_write_output(path: &Path, bytes: &[u8]) -> Result<()> {
 /// quarantined, so a write lost to a crash costs a cache miss, never a wrong result; what the fsyncs bought was
 /// only warmth after a host crash. On the Manifold build host they were about 14 disk flushes per stored result
 /// and drove its 90%+ busy stretches (r = 0.86 against the store events, 2026-10-28).
+/// While this file exists in a store's data directory, the store skips its fsyncs ([`Store::durable`]).
+pub const STORE_SYNC_OFF: &str = ".store-sync-off";
+
 pub fn store_durable() -> bool {
     static DURABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DURABLE.get_or_init(|| std::env::var("BELLOWS_STORE_SYNC").as_deref() != Ok("0"))

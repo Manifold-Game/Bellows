@@ -388,7 +388,7 @@ async fn put_blob(
         .store
         .blob_temp_path(&digest)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let received = receive_blob(&temp, body, state.max_blob_bytes).await;
+    let received = receive_blob(&temp, body, state.max_blob_bytes, state.store.durable()).await;
     let actual = match received {
         Ok(actual) => actual,
         Err(error) => {
@@ -416,7 +416,7 @@ async fn put_blob(
 }
 
 /// Writes `body` to `temp`, synced, and returns its digest.
-async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String> {
+async fn receive_blob(temp: &FsPath, body: Body, limit: u64, durable: bool) -> ApiResult<String> {
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -439,8 +439,8 @@ async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(internal)?;
     }
-    if bellows_core::store_durable() {
-        file.sync_all().await.map_err(internal)?; // BELLOWS_STORE_SYNC=0 skips it (see store_durable)
+    if durable {
+        file.sync_all().await.map_err(internal)?; // skipped while the store isn't durable (Store::durable)
     }
     Ok(hasher.finalize().to_hex().to_string())
 }
