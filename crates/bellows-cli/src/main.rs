@@ -4056,7 +4056,7 @@ fn restore_with(
     for (artifact, link) in candidate.artifacts.iter().zip(linked) {
         if let Some(blob) = link {
             let destination = invocation.out_dir.join(&artifact.file_name);
-            link_output(&blob, &destination, artifact.executable)?;
+            link_output(&blob, &destination)?;
             identity.digests.remember(&destination, &artifact.digest);
             continue;
         }
@@ -6324,14 +6324,20 @@ fn link_store() -> Option<PathBuf> {
 /// Outputs smaller than this are written, not linked: the copy costs little, and a link shares the file.
 const LINK_MIN_BYTES: u64 = 64 * 1024;
 
-/// The store blob `artifact` can be linked from into `out_dir`, or None: never a `.d` (rewritten per checkout, and
-/// rustc truncates it in place), never one under [`LINK_MIN_BYTES`], and only from a store on `out_dir`'s
-/// filesystem.
+/// The store blob `artifact` can be linked from into `out_dir`, or None:
+/// - never a `.d` (rewritten per checkout, and rustc truncates it in place);
+/// - never a `.rmeta`: a link carries the blob's mtime, and Cargo calls a dependent stale only when a dependency's
+///   output is newer than the dependent's (for a metadata-only edge, the `.rmeta` alone). A written `.rmeta` gives
+///   every restore one output with the current mtime, so a dependency replaced by a restore is seen as rebuilt
+///   (Manifold #100054: linked rmetas kept stale dependents, E0460/E0463);
+/// - never an executable output whose blob isn't executable (a link can't change the shared inode's mode);
+/// - never one under [`LINK_MIN_BYTES`], and only from a store on `out_dir`'s filesystem.
 fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Option<PathBuf> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if artifact.file_name.ends_with(".d")
+            || artifact.file_name.ends_with(".rmeta")
             || artifact.digest.len() != 64
             || !artifact.digest.bytes().all(|b| b.is_ascii_hexdigit())
         {
@@ -6343,6 +6349,9 @@ fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Opti
             .join(&artifact.digest);
         let meta = fs::metadata(&blob).ok()?;
         if !meta.is_file() || meta.len() < LINK_MIN_BYTES {
+            return None;
+        }
+        if artifact.executable && meta.permissions().mode() & 0o111 == 0 {
             return None;
         }
         let dir = fs::metadata(out_dir).ok()?;
@@ -6358,22 +6367,14 @@ fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Opti
 static LINK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Replace `destination` with a hardlink to `blob`, through a temporary name and a rename (as `atomic_write`). The
-/// blob is made read-only first (0444, 0555 for an executable; never back from 0555), so a tool that opens a linked
-/// output to write it in place fails with a permission error instead of changing the store and every other link.
-fn link_output(blob: &Path, destination: &Path, executable: bool) -> Result<()> {
+/// shared inode is never changed: no mode, no time (a read-only blob failed every upload that refreshed it, and a
+/// touched one would make every other checkout's dependents stale). The compiler, the linker and Cargo replace
+/// outputs by rename, so a linked output isn't written in place; `bellows verify-links` finds one that was.
+fn link_output(blob: &Path, destination: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(blob)?;
-        let mode = meta.permissions().mode() & 0o777;
-        let want = if executable || mode & 0o111 != 0 {
-            0o555
-        } else {
-            0o444
-        };
-        if mode != want {
-            fs::set_permissions(blob, fs::Permissions::from_mode(want))?;
-        }
         // Already this blob (a unit restored again with the same output): nothing to do. A rename of one link of an
         // inode onto another link of it succeeds without moving anything (POSIX), which would leave the temporary.
         if let Ok(existing) = fs::symlink_metadata(destination)
@@ -6400,7 +6401,7 @@ fn link_output(blob: &Path, destination: &Path, executable: bool) -> Result<()> 
     }
     #[cfg(not(unix))]
     {
-        let _ = (blob, destination, executable);
+        let _ = (blob, destination);
         bail!("linking outputs needs a unix filesystem")
     }
 }
@@ -6854,31 +6855,32 @@ mod tests {
             }
         }
 
+        fn mode_and_mtime(path: &Path) -> (u32, std::time::SystemTime) {
+            let meta = fs::metadata(path).unwrap();
+            (meta.permissions().mode() & 0o777, meta.modified().unwrap())
+        }
+
         #[test]
-        fn a_large_output_is_linked_read_only_and_a_second_restore_replaces_the_link() {
+        fn a_large_rlib_is_linked_and_the_shared_blob_keeps_its_mode_and_time() {
             let root = tempfile::tempdir().unwrap();
             let (store, out) = (root.path().join("store"), root.path().join("out"));
             fs::create_dir_all(&out).unwrap();
             let bytes = vec![7u8; 200 * 1024];
             let digest = blob(&store, &bytes);
-            let rlib = artifact("libx-1.rlib", &digest, false);
-            let source =
-                linkable_blob(&store, &rlib, &out).expect("a large blob on this filesystem links");
+            let source = linkable_blob(&store, &artifact("libx-1.rlib", &digest, false), &out)
+                .expect("a large rlib blob on this filesystem links");
+            let before = mode_and_mtime(&source);
             let destination = out.join("libx-1.rlib");
             fs::write(&destination, b"an older build").unwrap();
-            link_output(&source, &destination, false).unwrap();
+            link_output(&source, &destination).unwrap();
             assert_eq!(fs::read(&destination).unwrap(), bytes);
-            let meta = fs::metadata(&destination).unwrap();
-            assert_eq!(meta.nlink(), 2, "the output and the blob share one inode");
-            assert_eq!(meta.permissions().mode() & 0o777, 0o444);
-            if unsafe { libc_geteuid() } != 0 {
-                let write = fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .open(&destination);
-                assert!(write.is_err(), "an in-place write through the link fails");
-            }
-            link_output(&source, &destination, false).unwrap(); // again: replaced, still one link
+            assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2, "one inode");
+            assert_eq!(
+                mode_and_mtime(&source),
+                before,
+                "the shared inode's mode and time are untouched"
+            );
+            link_output(&source, &destination).unwrap(); // again: the same inode, nothing to do
             assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2);
             assert!(
                 fs::read_dir(&out).unwrap().all(|e| !e
@@ -6890,27 +6892,42 @@ mod tests {
             );
         }
 
+        /// Never a `.rmeta` (Manifold #100054): a link carries the blob's mtime, and Cargo calls a dependent stale
+        /// only when a dependency's output is newer than its own (the `.rmeta` alone for a metadata-only edge).
+        /// Linked rlib+rmeta kept dependents of a rebuilt dependency fresh: E0460/E0463. With the `.rmeta` written,
+        /// every restore leaves one output with the current mtime (the plain-cargo red/green: rlib-only passes).
         #[test]
-        fn an_executable_blob_stays_executable_and_small_or_dep_info_outputs_are_never_linked() {
+        fn rmeta_dep_info_small_and_non_executable_blobs_for_executables_are_never_linked() {
             let root = tempfile::tempdir().unwrap();
             let (store, out) = (root.path().join("store"), root.path().join("out"));
             fs::create_dir_all(&out).unwrap();
             let big = blob(&store, &vec![3u8; 100 * 1024]);
-            let exe = linkable_blob(&store, &artifact("tests-1", &big, true), &out).unwrap();
-            link_output(&exe, &out.join("tests-1"), true).unwrap();
-            link_output(&exe, &out.join("libsame.rlib"), false).unwrap(); // never back from 0555
-            assert_eq!(
-                fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
-                0o555
-            );
-            let small = blob(&store, b"tiny");
             assert!(
-                linkable_blob(&store, &artifact("libtiny.rmeta", &small, false), &out).is_none()
+                linkable_blob(&store, &artifact("libbig-1.rmeta", &big, false), &out).is_none()
             );
             assert!(linkable_blob(&store, &artifact("x.d", &big, false), &out).is_none());
+            let small = blob(&store, b"tiny");
+            assert!(
+                linkable_blob(&store, &artifact("libtiny.rlib", &small, false), &out).is_none()
+            );
             assert!(
                 linkable_blob(&store, &artifact("liby.rlib", &"0".repeat(64), false), &out)
                     .is_none()
+            );
+            // An executable output only from an executable blob: a link can't make the shared inode executable.
+            assert!(linkable_blob(&store, &artifact("tests-1", &big, true), &out).is_none());
+            let exe_digest = blob(&store, &vec![4u8; 100 * 1024]);
+            let exe_blob = store.join("blobs").join(&exe_digest[..2]).join(&exe_digest);
+            fs::set_permissions(&exe_blob, fs::Permissions::from_mode(0o755)).unwrap();
+            let exe = linkable_blob(&store, &artifact("tests-2", &exe_digest, true), &out).unwrap();
+            link_output(&exe, &out.join("tests-2")).unwrap();
+            assert_eq!(
+                fs::metadata(out.join("tests-2"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
             );
         }
 
@@ -6923,24 +6940,18 @@ mod tests {
             let bad = blob(&store, &vec![2u8; 100 * 1024]);
             for (name, digest) in [("libgood.rlib", &good), ("libbad.rlib", &bad)] {
                 let source = linkable_blob(&store, &artifact(name, digest, false), &out).unwrap();
-                link_output(&source, &out.join(name), false).unwrap();
+                link_output(&source, &out.join(name)).unwrap();
             }
             fs::write(out.join("unlinked.rlib"), vec![9u8; 100 * 1024]).unwrap(); // not the store's: ignored
             let report = verify_links(&store, &[out.clone()], false).unwrap();
             assert_eq!((report.checked, report.mismatched.len()), (2, 0));
-            // An in-place write past the read-only mode (as root, or after a chmod) changes the shared inode.
+            // A tool writing a linked output in place changes the shared inode.
             let target = out.join("libbad.rlib");
-            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
             fs::write(&target, vec![3u8; 100 * 1024]).unwrap();
             let report = verify_links(&store, &[out.clone()], true).unwrap();
             assert_eq!(report.mismatched.len(), 1);
             assert_eq!(report.mismatched[0].0, target);
             assert!(!target.exists(), "removed");
-        }
-
-        unsafe extern "C" {
-            #[link_name = "geteuid"]
-            fn libc_geteuid() -> u32;
         }
     }
 

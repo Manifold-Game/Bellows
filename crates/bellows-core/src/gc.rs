@@ -94,7 +94,9 @@ impl Store {
     /// keeps it for the record about to reference it.
     pub fn touch_blob(&self, digest: &str) -> Result<()> {
         let path = self.blob_path(digest)?;
-        let file = fs::OpenOptions::new().append(true).open(&path)?;
+        // Opened read-only: setting a file's times needs its owner, not write permission, so a read-only blob refreshes
+        // too (Manifold, 2026-10-28: blobs left read-only failed every upload that found them, with HTTP 500).
+        let file = fs::File::open(&path)?;
         file.set_modified(SystemTime::now())?;
         Ok(())
     }
@@ -1232,6 +1234,36 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// Manifold, 2026-10-28: blobs a link had left read-only failed every upload that found them already stored
+    /// (commit_blob's refresh opened them for writing: Permission denied, HTTP 500).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_blob_still_refreshes_and_accepts_the_same_upload() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("read-only");
+        let payload = vec![6u8; 100];
+        let digest = digest_bytes(&payload);
+        fixture.store.put_blob(&digest, &payload).unwrap();
+        let path = fixture.store.blob_path(&digest).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::open(&path).unwrap().set_modified(old).unwrap();
+        fixture.store.touch_blob(&digest).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+        assert!(
+            !fixture.store.put_blob(&digest, &payload).unwrap(),
+            "already stored, not an error"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "mode untouched"
+        );
     }
 
     #[test]
