@@ -86,6 +86,20 @@ enum Commands {
         #[arg(long)]
         spool_dir: Option<PathBuf>,
     },
+    /// Check that outputs linked from the store (BELLOWS_LINK_OUTPUTS) still hold their blob's bytes: every file
+    /// under the roots that shares an inode with a store blob must hash to that blob's digest. Prints each mismatch
+    /// (removing it with --remove) and exits 1 if there was any.
+    VerifyLinks {
+        /// The store's data directory (bellowsd --data-dir).
+        #[arg(long)]
+        store: PathBuf,
+        /// Remove each mismatching file (cargo rebuilds that unit).
+        #[arg(long)]
+        remove: bool,
+        /// Directories to check (a lane's target/<profile>/deps, say).
+        #[arg(required = true)]
+        roots: Vec<PathBuf>,
+    },
     /// Check server connectivity and the local toolchain.
     Doctor {
         #[arg(long, env = "BELLOWS_SERVER", default_value = "http://127.0.0.1:7878")]
@@ -308,6 +322,22 @@ fn run_cli() -> Result<i32> {
             env_file,
             spool_dir,
         } => run_relay(server, token, listen, env_file, spool_dir),
+        Commands::VerifyLinks {
+            store,
+            remove,
+            roots,
+        } => {
+            let report = verify_links(&store, &roots, remove)?;
+            println!(
+                "verify-links: {} linked files checked, {} mismatched",
+                report.checked,
+                report.mismatched.len()
+            );
+            for (path, want, got) in &report.mismatched {
+                println!("MISMATCH {} expected {want} got {got}", path.display());
+            }
+            Ok(if report.mismatched.is_empty() { 0 } else { 1 })
+        }
         Commands::Doctor { server, token } => {
             doctor(&server, token.as_deref())?;
             Ok(0)
@@ -3984,10 +4014,24 @@ fn restore_with(
             bail!("manifest contains unexpected output {}", artifact.file_name)
         }
     }
+    // Local link mode (`link_store`): an output whose blob is in the store on this filesystem is linked from it, not
+    // fetched and written.
+    let link_root = link_store();
+    let linked = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            link_root
+                .as_deref()
+                .and_then(|root| linkable_blob(root, artifact, &invocation.out_dir))
+        })
+        .collect::<Vec<Option<PathBuf>>>();
     let digests = candidate
         .artifacts
         .iter()
-        .map(|artifact| artifact.digest.as_str())
+        .zip(&linked)
+        .filter(|(_, link)| link.is_none())
+        .map(|(artifact, _)| artifact.digest.as_str())
         .chain([
             candidate.stdout.digest.as_str(),
             candidate.stderr.digest.as_str(),
@@ -4003,13 +4047,22 @@ fn restore_with(
     }
     let stderr_blob = blobs.pop().expect("stderr requested");
     let stdout_blob = blobs.pop().expect("stdout requested");
-    let downloaded = candidate.artifacts.iter().zip(blobs).collect::<Vec<_>>();
     if stdout_blob.len() as u64 != candidate.stdout.len
         || stderr_blob.len() as u64 != candidate.stderr.len
     {
         bail!("compiler stream length does not match manifest")
     }
-    for (artifact, stored) in downloaded {
+    let mut fetched = blobs.into_iter();
+    for (artifact, link) in candidate.artifacts.iter().zip(linked) {
+        if let Some(blob) = link {
+            let destination = invocation.out_dir.join(&artifact.file_name);
+            link_output(&blob, &destination, artifact.executable)?;
+            identity.digests.remember(&destination, &artifact.digest);
+            continue;
+        }
+        let stored = fetched
+            .next()
+            .context("blob fetch returned too few blobs")?;
         let bytes = if artifact.file_name.ends_with(".d") {
             localize_env_deps(
                 &transform_dep_info(&stored, &identity.normalizer, true),
@@ -6259,6 +6312,167 @@ fn safe_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(current)
 }
 
+/// The store an output may be linked from: `BELLOWS_LINK_STORE` (the store's data directory, the one `bellowsd
+/// --data-dir` names) when `BELLOWS_LINK_OUTPUTS=1`. Unix only.
+fn link_store() -> Option<PathBuf> {
+    if !cfg!(unix) || env::var_os("BELLOWS_LINK_OUTPUTS").as_deref() != Some(OsStr::new("1")) {
+        return None;
+    }
+    env::var_os("BELLOWS_LINK_STORE").map(PathBuf::from)
+}
+
+/// Outputs smaller than this are written, not linked: the copy costs little, and a link shares the file.
+const LINK_MIN_BYTES: u64 = 64 * 1024;
+
+/// The store blob `artifact` can be linked from into `out_dir`, or None: never a `.d` (rewritten per checkout, and
+/// rustc truncates it in place), never one under [`LINK_MIN_BYTES`], and only from a store on `out_dir`'s
+/// filesystem.
+fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if artifact.file_name.ends_with(".d")
+            || artifact.digest.len() != 64
+            || !artifact.digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let blob = store_root
+            .join("blobs")
+            .join(&artifact.digest[..2])
+            .join(&artifact.digest);
+        let meta = fs::metadata(&blob).ok()?;
+        if !meta.is_file() || meta.len() < LINK_MIN_BYTES {
+            return None;
+        }
+        let dir = fs::metadata(out_dir).ok()?;
+        (dir.dev() == meta.dev()).then_some(blob)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store_root, artifact, out_dir);
+        None
+    }
+}
+
+static LINK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace `destination` with a hardlink to `blob`, through a temporary name and a rename (as `atomic_write`). The
+/// blob is made read-only first (0444, 0555 for an executable; never back from 0555), so a tool that opens a linked
+/// output to write it in place fails with a permission error instead of changing the store and every other link.
+fn link_output(blob: &Path, destination: &Path, executable: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::metadata(blob)?;
+        let mode = meta.permissions().mode() & 0o777;
+        let want = if executable || mode & 0o111 != 0 {
+            0o555
+        } else {
+            0o444
+        };
+        if mode != want {
+            fs::set_permissions(blob, fs::Permissions::from_mode(want))?;
+        }
+        // Already this blob (a unit restored again with the same output): nothing to do. A rename of one link of an
+        // inode onto another link of it succeeds without moving anything (POSIX), which would leave the temporary.
+        if let Ok(existing) = fs::symlink_metadata(destination)
+            && existing.dev() == meta.dev()
+            && existing.ino() == meta.ino()
+        {
+            return Ok(());
+        }
+        let parent = destination.parent().context("destination has no parent")?;
+        let temp = parent.join(format!(
+            ".bellows-link-{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            LINK_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::hard_link(blob, &temp)
+            .with_context(|| format!("link {} from the store", destination.display()))?;
+        let renamed = fs::rename(&temp, destination);
+        // The temporary is gone after a rename that moved it; one that found the same inode at `destination` (a
+        // racing restore of the same blob) leaves it.
+        let _ = fs::remove_file(&temp);
+        renamed?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (blob, destination, executable);
+        bail!("linking outputs needs a unix filesystem")
+    }
+}
+
+struct LinkReport {
+    checked: usize,
+    mismatched: Vec<(PathBuf, String, String)>,
+}
+
+/// [`Commands::VerifyLinks`]: the store's blob inodes (metadata only), then every file under `roots` with one of
+/// those inodes, hashed and compared to the blob's digest.
+fn verify_links(store: &Path, roots: &[PathBuf], remove: bool) -> Result<LinkReport> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut blobs = BTreeMap::<(u64, u64), String>::new();
+        let dir = store.join("blobs");
+        for shard in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.len() != 64 {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata()
+                    && meta.nlink() > 1
+                {
+                    blobs.insert((meta.dev(), meta.ino()), name);
+                }
+            }
+        }
+        let mut report = LinkReport {
+            checked: 0,
+            mismatched: Vec::new(),
+        };
+        let mut pending = roots.to_vec();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                let Some(want) = blobs.get(&(meta.dev(), meta.ino())) else {
+                    continue;
+                };
+                report.checked += 1;
+                let got = bellows_core::digest_file(&entry.path())?;
+                if &got != want {
+                    if remove {
+                        fs::remove_file(entry.path())?;
+                    }
+                    report.mismatched.push((entry.path(), want.clone(), got));
+                }
+            }
+        }
+        Ok(report)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, roots, remove);
+        bail!("verify-links needs a unix filesystem")
+    }
+}
+
 fn set_file_executable(path: &Path, executable: bool) -> Result<()> {
     #[cfg(unix)]
     if executable {
@@ -6619,6 +6833,117 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod link_outputs {
+        use super::super::*;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn blob(store: &Path, bytes: &[u8]) -> String {
+            let digest = bellows_core::digest_bytes(bytes);
+            let dir = store.join("blobs").join(&digest[..2]);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(&digest), bytes).unwrap();
+            digest
+        }
+
+        fn artifact(name: &str, digest: &str, executable: bool) -> Artifact {
+            Artifact {
+                file_name: name.to_owned(),
+                digest: digest.to_owned(),
+                executable,
+            }
+        }
+
+        #[test]
+        fn a_large_output_is_linked_read_only_and_a_second_restore_replaces_the_link() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let bytes = vec![7u8; 200 * 1024];
+            let digest = blob(&store, &bytes);
+            let rlib = artifact("libx-1.rlib", &digest, false);
+            let source =
+                linkable_blob(&store, &rlib, &out).expect("a large blob on this filesystem links");
+            let destination = out.join("libx-1.rlib");
+            fs::write(&destination, b"an older build").unwrap();
+            link_output(&source, &destination, false).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            let meta = fs::metadata(&destination).unwrap();
+            assert_eq!(meta.nlink(), 2, "the output and the blob share one inode");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o444);
+            if unsafe { libc_geteuid() } != 0 {
+                let write = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&destination);
+                assert!(write.is_err(), "an in-place write through the link fails");
+            }
+            link_output(&source, &destination, false).unwrap(); // again: replaced, still one link
+            assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2);
+            assert!(
+                fs::read_dir(&out).unwrap().all(|e| !e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bellows-link-")),
+                "no temporary left behind"
+            );
+        }
+
+        #[test]
+        fn an_executable_blob_stays_executable_and_small_or_dep_info_outputs_are_never_linked() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let big = blob(&store, &vec![3u8; 100 * 1024]);
+            let exe = linkable_blob(&store, &artifact("tests-1", &big, true), &out).unwrap();
+            link_output(&exe, &out.join("tests-1"), true).unwrap();
+            link_output(&exe, &out.join("libsame.rlib"), false).unwrap(); // never back from 0555
+            assert_eq!(
+                fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+            let small = blob(&store, b"tiny");
+            assert!(
+                linkable_blob(&store, &artifact("libtiny.rmeta", &small, false), &out).is_none()
+            );
+            assert!(linkable_blob(&store, &artifact("x.d", &big, false), &out).is_none());
+            assert!(
+                linkable_blob(&store, &artifact("liby.rlib", &"0".repeat(64), false), &out)
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn verify_links_finds_a_linked_output_whose_bytes_changed_and_removes_it() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let good = blob(&store, &vec![1u8; 100 * 1024]);
+            let bad = blob(&store, &vec![2u8; 100 * 1024]);
+            for (name, digest) in [("libgood.rlib", &good), ("libbad.rlib", &bad)] {
+                let source = linkable_blob(&store, &artifact(name, digest, false), &out).unwrap();
+                link_output(&source, &out.join(name), false).unwrap();
+            }
+            fs::write(out.join("unlinked.rlib"), vec![9u8; 100 * 1024]).unwrap(); // not the store's: ignored
+            let report = verify_links(&store, &[out.clone()], false).unwrap();
+            assert_eq!((report.checked, report.mismatched.len()), (2, 0));
+            // An in-place write past the read-only mode (as root, or after a chmod) changes the shared inode.
+            let target = out.join("libbad.rlib");
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+            fs::write(&target, vec![3u8; 100 * 1024]).unwrap();
+            let report = verify_links(&store, &[out.clone()], true).unwrap();
+            assert_eq!(report.mismatched.len(), 1);
+            assert_eq!(report.mismatched[0].0, target);
+            assert!(!target.exists(), "removed");
+        }
+
+        unsafe extern "C" {
+            #[link_name = "geteuid"]
+            fn libc_geteuid() -> u32;
+        }
+    }
+
     use super::*;
 
     #[test]
