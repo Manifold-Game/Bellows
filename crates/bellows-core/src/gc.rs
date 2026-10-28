@@ -827,7 +827,11 @@ fn evict_from(path: &Path, units: &[&Unit], recent: &HashSet<(String, String)>) 
             Err(error) => return Err(error.into()),
         }
     } else {
-        atomic_write(path, &serde_json::to_vec_pretty(&index)?)?;
+        crate::atomic_write_with(
+            path,
+            &serde_json::to_vec_pretty(&index)?,
+            crate::store_durable(),
+        )?;
     }
     Ok(removed)
 }
@@ -1264,6 +1268,45 @@ mod tests {
             0o444,
             "mode untouched"
         );
+    }
+
+    /// BELLOWS_STORE_SYNC=0: a store without fsyncs keeps its guarantee, that a blob is the bytes its digest names.
+    /// A write a crash cut short (simulated by truncating the blob) is found by verification and replaced by the next
+    /// upload of the same digest.
+    #[test]
+    fn a_store_without_fsyncs_still_verifies_and_replaces_a_torn_blob() {
+        let fixture = Fixture::new("no-sync");
+        let payload = vec![9u8; 4096];
+        let digest = digest_bytes(&payload);
+        assert!(
+            fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "stored"
+        );
+        assert!(fixture.store.verify_blob(&digest).is_ok());
+        assert!(
+            !fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "already stored"
+        );
+        let path = fixture.store.blob_path(&digest).unwrap();
+        fs::write(&path, &payload[..100]).unwrap(); // torn by a crash
+        assert!(
+            fixture.store.verify_blob(&digest).is_err(),
+            "a torn blob fails verification"
+        );
+        assert!(
+            fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "replaced"
+        );
+        assert_eq!(fs::read(&path).unwrap(), payload);
     }
 
     #[test]

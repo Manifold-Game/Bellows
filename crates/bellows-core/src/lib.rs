@@ -1022,6 +1022,12 @@ impl Store {
     }
 
     pub fn put_blob(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
+        self.put_blob_with(expected, bytes, store_durable())
+    }
+
+    /// [`Store::put_blob`] with the store's durability given: `durable` false skips the blob's fsync and its
+    /// directory's ([`store_durable`]).
+    pub fn put_blob_with(&self, expected: &str, bytes: &[u8], durable: bool) -> Result<bool> {
         let actual = digest_bytes(bytes);
         if actual != expected {
             bail!("blob digest mismatch: expected {expected}, got {actual}")
@@ -1033,14 +1039,16 @@ impl Store {
                 .write(true)
                 .open(&temp)?;
             file.write_all(bytes)?;
-            file.sync_all()?;
+            if durable {
+                file.sync_all()?;
+            }
             Ok(())
         })();
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        self.commit_blob(expected, &temp)
+        self.commit_blob_with(expected, &temp, durable)
     }
 
     /// A fresh temporary path beside the blob's final location, for writing
@@ -1065,6 +1073,11 @@ impl Store {
     /// `temp`) when a verified copy was already present, refreshing it so a
     /// running collection keeps it.
     pub fn commit_blob(&self, expected: &str, temp: &Path) -> Result<bool> {
+        self.commit_blob_with(expected, temp, store_durable())
+    }
+
+    /// [`Store::commit_blob`] with the store's durability given ([`store_durable`]).
+    pub fn commit_blob_with(&self, expected: &str, temp: &Path, durable: bool) -> Result<bool> {
         let path = self.blob_path(expected)?;
         let committed = self.with_mutation_lock(|| {
             if path.exists() {
@@ -1076,7 +1089,9 @@ impl Store {
                     .with_context(|| format!("remove corrupt blob {expected}"))?;
             }
             fs::rename(temp, &path).with_context(|| format!("move blob {expected} into place"))?;
-            sync_parent(&path)?;
+            if durable {
+                sync_parent(&path)?;
+            }
             Ok(true)
         });
         if !matches!(committed, Ok(true)) {
@@ -1152,7 +1167,7 @@ impl Store {
         let (static_key, action_key) = (candidate.static_key.clone(), candidate.action_key.clone());
         index.candidates.insert(0, candidate);
         index.candidates.truncate(max_candidates.max(1));
-        atomic_write(&path, &serde_json::to_vec_pretty(&index)?)?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, store_durable())?;
         self.record_use(&static_key, &action_key)
     }
 
@@ -1198,7 +1213,7 @@ impl Store {
             bail!("declared action key already exists with different content")
         }
         fs::create_dir_all(path.parent().context("declared path has no parent")?)?;
-        atomic_write(&path, &serde_json::to_vec_pretty(record)?)?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(record)?, store_durable())?;
         Ok(true)
     }
 
@@ -1231,7 +1246,11 @@ impl Store {
             }
             bail!("archive name is already bound to a different tree")
         }
-        atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)?;
+        atomic_write_with(
+            &path,
+            &serde_json::to_vec_pretty(manifest)?,
+            store_durable(),
+        )?;
         Ok(true)
     }
 
@@ -1533,6 +1552,16 @@ pub fn atomic_write_output(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// False when `BELLOWS_SYNC_OUTPUTS=0`: restored outputs skip their fsyncs.
+/// False when `BELLOWS_STORE_SYNC=0`: the store (bellowsd, or a local cache) writes blobs and records without
+/// their fsyncs. Every blob is digest-verified when it is read or found again, and a record that fails to parse is
+/// quarantined, so a write lost to a crash costs a cache miss, never a wrong result; what the fsyncs bought was
+/// only warmth after a host crash. On the Manifold build host they were about 14 disk flushes per stored result
+/// and drove its 90%+ busy stretches (r = 0.86 against the store events, 2026-10-28).
+pub fn store_durable() -> bool {
+    static DURABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DURABLE.get_or_init(|| std::env::var("BELLOWS_STORE_SYNC").as_deref() != Ok("0"))
+}
+
 pub fn sync_outputs() -> bool {
     static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SYNC.get_or_init(|| std::env::var("BELLOWS_SYNC_OUTPUTS").as_deref() != Ok("0"))

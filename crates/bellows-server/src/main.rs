@@ -439,7 +439,9 @@ async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(internal)?;
     }
-    file.sync_all().await.map_err(internal)?;
+    if bellows_core::store_durable() {
+        file.sync_all().await.map_err(internal)?; // BELLOWS_STORE_SYNC=0 skips it (see store_durable)
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
