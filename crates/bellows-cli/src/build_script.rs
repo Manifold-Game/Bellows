@@ -23,8 +23,8 @@ use super::{
 use anyhow::{Context, Result, anyhow, bail};
 use bellows_core::{
     ActionCandidate, Artifact, EnvInput, FileInput, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
-    Store, StreamArtifact, atomic_write, atomic_write_output, compiler_action_key, digest_bytes,
-    now_ms, validate_candidate_manifest, validate_relative_path,
+    Store, StreamArtifact, atomic_write_output, compiler_action_key, digest_bytes, now_ms,
+    validate_candidate_manifest, validate_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,7 +96,8 @@ pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
         let _ = fs::rename(&real, &script);
         return Err(error);
     }
-    atomic_write(
+    // The launcher's record lives in OUT_DIR with the launcher itself: a build output.
+    atomic_write_output(
         &out_dir.join(RECORD),
         &serde_json::to_vec(&LauncherRecord { real: real_name })?,
     )

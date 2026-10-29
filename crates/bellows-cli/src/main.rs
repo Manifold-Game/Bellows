@@ -3408,7 +3408,7 @@ fn compiler_identity(rustc: &Path, state: &Path) -> Result<CompilerIdentity> {
         bail!("rustc -vV failed")
     }
     if let Some(memo) = memo {
-        let _ = atomic_write(&memo, &output.stdout);
+        let _ = bellows_core::atomic_write_state(&memo, &output.stdout);
     }
     Ok(CompilerIdentity {
         stdout: output.stdout,

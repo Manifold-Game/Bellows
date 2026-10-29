@@ -6,7 +6,7 @@
 //! changed within the last two seconds are never memoized, because a second
 //! write in the same timestamp tick could keep the same length and mtime.
 use anyhow::{Context, Result};
-use bellows_core::{atomic_write, digest_bytes, digest_file, validate_content_key};
+use bellows_core::{atomic_write_state, digest_bytes, digest_file, validate_content_key};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,7 +55,7 @@ impl Digests {
             .map(|after| identity(path, &after) == key)
             .unwrap_or(false);
         if settled && unchanged {
-            let _ = atomic_write(&memo, digest.as_bytes());
+            let _ = atomic_write_state(&memo, digest.as_bytes());
         }
         Ok(digest)
     }
@@ -75,7 +75,7 @@ impl Digests {
             return;
         }
         let key = identity(path, &metadata);
-        let _ = atomic_write(&root.join(&key[..2]).join(&key), digest.as_bytes());
+        let _ = atomic_write_state(&root.join(&key[..2]).join(&key), digest.as_bytes());
     }
 }
 

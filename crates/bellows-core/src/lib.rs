@@ -1554,6 +1554,18 @@ pub fn atomic_write_output(path: &Path, bytes: &[u8]) -> Result<()> {
     atomic_write_with(path, bytes, sync_outputs())
 }
 
+/// [`atomic_write`] for the client's own state: its file-digest and compiler
+/// memos and its diagnostics history under the state directory. The atomic
+/// rename stays and the fsyncs go, always: every memo is keyed by what it
+/// describes and checked when read (a digest must be a content key, a compiler
+/// identity must not be empty), and a history that no longer parses starts
+/// again, so a write lost to a crash costs a recomputation or a diagnostics
+/// line, never a wrong result. On the Manifold build host these writes were
+/// 2.55 of its 4.3 fsyncs a second (ftrace of ext4_sync_file_enter, 2026-10-29).
+pub fn atomic_write_state(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, bytes, false)
+}
+
 /// False when `BELLOWS_SYNC_OUTPUTS=0`: restored outputs skip their fsyncs.
 /// False when `BELLOWS_STORE_SYNC=0`: the store (bellowsd, or a local cache) writes blobs and records without
 /// their fsyncs. Every blob is digest-verified when it is read or found again, and a record that fails to parse is
@@ -1593,6 +1605,7 @@ pub fn atomic_write_with(path: &Path, bytes: &[u8], durable: bool) -> Result<()>
         file.write_all(bytes)?;
         if durable {
             file.sync_all()?;
+            note_sync();
         }
     }
     match fs::rename(&tmp, path) {
@@ -1620,7 +1633,19 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = path;
+    note_sync();
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fsyncs this thread's atomic writes issued: what the tests count.
+    static SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_sync() {
+    #[cfg(test)]
+    SYNCS.with(|count| count.set(count.get() + 1));
 }
 
 #[derive(Clone, Debug)]
@@ -1856,6 +1881,37 @@ fn split_makefile_words(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_state_is_written_whole_and_without_fsyncs() {
+        let dir =
+            std::env::temp_dir().join(format!("bellows-state-{}-{}", std::process::id(), now_ms()));
+        let syncs = || SYNCS.with(|count| count.get());
+        let before = syncs();
+        atomic_write(&dir.join("store-record"), b"durable").unwrap();
+        assert_eq!(
+            syncs() - before,
+            2,
+            "a durable write syncs the file, then its directory"
+        );
+        let before = syncs();
+        let memo = dir
+            .join("state")
+            .join("digests-v1")
+            .join("ab")
+            .join("abcdef");
+        atomic_write_state(&memo, b"first").unwrap();
+        atomic_write_state(&memo, b"second").unwrap();
+        assert_eq!(syncs() - before, 0, "client state never syncs");
+        assert_eq!(fs::read(&memo).unwrap(), b"second");
+        let leftovers = fs::read_dir(memo.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "no temporary file is left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_unsynced_write_still_replaces_the_file_whole() {
