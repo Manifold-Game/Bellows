@@ -3641,9 +3641,11 @@ const EXACT_ENVIRONMENT: &[&str] = &[
 ];
 
 fn is_relevant_environment_name(name: &str) -> bool {
-    // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
-    // output. A crate that reads one with env!/option_env! is still tracked
-    // exactly through dep-info.
+    // Scheduling, terminal, logging and rustup-proxy bookkeeping never reach
+    // rustc's output. A crate that reads one with env!/option_env! is still
+    // tracked exactly through dep-info. Logging especially must stay out: a
+    // probe run under CARGO_LOG missed every unit and stored a second copy of
+    // each (Manifold #100054, jobs 4093, 4106 and 4119).
     //
     // CARGO_HOLD_* belong to cargo-hold, a scheduler that runs one heavy
     // build at a time in front of Cargo. It marks everything inside a hold
@@ -3654,7 +3656,11 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CARGO_HOLD_ACTIVE",
         "CARGO_HOLD_LABEL",
         "CARGO_HOLD_SKIP",
+        "CARGO_HTTP_DEBUG",
         "CARGO_INCREMENTAL",
+        "CARGO_LOG",
+        "CARGO_LOG_PROFILE",
+        "CARGO_LOG_PROFILE_CAPTURE",
         "CARGO_MAKEFLAGS",
         "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
@@ -3664,12 +3670,14 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CARGO_TERM_QUIET",
         "CARGO_TERM_VERBOSE",
         "CLIPPY_TERMINAL_WIDTH",
+        "RUSTC_LOG",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTUP_AUTO_INSTALL",
         "RUSTUP_TOOLCHAIN_SOURCE",
         "RUST_BACKTRACE",
         "RUST_LOG",
+        "RUST_LOG_STYLE",
         "RUST_MIN_STACK",
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
@@ -8526,6 +8534,18 @@ release: 1.92.0
         assert!(!is_relevant_environment_name("GITHUB_RUN_ID"));
         assert!(!is_relevant_environment_name("GITHUB_ENV"));
         assert!(!is_relevant_environment_name("BELLOWS_AUTH_TOKEN"));
+        for logging in [
+            "CARGO_LOG",
+            "CARGO_LOG_PROFILE",
+            "CARGO_HTTP_DEBUG",
+            "RUSTC_LOG",
+            "RUST_LOG_STYLE",
+        ] {
+            assert!(
+                !is_relevant_environment_name(logging),
+                "{logging} only changes logging"
+            );
+        }
         assert!(is_relevant_environment_name("RUSTFLAGS"));
         assert!(is_relevant_environment_name("CARGO_MANIFEST_DIR"));
         assert!(is_relevant_environment_name("CC_x86_64_unknown_linux_gnu"));
