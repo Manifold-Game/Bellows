@@ -3662,6 +3662,10 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CARGO_LOG_PROFILE",
         "CARGO_LOG_PROFILE_CAPTURE",
         "CARGO_MAKEFLAGS",
+        // How Cargo fetches a git dependency (its own client or the git CLI) never reaches rustc: the fetched
+        // sources are hashed as inputs anyway. Keyed, it split every unit of a lane that sets it from the same
+        // unit elsewhere (Manifold's Zomvivor lane, build host 4241, 2026-10-30).
+        "CARGO_NET_GIT_FETCH_WITH_CLI",
         "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
         "CARGO_TERM_COLOR",
@@ -8544,6 +8548,21 @@ release: 1.92.0
             assert!(
                 !is_relevant_environment_name(logging),
                 "{logging} only changes logging"
+            );
+        }
+        assert!(!is_relevant_environment_name(
+            "CARGO_NET_GIT_FETCH_WITH_CLI"
+        ));
+        // What changes rustc's output stays in the key: flags (lints included, since a cached result replays its
+        // diagnostics) and profile settings.
+        for compile in [
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        ] {
+            assert!(
+                is_relevant_environment_name(compile),
+                "{compile} stays keyed"
             );
         }
         assert!(is_relevant_environment_name("RUSTFLAGS"));
