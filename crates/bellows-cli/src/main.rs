@@ -3232,8 +3232,13 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "remap",
         b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
-    let path_use = path_use(invocation, host_triple(&compiler.stdout).as_deref());
-    for (name, value) in compile_environment(&normalizer, &path_use) {
+    let host = host_triple(&compiler.stdout);
+    let path_use = path_use(invocation, host.as_deref());
+    let own_target = option_value(&invocation.args, "--target").or(host);
+    for (name, value) in without_other_targets(
+        compile_environment(&normalizer, &path_use),
+        own_target.as_deref(),
+    ) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
             format!("environment changed: {name}"),
@@ -3527,6 +3532,55 @@ fn without_shell(
 }
 
 const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// The compile's environment without the variables Cargo and the cc crate scope to another target triple:
+/// `CARGO_TARGET_<TRIPLE>_{RUSTFLAGS,LINKER,RUNNER,RUSTDOCFLAGS}` and `AR_`, `CC_`, `CXX_`, `CFLAGS_`,
+/// `CXXFLAGS_`, `CPPFLAGS_`, `RANLIB_` with a lower-case `<triple>` (either `-` or `_` spelling). Cargo turns the
+/// unit's own target's flags into rustc arguments, which are keyed; another target's never reach this compile.
+/// Keyed, a Windows cross-check's `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS` split every Linux unit of a lane
+/// that sets it from the same unit elsewhere (Manifold #100054: 625 compile-minutes over 46 jobs, 2026-10-31). Its
+/// own target's variables stay: a proc macro may read one. Without a known target nothing is dropped. Build-script
+/// runs keep every variable.
+fn without_other_targets(
+    mut environment: BTreeMap<String, String>,
+    own_target: Option<&str>,
+) -> BTreeMap<String, String> {
+    let Some(own) = own_target else {
+        return environment;
+    };
+    environment.retain(|name, _| !scoped_to_another_target(name, own));
+    environment
+}
+
+const TARGET_SCOPED_CARGO: &[&str] = &["_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS"];
+const TARGET_SCOPED_TOOLS: &[&str] = &[
+    "AR_",
+    "CC_",
+    "CXX_",
+    "CFLAGS_",
+    "CXXFLAGS_",
+    "CPPFLAGS_",
+    "RANLIB_",
+];
+
+fn scoped_to_another_target(name: &str, own: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("CARGO_TARGET_") {
+        let own_upper = own.to_ascii_uppercase().replace(['-', '.'], "_");
+        return TARGET_SCOPED_CARGO
+            .iter()
+            .any(|suffix| rest.ends_with(suffix) && rest.len() > suffix.len())
+            && !rest.starts_with(&format!("{own_upper}_"));
+    }
+    TARGET_SCOPED_TOOLS.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|triple| {
+            let looks_like_triple = triple.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+            }) && triple.chars().filter(|c| matches!(c, '-' | '_')).count()
+                >= 2;
+            looks_like_triple && triple.replace(['-', '.'], "_") != own.replace(['-', '.'], "_")
+        })
+    })
+}
 
 /// Where Cargo puts its outputs never changes what the compiler writes: the
 /// target directory is normalized out of the compile, and a crate that reads
@@ -8535,6 +8589,65 @@ release: 1.92.0
             ["CARGO_PKG_NAME", "RUSTFLAGS", "UCRTVersion"]
         );
         assert!(without_shell(windows, &PathUse::Whole).contains_key("PATH"));
+    }
+
+    #[test]
+    fn a_compile_keeps_only_its_own_targets_scoped_variables() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let all = env(&[
+            (
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+                "-D warnings",
+            ),
+            ("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "lld-link"),
+            (
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                "-D warnings",
+            ),
+            ("AR_x86_64_pc_windows_msvc", "llvm-lib"),
+            ("CC_x86_64-pc-windows-msvc", "clang-cl"),
+            ("CC_x86_64_unknown_linux_gnu", "cc"),
+            ("CC_ENABLE_DEBUG_OUTPUT", "1"),
+            ("CARGO_TARGET_DIR", "/t"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-Dwarnings"),
+            ("RUSTFLAGS", "-Dwarnings"),
+        ]);
+        let linux = without_other_targets(all.clone(), Some("x86_64-unknown-linux-gnu"));
+        // Another target's flags and tools never reach a Linux unit.
+        for gone in [
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+            "AR_x86_64_pc_windows_msvc",
+            "CC_x86_64-pc-windows-msvc",
+        ] {
+            assert!(!linux.contains_key(gone), "{gone}");
+        }
+        // Its own target's, the unscoped lint flags and anything that isn't a triple stay.
+        for kept in [
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            "CC_x86_64_unknown_linux_gnu",
+            "CC_ENABLE_DEBUG_OUTPUT",
+            "CARGO_TARGET_DIR",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTFLAGS",
+        ] {
+            assert!(linux.contains_key(kept), "{kept}");
+        }
+        // The Windows unit keeps the Windows variables and drops the Linux ones.
+        let windows = without_other_targets(all.clone(), Some("x86_64-pc-windows-msvc"));
+        assert!(windows.contains_key("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"));
+        assert!(windows.contains_key("CC_x86_64-pc-windows-msvc"));
+        assert!(!windows.contains_key("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
+        // wasm32 keeps neither host's.
+        let wasm = without_other_targets(all.clone(), Some("wasm32-unknown-unknown"));
+        assert!(!wasm.contains_key("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
+        // Without a known target nothing is dropped.
+        assert_eq!(without_other_targets(all.clone(), None), all);
     }
 
     #[test]
