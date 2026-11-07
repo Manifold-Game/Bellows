@@ -2676,6 +2676,14 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
 }
 
 fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNormalizer {
+    PathNormalizer::new(normalizer_bases(workspace, out_dir, source))
+}
+
+fn normalizer_bases(
+    workspace: &Path,
+    out_dir: &Path,
+    source: Option<&Path>,
+) -> Vec<(String, PathBuf)> {
     let mut bases = root_bases(workspace, out_dir, source);
     let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
@@ -2688,7 +2696,59 @@ fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNo
     if let Some(home) = home {
         bases.push(("$HOME".into(), canonical_base(home)));
     }
+    bases
+}
+
+/// The normalizer for the environment a compile is keyed on: the compile's
+/// own bases, and the session's checkout as `$SESSION`.
+///
+/// A nested Cargo build inherits the outer build's paths. trybuild's project
+/// is built by a Cargo that a test started, and nextest gave that test an
+/// `LD_LIBRARY_PATH` naming the outer target's `deps` and build-script
+/// directories; a build script's `cargo install` inherits its own. A registry
+/// crate in the nested build has no checkout of its own (Cargo runs its rustc
+/// in the registry source), so those paths kept the checkout's location and
+/// every checkout keyed the same crate differently. Only the location is
+/// normalized: the rest of the value, and a path outside the session's
+/// checkout, stay keyed. Where the compile's own checkout is the session's,
+/// `$CHECKOUT` keeps naming it and the key does not change.
+///
+/// A compile reads a variable's value only through `env!` and
+/// `option_env!`, which dep-info records and the action key holds as given.
+/// A build-script run keeps its environment as it was: it may print a path
+/// it found there, and its restored output is localized without `$SESSION`.
+fn environment_normalizer(
+    workspace: &Path,
+    out_dir: &Path,
+    source: Option<&Path>,
+) -> PathNormalizer {
+    environment_normalizer_with(
+        normalizer_bases(workspace, out_dir, source),
+        session_checkout_of(env::var_os("BELLOWS_WORKSPACE")),
+    )
+}
+
+fn environment_normalizer_with(
+    mut bases: Vec<(String, PathBuf)>,
+    session: Option<PathBuf>,
+) -> PathNormalizer {
+    if let Some(session) = session {
+        bases.push(("$SESSION".into(), session));
+    }
     PathNormalizer::new(bases)
+}
+
+/// The checkout the session was launched in: the git checkout containing
+/// `BELLOWS_WORKSPACE` (which `bellows run` sets, and a build host that sets
+/// `RUSTC_WRAPPER` itself sets the same way), else that directory itself.
+/// None when it is unset or relative.
+fn session_checkout_of(launch: Option<OsString>) -> Option<PathBuf> {
+    let launch = PathBuf::from(launch?);
+    if !launch.is_absolute() {
+        return None;
+    }
+    let launch = canonical_base(launch);
+    Some(git_root(&launch).unwrap_or(launch))
 }
 
 /// The per-checkout roots: the workspace and the Cargo target directory.
@@ -3235,8 +3295,10 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     let host = host_triple(&compiler.stdout);
     let path_use = path_use(invocation, host.as_deref());
     let own_target = option_value(&invocation.args, "--target").or(host);
+    let environment_normalizer =
+        environment_normalizer(&workspace, &invocation.out_dir, crate_root);
     for (name, value) in without_other_targets(
-        compile_environment(&normalizer, &path_use),
+        compile_environment(&environment_normalizer, &path_use),
         own_target.as_deref(),
     ) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
@@ -8556,6 +8618,87 @@ release: 1.92.0
             without_shell(set, &PathUse::None),
             without_shell(unset, &PathUse::None)
         );
+    }
+
+    #[test]
+    fn a_nested_builds_inherited_paths_key_the_same_in_every_checkout() {
+        // Two build-host lanes under one home, each a git checkout. A registry
+        // crate in trybuild's nested build sees nextest's LD_LIBRARY_PATH:
+        // the nested target's deps, then the outer target's build-script
+        // and deps directories inside the lane.
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let lane = |name: &str| {
+            let root = home.join("lanes").join(name);
+            fs::create_dir_all(root.join(".git")).unwrap();
+            fs::create_dir_all(root.join("target/test-fast/deps")).unwrap();
+            root
+        };
+        let (horde, ops) = (lane("horde"), lane("gameplay-ops"));
+        let library_path = |root: &Path, build_dir: &str| {
+            let root = root.display();
+            format!(
+                "/nested/debug/deps:{root}/target/test-fast/build/{build_dir}/out:\
+                 {root}/target/test-fast/deps:{root}/target/test-fast"
+            )
+        };
+        let key = |root: &Path, build_dir: &str, launch: Option<&Path>| {
+            let normalizer = environment_normalizer_with(
+                vec![("$HOME".into(), home.clone())],
+                session_checkout_of(launch.map(|launch| launch.as_os_str().to_owned())),
+            );
+            relevant_environment_of(
+                [("LD_LIBRARY_PATH".to_string(), library_path(root, build_dir))],
+                &normalizer,
+                false,
+            )
+        };
+        // Without a session each lane keyed its own location below $HOME.
+        assert_ne!(key(&horde, "ring-1", None), key(&ops, "ring-1", None));
+        // With the session's checkout named, every lane keys the same value,
+        // also when the session was launched in a subdirectory.
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde)),
+            key(&ops, "ring-1", Some(&ops))
+        );
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde.join("target"))),
+            key(&ops, "ring-1", Some(&ops))
+        );
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde))["LD_LIBRARY_PATH"],
+            "/nested/debug/deps:$SESSION/target/test-fast/build/ring-1/out:\
+             $SESSION/target/test-fast/deps:$SESSION/target/test-fast"
+        );
+        // Only the location is normalized: a different directory inside the
+        // checkout still keys differently.
+        assert_ne!(
+            key(&horde, "ring-1", Some(&horde)),
+            key(&ops, "ring-2", Some(&ops))
+        );
+        // Another checkout's path stays absolute.
+        assert_ne!(
+            key(&horde, "ring-1", Some(&ops)),
+            key(&ops, "ring-1", Some(&ops))
+        );
+    }
+
+    #[test]
+    fn the_session_checkout_leaves_a_compiles_own_checkout_as_it_was() {
+        let temp = tempfile::tempdir().unwrap();
+        let lane = temp.path().canonicalize().unwrap().join("lane");
+        fs::create_dir_all(lane.join(".git")).unwrap();
+        let own = environment_normalizer_with(
+            vec![("$CHECKOUT".into(), lane.clone())],
+            session_checkout_of(Some(lane.clone().into_os_string())),
+        );
+        let value = format!("{}/target/test-fast/deps", lane.display());
+        assert_eq!(own.normalize(&value), "$CHECKOUT/target/test-fast/deps");
+        // No session, or a relative one, adds nothing.
+        assert_eq!(session_checkout_of(None), None);
+        assert_eq!(session_checkout_of(Some("lanes/horde".into())), None);
+        let none = environment_normalizer_with(Vec::new(), None);
+        assert_eq!(none.normalize(&value), value);
     }
 
     #[test]
