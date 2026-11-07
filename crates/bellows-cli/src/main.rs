@@ -988,6 +988,10 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
         .args(arguments)
         .env("RUSTC_WRAPPER", &wrapper)
         .env("BELLOWS_LOCAL_ONLY", "1")
+        // Local mode's only store is the L1: `BELLOWS_L1=0` (a daemon setup's Cargo `[env]`, which Cargo applies to
+        // every wrapper, or the caller's environment) would make every compile publish nowhere, silently. Set here,
+        // it wins over `[env]`, which never replaces a variable the process already has.
+        .env("BELLOWS_L1", "1")
         .env("BELLOWS_WORKSPACE", &workspace)
         .env("BELLOWS_STATE_DIR", &state_dir)
         .env_remove("BELLOWS_SERVER")

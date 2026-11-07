@@ -237,6 +237,37 @@ fn virtual_roots_are_told_apart_from_real_bellows_directories() {
 }
 
 #[test]
+fn local_mode_caches_when_cargo_config_turns_the_l1_off() {
+    // A daemon host's Cargo `[env]` turns the L1 off for every wrapper (Manifold's build host: `BELLOWS_L1 = "0"` and
+    // a `BELLOWS_STATE_DIR`). Local mode's only store is the L1, so it must stay on there: before, every compile
+    // missed with "built before, but its entry was evicted or never saved" and nothing was stored.
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let elsewhere = f.temp.path().join("daemon state");
+    fs::create_dir_all(f.workspace.join(".cargo")).unwrap();
+    fs::write(
+        f.workspace.join(".cargo/config.toml"),
+        format!(
+            "[env]\nBELLOWS_L1 = \"0\"\nBELLOWS_STATE_DIR = {:?}\n",
+            elsewhere.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    f.build();
+    f.clean();
+    let warm = stderr(&f.build());
+    assert!(warm.contains("LOCAL HIT"), "{warm}");
+    assert_eq!(f.value("target"), "42");
+    assert!(
+        !elsewhere
+            .join(format!("store-v{PROTOCOL_VERSION}"))
+            .exists()
+    );
+}
+
+#[test]
 fn explicit_target_directories_share_verified_library_outputs() {
     let f = Fixture::new(
         "pub fn value() -> u32 { 42 }",
