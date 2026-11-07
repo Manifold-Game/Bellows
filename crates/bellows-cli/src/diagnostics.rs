@@ -682,13 +682,20 @@ pub fn remember_identity(state: &Path, group: &str, current: &Fingerprint) -> Re
     // every miss "not cached yet" rather than guessing at a cause.
     let explanation = if history.iter().any(|old| old.key == current.key) {
         ENTRY_GONE.into()
+    } else if let Some(old) = history.iter().find(|old| same_variant(old, current)) {
+        // The newest earlier build of this variant (the history is newest first): what changed since is the cause.
+        format!(
+            "{BUILD_VARIANT} {} (compared with {})",
+            fingerprint_changes(old, current).join("; "),
+            &old.key[..old.key.len().min(12)]
+        )
     } else if let Some((old, changes)) = history
         .iter()
         .map(|old| (old, fingerprint_changes(old, current)))
         .min_by_key(|(_, changes)| changes.len())
     {
         format!(
-            "{BUILD_VARIANT} {} (compared with {})",
+            "{BUILD_VARIANT} {} (compared with {}, another variant: no earlier build of this one)",
             changes.join("; "),
             &old.key[..old.key.len().min(12)]
         )
@@ -700,6 +707,23 @@ pub fn remember_identity(state: &Path, group: &str, current: &Fingerprint) -> Re
     history.truncate(8);
     atomic_write_state(&path, &serde_json::to_vec(&history)?)?;
     Ok(explanation)
+}
+
+/// What makes two builds of one crate different variants rather than one changed build: a test or a library, a
+/// check or a link, which crate types, which target. A miss explained against another variant named those
+/// differences, not its cause: 42% of the explained minutes on Manifold's build host (#100054, 2026-10-31).
+const VARIANT_COMPONENTS: &[&str] = &[
+    "argument --crate-type",
+    "argument --test",
+    "argument --emit",
+    "argument --target",
+    "output kind changed",
+];
+
+fn same_variant(a: &Fingerprint, b: &Fingerprint) -> bool {
+    VARIANT_COMPONENTS
+        .iter()
+        .all(|name| a.components.get(*name) == b.components.get(*name))
 }
 
 /// Hash flag values, retaining names only. Never persist environment values or
@@ -760,6 +784,43 @@ pub fn argument_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_miss_is_explained_against_the_newest_build_of_its_own_variant() {
+        let state = tempfile::tempdir().unwrap();
+        let fp = |key: &str, test: bool, cfg: &str| Fingerprint {
+            key: key.into(),
+            components: [
+                Some(("argument --crate-type".to_string(), "lib".to_string())),
+                test.then(|| ("argument --test".to_string(), String::new())),
+                Some(("argument --cfg".to_string(), cfg.to_string())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        };
+        // The lib built with cfg a, then its test build with cfg a, then the test with cfg b.
+        remember_identity(state.path(), "g", &fp("lib-a", false, "a")).unwrap();
+        remember_identity(state.path(), "g", &fp("test-a", true, "a")).unwrap();
+        // The lib again with cfg b: compared with the lib, not with the newer test build.
+        let lib = remember_identity(state.path(), "g", &fp("lib-b", false, "b")).unwrap();
+        assert!(lib.contains("compared with lib-a"), "{lib}");
+        assert!(
+            lib.contains("argument --cfg") && !lib.contains("argument --test"),
+            "{lib}"
+        );
+        // A variant never built before says so, and still names its nearest build.
+        let check = Fingerprint {
+            key: "check-b".into(),
+            components: BTreeMap::from([
+                ("argument --crate-type".into(), "lib".into()),
+                ("argument --emit".into(), "metadata".into()),
+                ("argument --cfg".into(), "b".into()),
+            ]),
+        };
+        let first = remember_identity(state.path(), "g", &check).unwrap();
+        assert!(first.contains("another variant"), "{first}");
+    }
 
     #[test]
     fn a_torn_identity_history_starts_again_instead_of_failing_every_explanation() {
