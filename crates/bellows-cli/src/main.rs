@@ -6955,12 +6955,12 @@ mod tests {
                 link_output(&source, &out.join(name)).unwrap();
             }
             fs::write(out.join("unlinked.rlib"), vec![9u8; 100 * 1024]).unwrap(); // not the store's: ignored
-            let report = verify_links(&store, &[out.clone()], false).unwrap();
+            let report = verify_links(&store, std::slice::from_ref(&out), false).unwrap();
             assert_eq!((report.checked, report.mismatched.len()), (2, 0));
             // A tool writing a linked output in place changes the shared inode.
             let target = out.join("libbad.rlib");
             fs::write(&target, vec![3u8; 100 * 1024]).unwrap();
-            let report = verify_links(&store, &[out.clone()], true).unwrap();
+            let report = verify_links(&store, std::slice::from_ref(&out), true).unwrap();
             assert_eq!(report.mismatched.len(), 1);
             assert_eq!(report.mismatched[0].0, target);
             assert!(!target.exists(), "removed");
