@@ -165,6 +165,32 @@ fn checked(command: &mut Command) -> Output {
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
+/// Whether `log` names one of the wrapper's virtual roots (`/bellows/checkout`, `/bellows/target`, ...). A real path
+/// that only has a `bellows` directory in it (a checkout under `.../buildhost/bellows/lanes/...`) doesn't count.
+fn names_a_virtual_root(log: &str) -> bool {
+    ["cargo-home", "checkout", "workspace", "target", "profile"]
+        .iter()
+        .any(|root| {
+            let virtual_root = format!("/bellows/{root}");
+            log.match_indices(&virtual_root).any(|(at, _)| {
+                !log[..at].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+        })
+}
+
+#[test]
+fn virtual_roots_are_told_apart_from_real_bellows_directories() {
+    assert!(names_a_virtual_root(
+        " --> /bellows/checkout/ui/warn.rs:1:17"
+    ));
+    assert!(names_a_virtual_root(
+        "\"file_name\":\"/bellows/target/out/gen.rs\""
+    ));
+    assert!(!names_a_virtual_root(
+        "RUNNING local  /home/builder/buildhost/bellows/lanes/x/target/debug/bellows rustc /tmp/w/ui/warn.rs"
+    ));
+    assert!(!names_a_virtual_root(" --> /tmp/x/bellows/target/warn.rs"));
+}
 
 #[test]
 fn explicit_target_directories_share_verified_library_outputs() {
@@ -2007,7 +2033,7 @@ fn diagnostics_show_real_paths_for_snapshot_tests() {
         let log = stderr(&output);
         assert!(output.status.success(), "{log}");
         assert!(log.contains(&expected), "{attempt}: {log}");
-        assert!(!log.contains("/bellows/"), "{attempt}: {log}");
+        assert!(!names_a_virtual_root(&log), "{attempt}: {log}");
         fs::remove_dir_all(f.workspace.join("out")).unwrap();
     }
     let failing = f.workspace.join("ui/fail.rs");
@@ -2016,7 +2042,7 @@ fn diagnostics_show_real_paths_for_snapshot_tests() {
     assert!(!output.status.success());
     let log = stderr(&output);
     assert!(log.contains(&format!("{}", failing.display())), "{log}");
-    assert!(!log.contains("/bellows/"), "{log}");
+    assert!(!names_a_virtual_root(&log), "{log}");
 }
 
 #[test]
@@ -2134,7 +2160,7 @@ fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
         diagnostic(&cached).contains("pub fn register<S: Side>()"),
         "{log}"
     );
-    assert!(!log.contains("/bellows/"), "{log}");
+    assert!(!names_a_virtual_root(&log), "{log}");
 }
 
 #[test]
@@ -2198,7 +2224,7 @@ fn diagnostics_quote_checkout_sources_from_a_project_outside_the_checkout() {
         "{log}"
     );
     assert!(
-        !log.contains("/bellows/") && !log.contains("trybuild/ui/engine"),
+        !names_a_virtual_root(&log) && !log.contains("trybuild/ui/engine"),
         "{log}"
     );
 }
