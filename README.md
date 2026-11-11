@@ -196,8 +196,13 @@ Every output is scanned for the workspace, target, and session checkout paths
 after a remapped compile. A result that embeds one is pinned to that checkout;
 otherwise path-valued `env!` values compare relative to those roots, so
 worktrees share it.
-Inputs reached through symlinks conservatively bypass publication until their
-resolution can be modeled. Unmodeled emit kinds and custom output destinations
+An input reached through a symlink or junction is not cached: a record that
+named the link's target would be trusted after the link moved. The exception
+is a link at or above the compile's own working directory or checkout, such
+as a project that reaches another checkout's packages through a linked folder.
+Those inputs are named relative to that root, which every compile derives for
+itself (see [linked outputs](docs/linked-outputs.md)). Unmodeled emit kinds and
+custom output destinations
 also bypass, so a successful hit always supplies the requested output set.
 Search paths that can supply crates (bare `-L`, `-L all=`, `-L crate=`), custom
 sysroots and target JSON files, and `target-cpu=native` bypass. `-L native=`

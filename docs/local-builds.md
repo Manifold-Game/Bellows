@@ -62,6 +62,13 @@ longer exist, whatever the budget. A checkout on a volume that is merely
 unplugged or unmounted is left alone. See the
 [runbook](operations.md#capacity-and-recovery) for the exact rules.
 
+A package reached through a linked folder is cached too: a project that
+depends on `../engine/crates/x`, where `engine` is a junction or symlink to
+another checkout, restores `x` on a fresh build. The files behind the link
+decide, so moving the link to a checkout with different sources is a miss.
+A link *inside* a package or checkout still bypasses (`symlink_input`); see
+[linked outputs](linked-outputs.md#changes-made-during-implementation).
+
 ## Incremental edit loops
 
 `bellows run` no longer forces `CARGO_INCREMENTAL=0`. An incremental rustc

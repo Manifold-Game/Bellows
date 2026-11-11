@@ -146,8 +146,9 @@ staleness. `explain` names the proc macros a restored result used.
 
 Anything the model cannot describe stays a visible bypass or capture fallback:
 an unresolvable `-l`, a directory output, a shell-quoted (`@shell:`) response file, `-L all=`, profile
-or plugin inputs, `save-temps`, a custom sysroot or target JSON, or
-`target-cpu=native`.
+or plugin inputs, `save-temps`, a custom sysroot or target JSON,
+`target-cpu=native`, or an input reached through a symlink or junction below
+the compile's own roots.
 
 ## Changes made during implementation
 
@@ -242,6 +243,38 @@ Each one keeps the guarantees above.
   outside the action key: earlier clients read such a candidate unchanged,
   and their own candidates are collected as before. It never leaves the
   machine.
+- **Roots reached through a link (0.3.17).** An input whose path passes through
+  a symlink or junction was never cached, because a record names inputs by
+  their canonical path: it would name the link's target, and after the link
+  moved, a compile would be checked against the old target's unchanged files
+  and restore code it does not compile. That stays true for a link *below*
+  the compile's roots. A link *at or above* the compile's own working
+  directory or checkout is different, and is now followed: a project that
+  depends on `../engine/crates/x`, where `engine` is a junction to another
+  checkout, compiles `x` in a working directory behind the link. The record
+  names its inputs relative to that root (`$WORKSPACE/src/lib.rs`,
+  `$CHECKOUT/crates/y/…`), never by where the link led, and every compile
+  derives its roots from its own working directory. A compile whose link
+  leads elsewhere is therefore checked against the files it reads itself.
+  Three rules keep this exact:
+  - Only a spelling the normalizer knows for `$WORKSPACE` or `$CHECKOUT`, and
+    that resolves to that root right now, counts. The rest of the path must
+    hold no link, and a `..` straight after a link is refused.
+  - A pin covers the spellings as well as the canonical path. An output that
+    embeds a root may embed Cargo's spelling of it, so a pinned candidate
+    made through one link is not reused through another, or directly. A root
+    reached plainly pins as before.
+  - A restore writes such a root in Cargo's spelling, through the link, as
+    rustc would. Cargo decides what to rebuild from the paths in dep-info;
+    paths naming the link's target would keep it watching the old target
+    after the link moved.
+
+  On Windows the working directory keeps the link's spelling, so outputs are
+  remapped and shareable as usual. Elsewhere the kernel resolves the working
+  directory while Cargo passes the crate root through the link; that spelling
+  is not remapped, so such a result embeds it and is pinned. There, a file
+  outside the package directory (a sibling crate's) still bypasses. A link in
+  the path of the target directory or of Cargo's home bypasses as before.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler

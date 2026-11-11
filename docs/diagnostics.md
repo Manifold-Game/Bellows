@@ -146,8 +146,13 @@ appear under the crate name `build-script:<package>`.
 | `native_inputs` | The rlib bundles native members that no `-l static` library supplied. |
 | `unsupported_outputs` | rustc produced a directory output (split debuginfo), or a build script ran over an existing `OUT_DIR` or produced a symlink. |
 | `too_many_outputs` | The output set exceeds the candidate limits. |
-`symlink_input` identifies a compiler input whose resolution is not yet modeled;
-if discovered in dep-info after compilation, capture is skipped safely.
+`symlink_input` identifies a compiler input reached through a symlink or
+junction that the record could not account for: one below the compile's
+working directory or checkout, one that leads out of them, or a `..` straight
+after one. If it is discovered in dep-info after compilation, capture is
+skipped safely. A link at or above the compile's own working directory or
+checkout is followed and is not reported (see
+[linked outputs](linked-outputs.md#changes-made-during-implementation)).
 
 ## Structured output and retention
 

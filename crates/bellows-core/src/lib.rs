@@ -1515,6 +1515,8 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct PathNormalizer {
     bases: Vec<(String, String)>,
+    /// Tokens whose localization was chosen by `localize_as`.
+    localized: Vec<(String, String)>,
 }
 
 impl PathNormalizer {
@@ -1540,7 +1542,25 @@ impl PathNormalizer {
             }
         }
         rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        Self { bases: rendered }
+        Self {
+            bases: rendered,
+            localized: Vec::new(),
+        }
+    }
+
+    /// Localizes `token` to `spelling`, one of its recognized spellings,
+    /// instead of the default choice. A directory the build reaches through a
+    /// symlink or junction is localized to that spelling: it is how the
+    /// compiler itself would name the files in what a restore writes.
+    pub fn localize_as(&mut self, token: &str, spelling: &str) {
+        if self
+            .bases
+            .iter()
+            .any(|(candidate, path)| candidate == token && path == spelling)
+        {
+            self.localized.retain(|(chosen, _)| chosen != token);
+            self.localized.push((token.to_owned(), spelling.to_owned()));
+        }
     }
 
     /// Every recognized spelling of the directory a token stands for.
@@ -1573,11 +1593,20 @@ impl PathNormalizer {
     /// restored build-script directive such as `rustc-link-search` becomes a
     /// later rustc argument, so it must be spelled as the script printed it.
     fn localizations(&self) -> Vec<(&str, &str)> {
-        let mut chosen: Vec<(&str, &str)> = Vec::new();
+        let mut chosen: Vec<(&str, &str)> = self
+            .localized
+            .iter()
+            .map(|(token, path)| (token.as_str(), path.as_str()))
+            .collect();
+        let fixed = chosen.len();
         for (token, path) in &self.bases {
             let (token, path) = (token.as_str(), path.as_str());
-            if let Some(entry) = chosen.iter_mut().find(|entry| entry.0 == token) {
-                if entry.1.starts_with(r"\\?\") && !path.starts_with(r"\\?\") && !path.contains('/')
+            if let Some(index) = chosen.iter().position(|entry| entry.0 == token) {
+                let entry = &mut chosen[index];
+                if index >= fixed
+                    && entry.1.starts_with(r"\\?\")
+                    && !path.starts_with(r"\\?\")
+                    && !path.contains('/')
                 {
                     entry.1 = path;
                 }
@@ -1848,6 +1877,32 @@ mod tests {
             MAX_PINNED_CHECKOUTS + 1
         ];
         assert!(validate_candidate_manifest(&candidate).is_err());
+    }
+
+    #[test]
+    fn a_token_can_be_localized_to_a_chosen_spelling() {
+        let mut normalizer = PathNormalizer::new(vec![
+            ("$WORKSPACE".into(), "/real/checkout/crate".into()),
+            ("$WORKSPACE".into(), "/link/crate".into()),
+        ]);
+        assert_eq!(
+            normalizer.localize("$WORKSPACE/src/lib.rs"),
+            "/real/checkout/crate/src/lib.rs"
+        );
+        normalizer.localize_as("$WORKSPACE", "/link/crate");
+        assert_eq!(
+            normalizer.localize("$WORKSPACE/src/lib.rs"),
+            "/link/crate/src/lib.rs"
+        );
+        assert_eq!(normalizer.localize_bytes(b"$WORKSPACE/x"), b"/link/crate/x");
+        // Every spelling still normalizes.
+        assert_eq!(
+            normalizer.normalize("/real/checkout/crate/a /link/crate/b"),
+            "$WORKSPACE/a $WORKSPACE/b"
+        );
+        // Only a recognized spelling can be chosen.
+        normalizer.localize_as("$WORKSPACE", "/elsewhere");
+        assert_eq!(normalizer.localize("$WORKSPACE"), "/link/crate");
     }
 
     #[test]

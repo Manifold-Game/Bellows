@@ -2889,3 +2889,260 @@ fn a_build_that_collects_also_evicts_results_of_deleted_checkouts() {
     ]));
     assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
 }
+
+fn unlink_directory(link: &Path) {
+    // A junction is removed as a directory, a symlink as a file.
+    if cfg!(windows) {
+        fs::remove_dir(link).unwrap();
+    } else {
+        fs::remove_file(link).unwrap();
+    }
+}
+
+/// Makes the fixture's binary depend on the package `dep` at `path`, a
+/// package outside the workspace, as an engine checked out elsewhere is.
+fn depend_on(f: &Fixture, path: &str) {
+    let manifest = f.workspace.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[workspace]",
+            &format!("[dependencies]\ndep = {{ path = \"{path}\" }}\n[workspace]"),
+        ),
+    )
+    .unwrap();
+}
+
+/// Writes the package `<root>/dep`, whose `value()` comes from a module file.
+fn dependency(root: &Path, value: u32) {
+    write_files(
+        &root.join("dep"),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod inner;\npub fn value() -> u32 { inner::value() }\npub fn here() -> &'static str { file!() }\n",
+            ),
+            (
+                "src/inner.rs",
+                &format!("pub fn value() -> u32 {{ {value} }}\n"),
+            ),
+        ],
+    );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_dependency_reached_through_a_directory_link_is_cached_and_never_stale() {
+    let f = Fixture::new("", "fn main() { println!(\"{}\", dep::value()); }");
+    depend_on(&f, "../engine/dep");
+    let real = f.temp.path().join("engine-real");
+    let other = f.temp.path().join("engine-other");
+    let link = f.temp.path().join("engine");
+    dependency(&real, 1);
+    dependency(&other, 3);
+    link_directory(&f, &real, &link);
+
+    let cold = f.build();
+    assert!(
+        !stderr(&cold).contains("symlinked compiler input"),
+        "{}",
+        stderr(&cold)
+    );
+    assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"]);
+    assert_eq!(f.value("target"), "1");
+    f.clean();
+    let warm = f.build();
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    assert_eq!(f.value("target"), "1");
+
+    // An edit behind the link is an edit.
+    fs::write(
+        real.join("dep/src/inner.rs"),
+        "pub fn value() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    f.clean();
+    let edited = f.build();
+    assert_eq!(decisions(&edited, "dep"), ["CACHE MISS"]);
+    assert_eq!(f.value("target"), "2");
+
+    // Pointing the link somewhere else never restores what the old target
+    // compiled to, although the old target is still there, unchanged.
+    unlink_directory(&link);
+    link_directory(&f, &other, &link);
+    f.clean();
+    let retargeted = f.build();
+    assert_eq!(
+        decisions(&retargeted, "dep"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&retargeted)
+    );
+    assert_eq!(f.value("target"), "3");
+
+    // Pointing it back finds the first target's result again: the files
+    // behind the link decide, wherever it points.
+    unlink_directory(&link);
+    link_directory(&f, &real, &link);
+    f.clean();
+    let back = f.build();
+    assert_eq!(decisions(&back, "dep"), ["LOCAL HIT"], "{}", stderr(&back));
+    assert_eq!(f.value("target"), "2");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_result_made_through_one_link_never_carries_its_path_through_another() {
+    let main = "fn main() { println!(\"{}\", dep::here()); }";
+    let first = Fixture::new("", main);
+    let mut second = Fixture::new("", main);
+    depend_on(&first, "../engine/dep");
+    depend_on(&second, "../elsewhere/dep");
+    // One package, reached by each workspace through a link of its own.
+    let real = first.temp.path().join("engine-real");
+    dependency(&real, 1);
+    link_directory(&first, &real, &first.temp.path().join("engine"));
+    link_directory(&second, &real, &second.temp.path().join("elsewhere"));
+
+    // What the second workspace's binary says with nothing cached.
+    second.build();
+    let uncached = second.value("target");
+    second.clean();
+    // With the first workspace's results in its cache it must say the same:
+    // a result that embeds the first link's path is not the second's.
+    first.build();
+    second.cache = first.cache.clone();
+    second.build();
+    assert_eq!(second.value("target"), uncached);
+    assert!(
+        !second.value("target").contains("engine"),
+        "{}",
+        second.value("target")
+    );
+}
+
+/// A package that reads a sibling package's file: with the link above the
+/// checkout root, the file is still inside the checkout the link stands for.
+#[cfg(windows)]
+#[test]
+fn files_beside_a_linked_package_are_tracked_inside_its_checkout() {
+    let f = Fixture::new("", "fn main() { println!(\"{}\", dep::value()); }");
+    depend_on(&f, "../engine/dep");
+    let real = f.temp.path().join("engine-real");
+    let link = f.temp.path().join("engine");
+    let package = |checkout: bool, value: &str| {
+        write_files(
+            &real,
+            &[
+                (
+                    "dep/Cargo.toml",
+                    "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+                ),
+                (
+                    "dep/src/lib.rs",
+                    "pub fn value() -> &'static str { include_str!(\"../../shared/value.txt\") }\n",
+                ),
+                ("shared/value.txt", value),
+            ],
+        );
+        if checkout {
+            fs::create_dir_all(real.join(".git")).unwrap();
+        }
+    };
+
+    // Outside any checkout the link is not one of the compile's own roots
+    // for the sibling file: the compile stays uncached, as before.
+    package(false, "1");
+    link_directory(&f, &real, &link);
+    let bypassed = f.build();
+    assert!(
+        stderr(&bypassed).contains("symlinked compiler input"),
+        "{}",
+        stderr(&bypassed)
+    );
+    assert_eq!(f.value("target"), "1");
+
+    // In a checkout the link stands for the checkout root.
+    package(true, "1");
+    f.clean();
+    let cold = f.build();
+    assert!(
+        !stderr(&cold).contains("symlinked compiler input"),
+        "{}",
+        stderr(&cold)
+    );
+    f.clean();
+    let warm = f.build();
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    fs::write(real.join("shared/value.txt"), "2").unwrap();
+    f.clean();
+    let edited = f.build();
+    assert_eq!(decisions(&edited, "dep"), ["CACHE MISS"]);
+    assert_eq!(f.value("target"), "2");
+}
+
+/// The dep-info file Cargo reads for the fixture's dependency `dep`.
+fn dependency_dep_info(f: &Fixture) -> String {
+    let deps = f.workspace.join("target/release/deps");
+    let path = fs::read_dir(&deps)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("dep-") && name.ends_with(".d")
+        })
+        .unwrap();
+    fs::read_to_string(path).unwrap()
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_restore_names_files_through_the_link_so_cargo_follows_it_when_it_moves() {
+    let f = Fixture::new("", "fn main() { println!(\"{}\", dep::value()); }");
+    depend_on(&f, "../engine/dep");
+    let real = f.temp.path().join("engine-real");
+    let other = f.temp.path().join("engine-other");
+    let link = f.temp.path().join("engine");
+    dependency(&real, 1);
+    link_directory(&f, &real, &link);
+    f.build();
+    let compiled = dependency_dep_info(&f);
+    f.clean();
+    let restored = f.build();
+    assert_eq!(
+        decisions(&restored, "dep"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    // The restored dep-info names the same files as the one rustc wrote:
+    // through the link, never by where the link led.
+    let restored_info = dependency_dep_info(&f);
+    assert!(!compiled.contains("engine-real"), "{compiled}");
+    assert!(!restored_info.contains("engine-real"), "{restored_info}");
+    assert_eq!(
+        restored_info.replace('\\', "/").lines().next(),
+        compiled.replace('\\', "/").lines().next()
+    );
+
+    // The link now leads to newer files. Cargo, reading that dep-info,
+    // rebuilds without being told to; it would not if the restore had named
+    // the old target, whose files have not changed.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    dependency(&other, 3);
+    unlink_directory(&link);
+    link_directory(&f, &other, &link);
+    let moved = f.build();
+    assert_eq!(
+        decisions(&moved, "dep"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&moved)
+    );
+    assert_eq!(f.value("target"), "3");
+}

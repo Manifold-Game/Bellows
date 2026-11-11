@@ -2064,6 +2064,9 @@ struct Identity {
     virtual_env: BTreeMap<String, String>,
     /// The canonical git checkout containing this compile, if any.
     checkout: Option<PathBuf>,
+    /// This compile's working directory and checkout under every spelling
+    /// that reaches them (see `own_roots`).
+    own_roots: Vec<PathBuf>,
     /// The `--diagnostic-width` rustc was given, if any.
     diagnostic_width: Option<String>,
 }
@@ -2825,10 +2828,27 @@ fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
     }
 }
 
-// Canonicalizing a symlink loses the dependency on its resolution. Until the
-// manifest models that resolution, do not cache any input reached through one.
-fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
+/// The canonical path of a compiler input, which is how a record names it.
+///
+/// Resolving a symlink (or a junction) on the way loses what the link pointed
+/// at. The record would name the link's target, and a later compile whose
+/// link points somewhere else would be checked against the old target's
+/// files, find them unchanged, and restore code it does not compile. An input
+/// reached through a link is therefore not cacheable.
+///
+/// The exception is a link at or above one of this compile's own roots: its
+/// working directory or its checkout, under a spelling in `own_roots`. A
+/// record names such an input relative to that root (`$WORKSPACE/src/lib.rs`),
+/// never by where the link led, and every compile derives its roots afresh
+/// from its own working directory. A compile whose link points elsewhere is
+/// then checked against the files it reads itself. Below the root the rule is
+/// unchanged, so the rest of the path holds no link.
+fn canonical_compiler_input(path: &Path, own_roots: &[PathBuf]) -> Result<PathBuf> {
+    let path = without_dot_segments(path)?;
     for ancestor in path.ancestors() {
+        if own_roots.iter().any(|root| root == ancestor) {
+            break;
+        }
         if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
             bail!(
                 "symlinked compiler input is not cacheable: {}",
@@ -2837,6 +2857,150 @@ fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(path.canonicalize()?)
+}
+
+/// `path` without `.` and `..` segments. A `..` that follows a link is not
+/// resolved: the system may take the parent of the link's target, not of the
+/// link, so the path cannot be judged by its spelling.
+fn without_dot_segments(path: &Path) -> Result<PathBuf> {
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if fs::symlink_metadata(&plain)?.file_type().is_symlink() {
+                    bail!(
+                        "symlinked compiler input is not cacheable: {} is followed by `..`",
+                        plain.display()
+                    );
+                }
+                plain.pop();
+            }
+            other => plain.push(other.as_os_str()),
+        }
+    }
+    Ok(plain)
+}
+
+/// This compile's working directory and checkout under every spelling that
+/// reaches them: their canonical paths, and each spelling the normalizer
+/// knows them by (Cargo's, which may pass through a symlink or junction) that
+/// resolves to one of them right now. Only spellings the normalizer knows
+/// qualify, so an input accepted below one is also normalized wherever it is
+/// written down: in arguments, dep-info and compiler messages.
+fn own_roots(
+    workspace: &Path,
+    checkout: Option<&Path>,
+    root_normalizer: &PathNormalizer,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (token, root) in [("$WORKSPACE", Some(workspace)), ("$CHECKOUT", checkout)] {
+        let Some(root) = root else {
+            continue;
+        };
+        let canonical = root.to_string_lossy();
+        roots.push(root.to_path_buf());
+        roots.push(PathBuf::from(ordinary_spelling(root)));
+        // A build that reaches its roots plainly has no other spelling, and
+        // pays for no lookup here.
+        for spelling in other_spellings(&canonical, &root_normalizer.spellings(token)) {
+            let spelling = PathBuf::from(spelling);
+            if spelling
+                .canonicalize()
+                .is_ok_and(|resolved| resolved == root)
+            {
+                roots.push(spelling);
+            }
+        }
+    }
+    roots
+}
+
+/// The spellings of a root that are not just another way to write its
+/// canonical path: without the Windows verbatim prefix, with forward slashes
+/// or, on Windows, in another letter case (some terminals start a build with
+/// a lower-case drive letter). What remains reaches the root by another
+/// route: through a symlink or junction, or by a Windows 8.3 name.
+fn other_spellings(canonical: &str, spellings: &[String]) -> Vec<String> {
+    let ordinary = ordinary_spelling(Path::new(canonical));
+    let forward = ordinary.replace('\\', "/");
+    let same = |spelling: &str, written: &str| {
+        if cfg!(windows) {
+            spelling.eq_ignore_ascii_case(written)
+        } else {
+            spelling == written
+        }
+    };
+    let mut others = spellings
+        .iter()
+        .filter(|spelling| {
+            ![canonical, ordinary.as_str(), forward.as_str()]
+                .iter()
+                .any(|written| same(spelling, written))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    others.sort();
+    others.dedup();
+    others
+}
+
+/// Cargo's spelling of `root` when it reaches the root through a symlink or
+/// junction: the one rustc prints for the files below it. A restore must
+/// write that spelling, not the link's target: Cargo decides what to rebuild
+/// from the paths in a restored dep-info file, and paths that name the target
+/// would keep it watching the old target after the link has moved.
+fn link_spelling(normalizer: &PathNormalizer, token: &str, root: &Path) -> Option<String> {
+    let through_link = |spelling: &Path| {
+        spelling.ancestors().any(|ancestor| {
+            fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+    };
+    other_spellings(&root.to_string_lossy(), &normalizer.spellings(token))
+        .into_iter()
+        .find(|spelling| {
+            let path = Path::new(spelling);
+            // Never the verbatim or forward-slash form of a Windows path: no
+            // fresh process spells a directory that way.
+            let unusual =
+                spelling.starts_with(r"\\?\") || (cfg!(windows) && spelling.contains('/'));
+            !unusual
+                && through_link(path)
+                && path.canonicalize().is_ok_and(|resolved| resolved == root)
+        })
+}
+
+/// Localizes this compile's roots to the spelling that reaches them through a
+/// link, where there is one (see `link_spelling`).
+pub(crate) fn localize_through_links(
+    normalizers: [&mut PathNormalizer; 2],
+    workspace: &Path,
+    checkout: Option<&Path>,
+) {
+    let [normalizer, root_normalizer] = normalizers;
+    for (token, root) in [("$WORKSPACE", Some(workspace)), ("$CHECKOUT", checkout)] {
+        if let Some(root) = root
+            && let Some(spelling) = link_spelling(root_normalizer, token, root)
+        {
+            normalizer.localize_as(token, &spelling);
+            root_normalizer.localize_as(token, &spelling);
+        }
+    }
+}
+
+/// The value a root's pin compares: the root's canonical path and, when the
+/// build reaches it under another spelling (through a symlink or junction, or
+/// by a Windows 8.3 name), those spellings too. An output that embeds a root
+/// may embed any of them, so a pinned candidate is reused only by a build
+/// that spells the root the same way. For a root reached plainly this is the
+/// canonical path alone, as it always was.
+pub(crate) fn pin_value(canonical: &str, spellings: &[String]) -> String {
+    let others = other_spellings(canonical, spellings);
+    if others.is_empty() {
+        canonical.to_owned()
+    } else {
+        format!("{canonical}\nspelled {}", others.join("\nspelled "))
+    }
 }
 
 fn diagnostic_width(args: &[String]) -> Option<String> {
@@ -2919,9 +3083,15 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     // not the parent Bellows session's launch directory.
     let workspace = env::current_dir()?.canonicalize()?;
     let crate_root = invocation.explicit_inputs.first().map(PathBuf::as_path);
-    let normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
-    let root_normalizer =
+    let mut normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
+    let mut root_normalizer =
         PathNormalizer::new(root_bases(&workspace, &invocation.out_dir, crate_root));
+    let checkout = compile_checkout(&workspace, crate_root);
+    localize_through_links(
+        [&mut normalizer, &mut root_normalizer],
+        &workspace,
+        checkout.as_deref(),
+    );
     let digests = digests::Digests::new(&state_dir(&workspace));
     let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
@@ -2990,12 +3160,13 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
             digest_bytes(found.as_bytes()),
         );
     }
+    let own_roots = own_roots(&workspace, checkout.as_deref(), &root_normalizer);
     let mut inputs = invocation.explicit_inputs.clone();
     inputs.extend(resolve_static_libraries(invocation, &workspace)?);
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace))
+        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace), &own_roots)
             .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
         let input_digest = digests.file(&absolute)?;
         components.insert(
@@ -3022,21 +3193,32 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         .unwrap_or_default();
     let mut pins = vec![(
         format!("{PIN_PREFIX}$WORKSPACE"),
-        workspace.to_string_lossy().into_owned(),
+        pin_value(
+            &workspace.to_string_lossy(),
+            &root_normalizer.spellings("$WORKSPACE"),
+        ),
     )];
     if let Some(target) = target_root(&workspace, &invocation.out_dir) {
         pins.push((
             format!("{PIN_PREFIX}$TARGET"),
-            canonical_base(target).to_string_lossy().into_owned(),
+            pin_value(
+                &canonical_base(target).to_string_lossy(),
+                &root_normalizer.spellings("$TARGET"),
+            ),
         ));
     }
-    if let Some(checkout) = root_normalizer.spellings("$CHECKOUT").first() {
-        pins.push((format!("{PIN_PREFIX}$CHECKOUT"), checkout.clone()));
+    let checkout_spellings = root_normalizer.spellings("$CHECKOUT");
+    if let Some(longest) = checkout_spellings.first() {
+        pins.push((
+            format!("{PIN_PREFIX}$CHECKOUT"),
+            pin_value(longest, &checkout_spellings),
+        ));
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
         diagnostic_width: diagnostic_width(&invocation.args),
-        checkout: compile_checkout(&workspace, crate_root),
+        checkout,
+        own_roots,
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -4353,7 +4535,7 @@ fn capture_outputs(
                 absolute.display()
             )
         }
-        let absolute = canonical_compiler_input(&absolute)
+        let absolute = canonical_compiler_input(&absolute, &identity.own_roots)
             .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         record(&absolute, true)?;
     }
@@ -4788,7 +4970,8 @@ pub(crate) fn pinned_checkouts(identity: &Identity, inputs: &[EnvInput]) -> Vec<
         .iter()
         .filter(|input| input.name.starts_with(PIN_PREFIX))
         .filter_map(|input| identity.pin_value(&input.name))
-        .filter_map(|root| checkout_root(Path::new(root)))
+        // The root's canonical path, before any other spelling of it.
+        .filter_map(|root| checkout_root(Path::new(root.lines().next()?)))
         .filter_map(|checkout| PinnedCheckout::locate(&checkout))
         .collect::<Vec<_>>();
     checkouts.sort();
@@ -6536,6 +6719,7 @@ mod tests {
             )],
             virtual_env: BTreeMap::new(),
             checkout: None,
+            own_roots: vec![workspace.to_path_buf()],
             diagnostic_width: None,
         }
     }
@@ -6642,6 +6826,201 @@ mod tests {
                 .unwrap()
                 .contains("pinned_checkouts")
         );
+    }
+
+    /// Links `link` to the directory `target`: a symlink, or on Windows a
+    /// junction, which needs no privilege.
+    #[cfg(any(unix, windows))]
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// `<root>/real/{pkg/src/lib.rs, shared/data.txt}` and `<root>/outside`,
+    /// with `<root>/link` leading to `real` and `pkg/selected` to `outside`.
+    /// Returns the canonical `real`, and `link` as Cargo would spell it.
+    #[cfg(any(unix, windows))]
+    fn linked_tree(temp: &Path) -> (PathBuf, PathBuf) {
+        let root = temp.canonicalize().unwrap();
+        let real = root.join("real");
+        for (directory, file) in [
+            (real.join("pkg").join("src"), "lib.rs"),
+            (real.join("shared"), "data.txt"),
+            (root.join("outside"), "value.rs"),
+        ] {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(file), "contents").unwrap();
+        }
+        let link = PathBuf::from(ordinary_spelling(&root)).join("link");
+        link_dir(&real, &link);
+        link_dir(&root.join("outside"), &real.join("pkg").join("selected"));
+        (real, link)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_link_is_followed_only_at_or_above_the_compiles_own_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let (real, link) = linked_tree(temp.path());
+        let package = real.join("pkg");
+        let spelled = link.join("pkg");
+        let source = package.join("src").join("lib.rs");
+        let refused = |path: &Path, roots: &[PathBuf]| {
+            let error = canonical_compiler_input(path, roots).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("symlinked compiler input is not cacheable"),
+                "{error:#}"
+            );
+        };
+
+        // No link on the way: as it always was, whatever the roots.
+        assert_eq!(canonical_compiler_input(&source, &[]).unwrap(), source);
+        // Reached through the spelling of the compile's own root: the record
+        // names the file under that root, so the link is the root's affair.
+        let own = vec![package.clone(), spelled.clone()];
+        assert_eq!(
+            canonical_compiler_input(&spelled.join("src").join("lib.rs"), &own).unwrap(),
+            source
+        );
+        assert_eq!(
+            canonical_compiler_input(
+                &spelled.join("src").join("..").join("src").join("lib.rs"),
+                &own
+            )
+            .unwrap(),
+            source
+        );
+        // The same path when the link is not a spelling of a root.
+        refused(
+            &spelled.join("src").join("lib.rs"),
+            std::slice::from_ref(&package),
+        );
+        // A link below the root still loses what it pointed at.
+        for base in [&spelled, &package] {
+            refused(&base.join("selected").join("value.rs"), &own);
+        }
+        // A file beside the package is inside the link only as far as the
+        // checkout the link stands for is one of the roots.
+        let sibling = spelled
+            .join("src")
+            .join("..")
+            .join("..")
+            .join("shared")
+            .join("data.txt");
+        refused(&sibling, &own);
+        let with_checkout = [own, vec![real.clone(), link.clone()]].concat();
+        assert_eq!(
+            canonical_compiler_input(&sibling, &with_checkout).unwrap(),
+            real.join("shared").join("data.txt")
+        );
+        // `..` straight after a link is not judged by its spelling.
+        refused(
+            &link
+                .join("..")
+                .join("real")
+                .join("pkg")
+                .join("src")
+                .join("lib.rs"),
+            &with_checkout,
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn own_roots_are_the_spellings_that_resolve_to_this_compiles_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let (real, link) = linked_tree(temp.path());
+        let package = real.join("pkg");
+        let elsewhere = real.parent().unwrap().join("outside");
+        let mut normalizer = PathNormalizer::new(vec![
+            ("$WORKSPACE".into(), package.clone()),
+            ("$WORKSPACE".into(), link.join("pkg")),
+            // Recorded as a spelling, but it leads somewhere else.
+            (
+                "$WORKSPACE".into(),
+                PathBuf::from(ordinary_spelling(&elsewhere)),
+            ),
+            ("$CHECKOUT".into(), link.clone()),
+            ("$CHECKOUT".into(), real.clone()),
+        ]);
+        let roots = own_roots(&package, Some(&real), &normalizer);
+        for root in [&package, &link.join("pkg"), &real, &link] {
+            assert!(roots.contains(root), "{root:?} in {roots:?}");
+        }
+        assert!(
+            !roots.iter().any(|root| root.ends_with("outside")),
+            "{roots:?}"
+        );
+
+        // A restore spells each root through its link, as rustc would.
+        assert_eq!(
+            normalizer.localize("$WORKSPACE"),
+            ordinary_spelling(&package)
+        );
+        let mut root_normalizer = normalizer.clone();
+        localize_through_links(
+            [&mut normalizer, &mut root_normalizer],
+            &package,
+            Some(&real),
+        );
+        for normalizer in [&normalizer, &root_normalizer] {
+            assert_eq!(
+                normalizer.localize("$WORKSPACE"),
+                link.join("pkg").to_string_lossy()
+            );
+            assert_eq!(normalizer.localize("$CHECKOUT"), link.to_string_lossy());
+        }
+        // A root reached plainly has no such spelling.
+        let plain = PathNormalizer::new(vec![("$WORKSPACE".into(), package.clone())]);
+        assert_eq!(link_spelling(&plain, "$WORKSPACE", &package), None);
+        assert_eq!(own_roots(&package, None, &plain).len(), 2);
+    }
+
+    #[test]
+    fn a_pin_covers_every_spelling_that_reaches_its_root() {
+        let (canonical, link, other) = if cfg!(windows) {
+            (
+                r"\\?\C:\work\checkout",
+                r"C:\link\checkout",
+                r"C:\other\checkout",
+            )
+        } else {
+            ("/work/checkout", "/link/checkout", "/other/checkout")
+        };
+        let spellings = |alias: Option<&str>| {
+            let mut bases = vec![("$WORKSPACE".to_owned(), PathBuf::from(canonical))];
+            bases.extend(alias.map(|alias| ("$WORKSPACE".to_owned(), PathBuf::from(alias))));
+            PathNormalizer::new(bases).spellings("$WORKSPACE")
+        };
+        // Reached plainly: the canonical path alone, as before, so pinned
+        // candidates stored by earlier versions still match.
+        assert_eq!(pin_value(canonical, &spellings(None)), canonical);
+        // Reached through a link: only by a build that spells it the same.
+        let linked = pin_value(canonical, &spellings(Some(link)));
+        assert_ne!(linked, canonical);
+        assert_eq!(linked.lines().next(), Some(canonical));
+        assert!(linked.contains(link), "{linked}");
+        assert_ne!(linked, pin_value(canonical, &spellings(Some(other))));
+        assert_eq!(linked, pin_value(canonical, &spellings(Some(link))));
+        // A shell that writes the drive letter in lower case reaches the
+        // same root the same way: its pinned results are not set apart.
+        if cfg!(windows) {
+            assert_eq!(
+                pin_value(canonical, &spellings(Some(r"c:\work\checkout"))),
+                canonical
+            );
+        }
     }
 
     #[test]
