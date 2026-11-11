@@ -2583,3 +2583,163 @@ fn undeclared_build_script_inputs_track_content_edits() {
     assert_eq!(script(&f, before), "l1_hit");
     assert_eq!(f.value("target"), "9");
 }
+
+fn open_store(root: &Path) -> bellows_core::Store {
+    bellows_core::Store::open(root).unwrap()
+}
+
+/// Stores a blob of `megabytes` MiB that no record references, aged past the
+/// grace that protects a publication in flight: a collection may delete it.
+fn stale_blob(store: &bellows_core::Store, megabytes: usize, fill: u8) -> PathBuf {
+    let bytes = vec![fill; megabytes * 1024 * 1024];
+    let digest = bellows_core::digest_bytes(&bytes);
+    store.put_blob(&digest, &bytes).unwrap();
+    let path = store.blob_path(&digest).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60))
+        .unwrap();
+    path
+}
+
+#[test]
+fn a_configured_budget_collects_the_local_store_when_a_build_finishes() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let store = open_store(&f.cache.join(format!("store-v{PROTOCOL_VERSION}")));
+    let stale = stale_blob(&store, 12, 7);
+    // Without a budget a build never collects, and a small store is not news.
+    let unbounded = f.build();
+    assert!(stale.exists());
+    let text = stderr(&unbounded);
+    assert!(
+        !text.contains("COLLECTED") && !text.contains("BELLOWS_MAX_MB"),
+        "{text}"
+    );
+    // With one, the build that finishes over budget collects, and says so once.
+    let budgeted = || {
+        let mut command = f.local();
+        command
+            .env("BELLOWS_MAX_MB", "8")
+            .args(["cargo", "build", "--release", "--offline"]);
+        command
+    };
+    f.clean();
+    let collected = checked(&mut budgeted());
+    let text = stderr(&collected);
+    assert_eq!(text.matches("COLLECTED").count(), 1, "{text}");
+    let line = text
+        .lines()
+        .find(|line| line.contains("COLLECTED"))
+        .unwrap();
+    assert!(line.contains("8.0 MiB budget"), "{line}");
+    assert!(!stale.exists(), "{text}");
+    assert!(store.blob_bytes().unwrap() <= 8 * 1024 * 1024);
+    // What the build itself just used is the most recently used: it stays,
+    // and a store within its budget is left alone and not mentioned.
+    f.clean();
+    let restored = checked(&mut budgeted());
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    assert!(
+        !stderr(&restored).contains("COLLECTED"),
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(f.value("target"), "42");
+}
+
+#[test]
+fn the_wrapper_mode_store_keeps_the_same_budget() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let state = f.temp.path().join("state");
+    let store = open_store(&state.join(format!("l1-v{PROTOCOL_VERSION}")));
+    let stale = stale_blob(&store, 12, 9);
+    // No server answers, so `bellows run` works from its local store alone.
+    let output = checked(
+        f.command(BELLOWS)
+            .env("BELLOWS_STATE_DIR", &state)
+            .env("BELLOWS_MAX_MB", "8")
+            .args([
+                "run",
+                "--server",
+                "http://127.0.0.1:1",
+                "--",
+                "cargo",
+                "build",
+                "--release",
+                "--offline",
+            ]),
+    );
+    let text = stderr(&output);
+    assert_eq!(text.matches("COLLECTED").count(), 1, "{text}");
+    assert!(!stale.exists(), "{text}");
+    assert!(store.blob_bytes().unwrap() > 0, "the build's results stay");
+    assert_eq!(f.value("target"), "42");
+}
+
+#[test]
+fn a_malformed_budget_stops_the_command_before_it_builds() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    for (name, value, message) in [
+        ("BELLOWS_MAX_MB", "100GB", "BELLOWS_MAX_MB"),
+        ("BELLOWS_MAX_EXECUTABLE_MB", "10", "needs BELLOWS_MAX_MB"),
+    ] {
+        let output = f
+            .local()
+            .env(name, value)
+            .args(["cargo", "build", "--release", "--offline"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(stderr(&output).contains(message), "{}", stderr(&output));
+        assert!(!f.workspace.join("target").exists());
+    }
+}
+
+#[test]
+fn local_statistics_show_the_budget_and_what_is_stored() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    f.build();
+    let stats = |budget: Option<&str>, json: bool| {
+        let mut command = f.command(BELLOWS);
+        command
+            .args(["stats", "--local", "--cache-dir"])
+            .arg(&f.cache);
+        if json {
+            command.arg("--json");
+        }
+        if let Some(budget) = budget {
+            command.env("BELLOWS_MAX_MB", budget);
+        }
+        String::from_utf8(checked(&mut command).stdout).unwrap()
+    };
+    let unset = stats(None, false);
+    assert!(unset.contains("stored"), "{unset}");
+    assert!(
+        unset.contains("budget") && unset.contains("BELLOWS_MAX_MB"),
+        "{unset}"
+    );
+    let limited = stats(Some("2048"), false);
+    assert!(limited.contains("2.0 GiB"), "{limited}");
+    assert!(limited.contains("1.6 GiB"), "collects to 80%: {limited}");
+    let unbounded = stats(Some("0"), false);
+    assert!(unbounded.contains("unbounded"), "{unbounded}");
+    let json: Value = serde_json::from_str(&stats(Some("2048"), true)).unwrap();
+    assert_eq!(json["budget"]["max_bytes"], 2048u64 * 1024 * 1024, "{json}");
+    assert_eq!(
+        json["budget"]["collect_to_bytes"],
+        2048u64 * 1024 * 1024 / 100 * 80,
+        "{json}"
+    );
+    assert!(json["remote"]["blob_bytes"].as_u64().unwrap() > 0, "{json}");
+    let json: Value = serde_json::from_str(&stats(None, true)).unwrap();
+    assert_eq!(json["budget"]["state"], "unset", "{json}");
+    assert!(json["budget"]["max_bytes"].is_null(), "{json}");
+}

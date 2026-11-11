@@ -105,6 +105,7 @@ bellows stats --local
 bellows stats --local --json
 bellows gc --local --max-mb 20000
 bellows explain --local --latest --summary
+export BELLOWS_MAX_MB=20000   # or let every wrapped build keep the store to a budget
 ```
 
 This version stores cache objects in `store-v6` below this state directory,
@@ -117,6 +118,52 @@ Collection is reference-aware. If collection or manual damage leaves a
 declared record without all of its blobs, the next local action removes the
 stale record and executes normally. Compiler artifacts retain the existing
 eight-candidate-per-static-key policy.
+
+### A budget that enforces itself
+
+Without a budget a local store only grows, until someone runs `bellows gc`.
+Set one and wrapped builds keep to it themselves:
+
+```bash
+export BELLOWS_MAX_MB=100000   # mebibytes, for each local store
+```
+
+- When a wrapped build (`bellows cargo`, `bellows local`, `bellows run`)
+  finishes and its store holds more than the budget, the build runs the same
+  least-recently-used collection as `bellows gc`, down to 80% of the budget,
+  so the builds that follow have room before another collection is due. The
+  build summary gains one line, for example
+  `COLLECTED cache  101.3 GiB → 78.0 GiB of a 97.7 GiB budget · evicted 4120 of 15873 records · 9311 blobs · 6.2s`.
+  A store within its budget is left alone and not mentioned.
+- The budget applies to each store on its own: `store-v6` (used by
+  `bellows cargo` and `bellows local`) and `l1-v6` beside it (used by
+  `bellows run`). A state directory used both ways holds up to twice the
+  budget.
+- `BELLOWS_MAX_EXECUTABLE_MB` gives final executables their own share of the
+  budget, as `bellows gc --max-executable-mb` does (see the
+  [runbook](operations.md#capacity-and-recovery)). It is applied whenever a
+  build collects, and needs `BELLOWS_MAX_MB`.
+- Builds that share a store are safe. Collections take the store's
+  collection lock (`.gc.lock`), so a build that finishes while another is
+  collecting leaves it to that one and says nothing. A collection never
+  deletes a blob written since it started, an unreferenced blob younger than
+  the one-hour publication grace, or a record published or reused since it
+  started. A store can therefore stay above its budget while builds are
+  writing to it; the line says so.
+- With `BELLOWS_MAX_MB` unset nothing is collected automatically. A store
+  that has reached 20 GiB then says so in one line after every build that
+  uses it. `BELLOWS_MAX_MB=0` declares the store unbounded and silences that
+  line.
+- A value that is not a whole number stops the command before it builds. A
+  collection that fails is reported in the summary and never fails the build.
+- `bellows stats --local` shows the budget, what the daemonless store holds,
+  and what the `bellows run` store in the same state directory holds.
+  `--json` carries them in `budget`.
+
+`bellows run` keeps its local store in `BELLOWS_STATE_DIR`, or in
+`<workspace>/.bellows` when that is unset, so every checkout then grows a
+private store. Set `BELLOWS_STATE_DIR` to one directory for the machine to
+share a single store, and one budget, between checkouts.
 
 ## Declared local actions
 

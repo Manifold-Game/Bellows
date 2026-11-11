@@ -179,6 +179,14 @@ the budget. A blob is deleted only when no remaining record references it.
   apply it.
 - `bellowsd --max-store-gb GIB` (or `BELLOWS_MAX_STORE_GB`) collects to that
   budget every `--gc-interval-mins` (default 30). It is off unless set.
+- A client's local stores have their own budget: with `BELLOWS_MAX_MB` set,
+  every wrapped build that ends above it collects its store (see
+  [local builds](local-builds.md#a-budget-that-enforces-itself)).
+
+Collections that change a store run one at a time, under the store's
+collection lock (`.gc.lock`): each rotates and compacts the access journal the
+other reads. `bellows gc` waits for a collection in progress; a build's
+automatic collection skips instead. A dry run only reads and never waits.
 
 Collection applies its plan in batches of 256 under the store's mutation
 lock, so builds keep publishing while it runs. It never deletes a blob that

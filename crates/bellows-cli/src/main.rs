@@ -540,6 +540,7 @@ fn print_gc_report(report: &GcReport) {
 
 fn run_command(server: String, token: Option<String>, command: Vec<OsString>) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
+    let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = state_dir(&workspace);
     if let Err(error) = fs::create_dir_all(&state_dir) {
@@ -621,7 +622,12 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     if let Some(relay) = relay {
         finish_relay(relay)?;
     }
+    // The wrappers' local store, unless they ran without one.
+    let cache_line = (env::var("BELLOWS_L1").as_deref() != Ok("0"))
+        .then(|| enforce_budget(&state_dir.join(format!("l1-v{PROTOCOL_VERSION}")), budget))
+        .flatten();
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    print_summary_line(cache_line);
     if let Some(message) = &unreachable {
         eprintln!(
             "{}",
@@ -827,6 +833,7 @@ fn unreachable_message(server: &str, error: &anyhow::Error) -> String {
 
 fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
+    let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = match local_state_dir(cache_dir.as_deref()).and_then(|state| {
         local_store(Some(&state), true)?.check_writable()?;
@@ -858,8 +865,219 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
     let result = child.status().context("start locally wrapped command");
+    let cache_line = enforce_budget(
+        &state_dir.join(format!("store-v{PROTOCOL_VERSION}")),
+        budget,
+    );
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    print_summary_line(cache_line);
     Ok(result?.code().unwrap_or(1))
+}
+
+const MEBIBYTE: u64 = 1024 * 1024;
+
+/// An automatic collection frees a store down to this share of its budget, so
+/// the builds that follow have room before another collection is due.
+const COLLECT_TO_PERCENT: u64 = 80;
+
+/// A local store this large with no budget is reported after every build that
+/// uses it: nothing else would ever say that it only grows.
+const UNBUDGETED_NOTICE_BYTES: u64 = 20 * 1024 * MEBIBYTE;
+
+/// How large a local store may grow before a wrapped build collects it. It
+/// applies to each store on its own: the daemonless store that
+/// `bellows cargo` and `bellows local` use, and the local store beside a
+/// `bellows run` session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budget {
+    /// `BELLOWS_MAX_MB` is not set: only `bellows gc` ever collects.
+    Unset,
+    /// `BELLOWS_MAX_MB=0`: unbounded on purpose.
+    Unbounded,
+    Limited {
+        max_bytes: u64,
+        max_executable_bytes: Option<u64>,
+    },
+}
+
+/// What a wrapped build does about its store once it has finished.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetAction {
+    Nothing,
+    /// Say that the store is large and nothing bounds it.
+    Notice,
+    /// Collect least recently used records until the blobs fit `to_bytes`.
+    Collect {
+        max_bytes: u64,
+        to_bytes: u64,
+        max_executable_bytes: Option<u64>,
+    },
+}
+
+impl Budget {
+    fn from_env() -> Result<Self> {
+        let value = |name: &str| -> Result<Option<String>> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => {
+                    bail!("{name} must be a whole number of mebibytes")
+                }
+            }
+        };
+        Self::parse(
+            value("BELLOWS_MAX_MB")?.as_deref(),
+            value("BELLOWS_MAX_EXECUTABLE_MB")?.as_deref(),
+        )
+    }
+
+    fn parse(max_mb: Option<&str>, max_executable_mb: Option<&str>) -> Result<Self> {
+        let mebibytes = |name: &str, value: Option<&str>| -> Result<Option<u64>> {
+            let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+                return Ok(None);
+            };
+            let parsed = value.parse::<u64>().with_context(|| {
+                format!("{name} must be a whole number of mebibytes, not {value:?}")
+            })?;
+            Ok(Some(parsed.saturating_mul(MEBIBYTE)))
+        };
+        let max_bytes = mebibytes("BELLOWS_MAX_MB", max_mb)?;
+        let max_executable_bytes = mebibytes("BELLOWS_MAX_EXECUTABLE_MB", max_executable_mb)?;
+        match max_bytes {
+            Some(0) | None if max_executable_bytes.is_some() => {
+                bail!(
+                    "BELLOWS_MAX_EXECUTABLE_MB needs BELLOWS_MAX_MB: it is a share of that budget"
+                )
+            }
+            None => Ok(Self::Unset),
+            Some(0) => Ok(Self::Unbounded),
+            Some(max_bytes) => Ok(Self::Limited {
+                max_bytes,
+                max_executable_bytes,
+            }),
+        }
+    }
+
+    /// What an automatic collection under a budget of `max_bytes` frees to.
+    fn collect_to(max_bytes: u64) -> u64 {
+        max_bytes / 100 * COLLECT_TO_PERCENT
+    }
+
+    fn action(self, stored_bytes: u64) -> BudgetAction {
+        match self {
+            Self::Unset if stored_bytes >= UNBUDGETED_NOTICE_BYTES => BudgetAction::Notice,
+            Self::Unset | Self::Unbounded => BudgetAction::Nothing,
+            Self::Limited {
+                max_bytes,
+                max_executable_bytes,
+            } if stored_bytes > max_bytes => BudgetAction::Collect {
+                max_bytes,
+                to_bytes: Self::collect_to(max_bytes),
+                max_executable_bytes,
+            },
+            Self::Limited { .. } => BudgetAction::Nothing,
+        }
+    }
+}
+
+/// Applies the budget to the store a wrapped build used, once the build has
+/// finished, and returns what to say about it in the build summary: nothing
+/// when the store is within its budget, or when another build is already
+/// collecting it. A collection that fails is reported and never fails the
+/// build.
+fn enforce_budget(store_root: &Path, budget: Budget) -> Option<String> {
+    // A session whose wrappers never ran has no store, and creates none.
+    if !store_root.join("blobs").is_dir() {
+        return None;
+    }
+    let color = terminal::stderr_color();
+    let failed = |what: &str, error: anyhow::Error| {
+        Some(terminal::warning(
+            color,
+            "cache",
+            &format!("{what} for {}: {error:#}", store_root.display()),
+        ))
+    };
+    let store = match Store::open_for_access(store_root) {
+        Ok(store) => store,
+        Err(error) => return failed("budget not applied", error),
+    };
+    let stored = match store.blob_bytes() {
+        Ok(stored) => stored,
+        Err(error) => return failed("budget not applied", error),
+    };
+    match budget.action(stored) {
+        BudgetAction::Nothing => None,
+        BudgetAction::Notice => Some(terminal::attention(
+            color,
+            "cache",
+            &format!(
+                "{} holds {} and has no budget, so it only grows. Set BELLOWS_MAX_MB (mebibytes) to \
+                 have builds collect it, or BELLOWS_MAX_MB=0 to keep it unbounded without this notice",
+                store_root.display(),
+                human_bytes(stored)
+            ),
+        )),
+        BudgetAction::Collect {
+            max_bytes,
+            to_bytes,
+            max_executable_bytes,
+        } => {
+            let options = GcOptions {
+                max_bytes: to_bytes,
+                max_executable_bytes,
+                ..GcOptions::default()
+            };
+            match store.try_collect_locally(&options) {
+                Ok(Some(report)) => Some(terminal::status(
+                    color,
+                    "gc",
+                    "cache",
+                    &collection_summary(&report, max_bytes),
+                )),
+                // Another build that finished with this one is collecting.
+                Ok(None) => None,
+                Err(error) => failed(
+                    &format!(
+                        "over its {} budget at {}, and the collection failed",
+                        human_bytes(max_bytes),
+                        human_bytes(stored)
+                    ),
+                    error,
+                ),
+            }
+        }
+    }
+}
+
+/// One line for an automatic collection: what the store held and holds now
+/// against its budget, and what was evicted to get there.
+fn collection_summary(report: &GcReport, max_bytes: u64) -> String {
+    let mut line = format!(
+        "{} → {} of a {} budget · evicted {} of {} records · {} blobs · {:.1}s",
+        human_bytes(report.bytes_before),
+        human_bytes(report.bytes_after),
+        human_bytes(max_bytes),
+        report.records_evicted,
+        report.records,
+        report.blobs_evicted,
+        report.duration_ms as f64 / 1000.0
+    );
+    if report.bytes_after > max_bytes {
+        line.push_str(
+            " · still over budget: blobs that builds in progress are writing are kept for an hour",
+        );
+    }
+    line
+}
+
+/// Prints a line that belongs to the build summary, when one is printed.
+fn print_summary_line(line: Option<String>) {
+    if let Some(line) = line
+        && terminal::Output::from_env().prints_build_summary()
+    {
+        eprintln!("{line}");
+    }
 }
 
 fn run_without_cache(
@@ -4820,6 +5038,73 @@ struct CombinedStats {
     remote: ServerStats,
     events: BTreeMap<String, u64>,
     diagnostics: diagnostics::Summary,
+    /// Local statistics only: the configured budget and the stores it covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<BudgetStats>,
+}
+
+#[derive(Serialize)]
+struct BudgetStats {
+    /// `unset`, `unbounded` or `limited`.
+    state: &'static str,
+    /// The budget each local store is held to (`BELLOWS_MAX_MB`).
+    max_bytes: Option<u64>,
+    /// What a build's automatic collection frees a store down to.
+    collect_to_bytes: Option<u64>,
+    max_executable_bytes: Option<u64>,
+    /// The store `bellows run` keeps beside this one, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrapper_store: Option<StoreUsage>,
+}
+
+#[derive(Serialize)]
+struct StoreUsage {
+    path: String,
+    blob_bytes: u64,
+}
+
+impl BudgetStats {
+    fn new(budget: Budget, wrapper_store: Option<StoreUsage>) -> Self {
+        let (state, max_bytes, max_executable_bytes) = match budget {
+            Budget::Unset => ("unset", None, None),
+            Budget::Unbounded => ("unbounded", None, None),
+            Budget::Limited {
+                max_bytes,
+                max_executable_bytes,
+            } => ("limited", Some(max_bytes), max_executable_bytes),
+        };
+        Self {
+            state,
+            max_bytes,
+            collect_to_bytes: max_bytes.map(Budget::collect_to),
+            max_executable_bytes,
+            wrapper_store,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (self.max_bytes, self.collect_to_bytes) {
+            (Some(max), Some(collect_to)) => {
+                let mut text = format!(
+                    "{} for each store (BELLOWS_MAX_MB); a build that ends above it collects to {}",
+                    human_bytes(max),
+                    human_bytes(collect_to)
+                );
+                if let Some(executables) = self.max_executable_bytes {
+                    text.push_str(&format!(
+                        ", executables to {} (BELLOWS_MAX_EXECUTABLE_MB)",
+                        human_bytes(executables)
+                    ));
+                }
+                text
+            }
+            _ if self.state == "unbounded" => "unbounded (BELLOWS_MAX_MB=0)".into(),
+            _ => {
+                "none: only `bellows gc` collects; set BELLOWS_MAX_MB (mebibytes) to cap each store"
+                    .into()
+            }
+        }
+    }
 }
 
 fn show_stats(
@@ -4837,7 +5122,8 @@ fn show_stats(
             serde_json::to_string_pretty(&CombinedStats {
                 remote,
                 events,
-                diagnostics
+                diagnostics,
+                budget: None,
             })?
         );
     } else {
@@ -4878,13 +5164,26 @@ fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()
     let remote = collect_local_stats(&store)?;
     let diagnostics = diagnostics::summarize(&diagnostics::read_selected(selection)?);
     let events = diagnostics.decisions.clone();
+    // The store `bellows run` keeps in the same state directory is held to
+    // the same budget, so its size belongs beside this one's.
+    let wrapper_root = state.join(format!("l1-v{PROTOCOL_VERSION}"));
+    let wrapper_store = if wrapper_root.join("blobs").is_dir() {
+        Some(StoreUsage {
+            blob_bytes: Store::open_for_access(&wrapper_root)?.blob_bytes()?,
+            path: wrapper_root.display().to_string(),
+        })
+    } else {
+        None
+    };
+    let budget = BudgetStats::new(Budget::from_env()?, wrapper_store);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&CombinedStats {
                 remote,
                 events,
-                diagnostics
+                diagnostics,
+                budget: Some(budget),
             })?
         );
         return Ok(());
@@ -4908,6 +5207,20 @@ fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()
         "{}",
         terminal::key_value(color, "stored", human_bytes(remote.blob_bytes))
     );
+    println!(
+        "{}",
+        terminal::key_value(color, "budget", budget.describe())
+    );
+    if let Some(wrapper) = &budget.wrapper_store {
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "bellows run store",
+                format!("{} in {}", human_bytes(wrapper.blob_bytes), wrapper.path)
+            )
+        );
+    }
     println!(
         "{}",
         terminal::section(color, "Selected decisions (retained log)")
@@ -5943,6 +6256,70 @@ fn display_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_budget_is_a_whole_number_of_mebibytes_and_zero_means_unbounded() {
+        assert_eq!(Budget::parse(None, None).unwrap(), Budget::Unset);
+        assert_eq!(Budget::parse(Some(""), None).unwrap(), Budget::Unset);
+        assert_eq!(Budget::parse(Some("0"), None).unwrap(), Budget::Unbounded);
+        assert_eq!(
+            Budget::parse(Some(" 100000 "), Some("20000")).unwrap(),
+            Budget::Limited {
+                max_bytes: 100_000 * MEBIBYTE,
+                max_executable_bytes: Some(20_000 * MEBIBYTE),
+            }
+        );
+        for (max, executables) in [
+            (Some("100GB"), None),
+            (Some("-1"), None),
+            (Some("1.5"), None),
+            (Some("100"), Some("many")),
+            // A share of a budget that does not exist.
+            (None, Some("10")),
+            (Some("0"), Some("10")),
+        ] {
+            assert!(
+                Budget::parse(max, executables).is_err(),
+                "{max:?} {executables:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_collects_only_above_the_budget_and_then_to_four_fifths_of_it() {
+        let budget = Budget::Limited {
+            max_bytes: 1000 * MEBIBYTE,
+            max_executable_bytes: None,
+        };
+        assert_eq!(budget.action(1000 * MEBIBYTE), BudgetAction::Nothing);
+        assert_eq!(
+            budget.action(1000 * MEBIBYTE + 1),
+            BudgetAction::Collect {
+                max_bytes: 1000 * MEBIBYTE,
+                to_bytes: 800 * MEBIBYTE,
+                max_executable_bytes: None,
+            }
+        );
+        // Without a budget nothing is collected. A large store is reported,
+        // unless it is unbounded on purpose.
+        assert_eq!(
+            Budget::Unset.action(UNBUDGETED_NOTICE_BYTES - 1),
+            BudgetAction::Nothing
+        );
+        assert_eq!(
+            Budget::Unset.action(UNBUDGETED_NOTICE_BYTES),
+            BudgetAction::Notice
+        );
+        assert_eq!(Budget::Unbounded.action(u64::MAX), BudgetAction::Nothing);
+        assert_eq!(Budget::collect_to(u64::MAX), u64::MAX / 100 * 80);
+    }
+
+    #[test]
+    fn budget_settings_never_reach_a_cache_key() {
+        for name in ["BELLOWS_MAX_MB", "BELLOWS_MAX_EXECUTABLE_MB"] {
+            assert!(!is_relevant_environment_name(name), "{name}");
+        }
+    }
 
     #[test]
     fn protocol_skew_is_rejected_in_both_directions() {

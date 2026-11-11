@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const JOURNAL_DIR: &str = "access";
 const JOURNAL_FILE: &str = "journal.log";
+const COLLECTION_LOCK: &str = ".gc.lock";
 const BATCH: usize = 256;
 const TOP_CRATES: usize = 15;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -100,7 +101,38 @@ impl Store {
         self.collect(options, &unserialized)
     }
 
+    /// Collects like [`Store::collect_locally`], unless another process is
+    /// collecting this store: then nothing is done and `None` is returned.
+    /// Builds that finish together each try to enforce the same budget; one
+    /// collection serves them all.
+    pub fn try_collect_locally(&self, options: &GcOptions) -> Result<Option<GcReport>> {
+        if options.dry_run {
+            return self.collect_unlocked(options, &unserialized).map(Some);
+        }
+        let Some(_lock) = collection_lock(&self.root, false)? else {
+            return Ok(None);
+        };
+        self.collect_unlocked(options, &unserialized).map(Some)
+    }
+
+    /// Plans a collection and, unless it is a dry run, applies it. Collections
+    /// that change a store run one at a time: a second one waits for the
+    /// first, because each rotates and compacts the access journal the other
+    /// reads. A dry run only reads and never waits.
     pub fn collect(&self, options: &GcOptions, serialize: BatchRunner<'_>) -> Result<GcReport> {
+        let _lock = if options.dry_run {
+            None
+        } else {
+            collection_lock(&self.root, true)?
+        };
+        self.collect_unlocked(options, serialize)
+    }
+
+    fn collect_unlocked(
+        &self,
+        options: &GcOptions,
+        serialize: BatchRunner<'_>,
+    ) -> Result<GcReport> {
         let started = now_ms();
         let started_time = SystemTime::now();
         // Rotate before reading so every use from here on lands in a fresh
@@ -744,6 +776,31 @@ fn candidate_kind(crate_name: &str, artifacts: &[crate::Artifact]) -> Kind {
     }
 }
 
+/// Holds a store's collection lock until dropped. With `wait` false, returns
+/// `None` when another process holds it.
+fn collection_lock(root: &Path, wait: bool) -> Result<Option<fs::File>> {
+    let path = root.join(COLLECTION_LOCK);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open collection lock {}", path.display()))?;
+    if wait {
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("lock {} for collection", root.display()))?;
+        return Ok(Some(file));
+    }
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("lock {} for collection", root.display())),
+    }
+}
+
 fn rotate_journal(root: &Path) -> Result<()> {
     let directory = root.join(JOURNAL_DIR);
     let current = directory.join(JOURNAL_FILE);
@@ -1287,6 +1344,58 @@ mod tests {
         assert_eq!(second.records_evicted, 1);
         assert!(fixture.present(&older));
         assert!(!fixture.present(&newer));
+    }
+
+    #[test]
+    fn blob_bytes_measure_what_a_budget_counts() {
+        let fixture = Fixture::new("bytes");
+        assert_eq!(fixture.store.blob_bytes().unwrap(), 0);
+        fixture.publish("one", 1, 1_000, PROTOCOL_VERSION);
+        fixture.publish("two", 2, 2_000, PROTOCOL_VERSION);
+        // A write in flight is not stored yet.
+        let temp = fixture.store.blob_temp_path(&digest_bytes(b"x")).unwrap();
+        fs::write(&temp, vec![0u8; 50]).unwrap();
+        assert_eq!(fixture.store.blob_bytes().unwrap(), 200);
+        assert_eq!(
+            fixture.store.blob_bytes().unwrap(),
+            crate::directory_bytes(&fixture.root.join("blobs")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_collection_steps_aside_while_another_is_running() {
+        let fixture = Fixture::new("contended");
+        let older = fixture.publish("older", 1, 1_000, PROTOCOL_VERSION);
+        let newer = fixture.publish("newer", 2, 2_000, PROTOCOL_VERSION);
+        fixture.uses(&[]);
+        fixture.age_blobs();
+        let running = collection_lock(&fixture.root, false).unwrap().unwrap();
+        assert!(
+            fixture
+                .store
+                .try_collect_locally(&fixture.options(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.present(&older) && fixture.present(&newer));
+        // A dry run only reads, so it never has to wait.
+        let plan = fixture
+            .store
+            .try_collect_locally(&GcOptions {
+                dry_run: true,
+                ..fixture.options(100)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.records_evicted, 1);
+        drop(running);
+        let report = fixture
+            .store
+            .try_collect_locally(&fixture.options(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert!(!fixture.present(&older) && fixture.present(&newer));
     }
 
     #[test]

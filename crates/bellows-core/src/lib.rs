@@ -750,6 +750,41 @@ impl Store {
         &self.root
     }
 
+    /// Bytes held in blobs: what a storage budget is measured against.
+    ///
+    /// Sizes come from the directory listing where the platform supplies
+    /// them, so a wrapped build can afford to ask once when it finishes.
+    pub fn blob_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        let shards = match fs::read_dir(self.root.join("blobs")) {
+            Ok(shards) => shards,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        for shard in shards {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for blob in fs::read_dir(shard.path())? {
+                let blob = blob?;
+                if blob.file_name().to_string_lossy().starts_with(".tmp-") {
+                    continue;
+                }
+                match blob.metadata() {
+                    Ok(metadata) if metadata.is_file() => {
+                        total = total.saturating_add(metadata.len());
+                    }
+                    Ok(_) => {}
+                    // Deleted by a collection between the listing and the stat.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(total)
+    }
+
     pub fn check_writable(&self) -> Result<()> {
         let path = self.root.join(format!(
             ".health-{}-{}",
