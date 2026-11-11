@@ -34,22 +34,8 @@ impl Fixture {
         let mut cmd = Command::new(program);
         cmd.current_dir(&self.workspace);
         for (name, _) in std::env::vars_os() {
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with("BELLOWS_")
-                || name_str.starts_with("CARGO_")
-                || matches!(
-                    name_str.as_ref(),
-                    "RUSTC_WRAPPER"
-                        | "RUSTC_WORKSPACE_WRAPPER"
-                        | "RUSTFLAGS"
-                        | "RUSTDOCFLAGS"
-                        | "RUSTC"
-                )
-            {
-                // Keep CARGO_HOME for the installed toolchain's normal lookup.
-                if name_str != "CARGO_HOME" {
-                    cmd.env_remove(name);
-                }
+            if !inherited(&name.to_string_lossy()) {
+                cmd.env_remove(name);
             }
         }
         cmd.env("BELLOWS_COLOR", "never");
@@ -118,6 +104,54 @@ impl Fixture {
         );
     }
 }
+/// Whether a fixture's commands inherit a variable of the test process. The
+/// build under test must not see the Bellows, Cargo and rustc settings of the
+/// build that runs the tests, with two exceptions: `CARGO_HOME`, and the
+/// marks of a build scheduler in front of Cargo (cargo-hold's `CARGO_HOLD_*`).
+/// Those say that this process already runs inside a hold; without them a
+/// fixture's Cargo waits for the hold its own `cargo test` holds. No cache
+/// key covers them.
+fn inherited(name: &str) -> bool {
+    let from_the_outer_build = name.starts_with("BELLOWS_")
+        || name.starts_with("CARGO_")
+        || matches!(
+            name,
+            "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTC"
+        );
+    // Keep CARGO_HOME for the installed toolchain's normal lookup.
+    !from_the_outer_build || name == "CARGO_HOME" || name.starts_with("CARGO_HOLD_")
+}
+
+#[test]
+fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
+    for name in [
+        "BELLOWS_STATE_DIR",
+        "BELLOWS_MAX_MB",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_JOBS",
+        "CARGO_MANIFEST_DIR",
+        "RUSTC_WRAPPER",
+        "RUSTFLAGS",
+    ] {
+        assert!(!inherited(name), "{name}");
+    }
+    for name in [
+        "PATH",
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "RUSTUP_TOOLCHAIN",
+    ] {
+        assert!(inherited(name), "{name}");
+    }
+    // A scheduler in front of Cargo (cargo-hold) marks everything inside a
+    // hold. A nested Cargo that does not see the mark queues behind the very
+    // `cargo test` that is running it, and never starts.
+    for name in ["CARGO_HOLD_ACTIVE", "CARGO_HOLD_LABEL", "CARGO_HOLD_SKIP"] {
+        assert!(inherited(name), "{name}");
+    }
+}
+
 fn checked(command: &mut Command) -> Output {
     let result = command.output().unwrap();
     assert!(
