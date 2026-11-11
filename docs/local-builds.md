@@ -54,6 +54,14 @@ results as *shareable* or *pinned to checkout*. Reading `CARGO_MANIFEST_DIR`
 at run time (Cargo and nextest set it for test processes) makes such a test
 shareable.
 
+A pinned result is dead weight once its checkout is deleted, as a finished
+git worktree is. The local store records which checkout each pinned result
+belongs to, and every local collection (`bellows gc --local` and a build's
+[own](#a-budget-that-enforces-itself)) evicts the results of checkouts that no
+longer exist, whatever the budget. A checkout on a volume that is merely
+unplugged or unmounted is left alone. See the
+[runbook](operations.md#capacity-and-recovery) for the exact rules.
+
 ## Incremental edit loops
 
 `bellows run` no longer forces `CARGO_INCREMENTAL=0`. An incremental rustc
@@ -134,7 +142,8 @@ export BELLOWS_MAX_MB=100000   # mebibytes, for each local store
   so the builds that follow have room before another collection is due. The
   build summary gains one line, for example
   `COLLECTED cache  101.3 GiB → 78.0 GiB of a 97.7 GiB budget · evicted 4120 of 15873 records · 9311 blobs · 6.2s`.
-  A store within its budget is left alone and not mentioned.
+  It also says how many of them were pinned to checkouts that no longer
+  exist. A store within its budget is left alone and not mentioned.
 - The budget applies to each store on its own: `store-v6` (used by
   `bellows cargo` and `bellows local`) and `l1-v6` beside it (used by
   `bellows run`). A state directory used both ways holds up to twice the

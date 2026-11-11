@@ -252,7 +252,8 @@ fn cached_run(
             match restored {
                 Ok(()) => {
                     if remote && let Some(store) = &stores.l1 {
-                        let _ = store.put_candidate(candidate.clone(), 8);
+                        let _ =
+                            store.put_candidate(super::for_local_store(candidate, &identity), 8);
                     }
                     if !remote && let Some(store) = &stores.l1 {
                         let _ = store.record_use(&candidate.static_key, &candidate.action_key);
@@ -787,6 +788,7 @@ fn capture(
     let stderr_len = stderr.len() as u64;
     blobs.insert(stdout_digest.clone(), stdout);
     blobs.insert(stderr_digest.clone(), stderr);
+    let pinned_checkouts = super::pinned_checkouts(identity, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -810,6 +812,7 @@ fn capture(
             len: stderr_len,
         },
         proc_macros: Vec::new(),
+        pinned_checkouts,
     };
     validate_candidate_manifest(&candidate)?;
     Ok((candidate, blobs, !leaked.is_empty()))

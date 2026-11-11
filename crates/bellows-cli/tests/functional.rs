@@ -2743,3 +2743,149 @@ fn local_statistics_show_the_budget_and_what_is_stored() {
     assert_eq!(json["budget"]["state"], "unset", "{json}");
     assert!(json["budget"]["max_bytes"].is_null(), "{json}");
 }
+
+/// A canonical path as a fresh process spells it.
+fn ordinary(path: &Path) -> String {
+    let canonical = path.canonicalize().unwrap();
+    let text = canonical.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
+}
+
+fn scope_records(report: &Value, label: &str) -> u64 {
+    report["breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|bucket| bucket["group"] == "scope" && bucket["label"] == label)
+        .map_or(0, |bucket| bucket["records"].as_u64().unwrap())
+}
+
+#[test]
+fn collection_evicts_results_pinned_to_a_checkout_that_was_deleted() {
+    let mut f = Fixture::new(
+        "pub fn value() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let gc = |f: &Fixture, flags: &[&str]| -> Output {
+        checked(
+            f.command(BELLOWS)
+                .args(["gc", "--local", "--max-mb", "100000", "--cache-dir"])
+                .arg(&f.cache)
+                .args(flags),
+        )
+    };
+    let json = |f: &Fixture, flags: &[&str]| -> Value {
+        serde_json::from_slice(&gc(f, &[flags, &["--json"]].concat()).stdout).unwrap()
+    };
+    f.build();
+    let first = f.workspace.clone();
+    let first_spelled = ordinary(&first);
+    second_checkout(&mut f, "second");
+    f.build();
+    // Both checkouts exist: the library and the binary of each are pinned,
+    // and none of them to a checkout that is gone.
+    let both = json(&f, &["--dry-run"]);
+    assert_eq!(scope_records(&both, "pinned to a checkout"), 4, "{both}");
+    assert_eq!(both["deleted_checkout_records"], 0, "{both}");
+    assert_eq!(both["records_evicted"], 0, "{both}");
+
+    fs::remove_dir_all(&first).unwrap();
+    let plan = json(&f, &["--dry-run"]);
+    assert_eq!(plan["deleted_checkout_records"], 2, "{plan}");
+    assert_eq!(plan["records_evicted"], 2, "{plan}");
+    assert!(
+        plan["deleted_checkout_bytes"].as_u64().unwrap() > 0,
+        "{plan}"
+    );
+    assert_eq!(plan["deleted_checkouts"][0]["path"], first_spelled.as_str());
+    assert_eq!(plan["deleted_checkouts"][0]["records"], 2, "{plan}");
+    assert_eq!(
+        scope_records(&plan, "pinned to a deleted checkout"),
+        2,
+        "{plan}"
+    );
+    assert_eq!(scope_records(&plan, "pinned to a checkout"), 2, "{plan}");
+    let text = String::from_utf8(gc(&f, &["--dry-run"]).stdout).unwrap();
+    assert!(
+        text.contains("would evict 2 records") && text.contains("pinned to 1 deleted checkout"),
+        "{text}"
+    );
+    assert!(text.contains(&first_spelled), "{text}");
+    // They can be left to the budget instead.
+    let kept = json(&f, &["--dry-run", "--keep-missing-checkouts"]);
+    assert_eq!(kept["records_evicted"], 0, "{kept}");
+
+    let collected = json(&f, &[]);
+    assert_eq!(collected["records_evicted"], 2, "{collected}");
+    assert_eq!(collected["deleted_checkout_records"], 2, "{collected}");
+    let after = json(&f, &["--dry-run"]);
+    assert_eq!(after["deleted_checkout_records"], 0, "{after}");
+    // The checkout that still exists restores everything it built.
+    f.clean();
+    let restored = f.build();
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    assert_eq!(f.value("target"), f.workspace.to_str().unwrap());
+}
+
+#[test]
+fn a_cleaned_target_directory_is_not_a_deleted_checkout() {
+    let f = Fixture::new(
+        "pub fn value() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.build();
+    f.clean();
+    let output = checked(
+        f.command(BELLOWS)
+            .args([
+                "gc",
+                "--local",
+                "--max-mb",
+                "100000",
+                "--json",
+                "--cache-dir",
+            ])
+            .arg(&f.cache),
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["records_evicted"], 0, "{report}");
+    assert_eq!(decisions(&f.build(), "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+}
+
+#[test]
+fn a_build_that_collects_also_evicts_results_of_deleted_checkouts() {
+    let mut f = Fixture::new(
+        "pub fn value() -> &'static str { env!(\"CARGO_MANIFEST_DIR\") }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.build();
+    let first = f.workspace.clone();
+    second_checkout(&mut f, "second");
+    fs::remove_dir_all(&first).unwrap();
+    let store = open_store(&f.cache.join(format!("store-v{PROTOCOL_VERSION}")));
+    stale_blob(&store, 12, 3);
+    let output = checked(f.local().env("BELLOWS_MAX_MB", "8").args([
+        "cargo",
+        "build",
+        "--release",
+        "--offline",
+    ]));
+    let text = stderr(&output);
+    let line = text
+        .lines()
+        .find(|line| line.contains("COLLECTED"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        line.contains("2 of them pinned to 1 deleted checkout"),
+        "{line}"
+    );
+    // What this build stored for the checkout that exists is still there.
+    f.clean();
+    let restored = checked(f.local().env("BELLOWS_MAX_MB", "8").args([
+        "cargo",
+        "build",
+        "--release",
+        "--offline",
+    ]));
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+}

@@ -85,6 +85,11 @@ of its summary. Without it, a store that has reached 20 GiB says so after each
 build (`BELLOWS_MAX_MB=0` keeps it unbounded, quietly). See
 [local builds](docs/local-builds.md#a-budget-that-enforces-itself).
 
+Results that embed a checkout path can only be reused from that checkout.
+Every local collection evicts those whose checkout has been deleted (a
+finished git worktree, say), whatever the budget, and reports them as their
+own group.
+
 Each wrapped build prints its build ID, elapsed time, hit/miss/bypass counts,
 and the most common reasons. Inspect that build without lifetime-log noise:
 

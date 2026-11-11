@@ -3,9 +3,9 @@ use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord, EnvInput,
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcOptions, GcReport, GcRequest,
     HealthResponse, LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
-    PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write, compiler_action_key,
-    declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home, tree_digest,
-    validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
+    PinnedCheckout, PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write,
+    compiler_action_key, declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home,
+    tree_digest, validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
     validate_declared_record, validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
@@ -151,6 +151,11 @@ enum Commands {
         /// procedural macros and build scripts never make room for them.
         #[arg(long)]
         max_executable_mb: Option<u64>,
+        /// Keep records pinned to a checkout that no longer exists until the
+        /// budget reaches them. A local collection otherwise evicts them
+        /// whatever the budget (also set by BELLOWS_KEEP_MISSING_CHECKOUTS=1).
+        #[arg(long)]
+        keep_missing_checkouts: bool,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -350,6 +355,7 @@ fn run_cli() -> Result<i32> {
             dry_run,
             min_protocol,
             max_executable_mb,
+            keep_missing_checkouts,
             json,
             local,
             cache_dir,
@@ -361,6 +367,10 @@ fn run_cli() -> Result<i32> {
                 dry_run,
                 min_protocol,
                 max_executable_bytes: max_executable_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+                // Only a store on this machine names checkouts that can be
+                // looked for here; a server never does (see `PinnedCheckout`).
+                evict_missing_checkouts: (local || store_dir.is_some())
+                    && !(keep_missing_checkouts || keep_missing_checkouts_from_env()),
             };
             let report = if let Some(directory) = store_dir {
                 collect_store_directory(&directory, &options)?
@@ -427,6 +437,22 @@ fn collect_store_directory(directory: &Path, options: &GcOptions) -> Result<GcRe
     store.collect_locally(options)
 }
 
+/// How many deleted checkouts a text report lists by path.
+const DELETED_CHECKOUTS_SHOWN: usize = 20;
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Whether collections on this machine keep records of deleted checkouts.
+fn keep_missing_checkouts_from_env() -> bool {
+    env::var("BELLOWS_KEEP_MISSING_CHECKOUTS").as_deref() == Ok("1")
+}
+
 fn print_gc_report(report: &GcReport) {
     let color = terminal::stdout_color();
     let verb = if report.dry_run {
@@ -472,6 +498,38 @@ fn print_gc_report(report: &GcReport) {
             human_bytes(report.evicted_bytes)
         )
     );
+    if report.deleted_checkout_records > 0 {
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "deleted checkouts",
+                format!(
+                    "{verb} {} records ({}) pinned to {}{}",
+                    report.deleted_checkout_records,
+                    human_bytes(report.deleted_checkout_bytes),
+                    plural(report.deleted_checkouts.len(), "deleted checkout"),
+                    if report.deleted_checkouts.len() > DELETED_CHECKOUTS_SHOWN {
+                        format!("; the {DELETED_CHECKOUTS_SHOWN} largest follow, --json lists all")
+                    } else {
+                        String::new()
+                    }
+                )
+            )
+        );
+        for checkout in report
+            .deleted_checkouts
+            .iter()
+            .take(DELETED_CHECKOUTS_SHOWN)
+        {
+            println!(
+                "    {:>10}  {:>7} records  {}",
+                human_bytes(checkout.evicted_bytes),
+                checkout.records,
+                checkout.path
+            );
+        }
+    }
     println!(
         "{}",
         terminal::key_value(
@@ -1026,6 +1084,7 @@ fn enforce_budget(store_root: &Path, budget: Budget) -> Option<String> {
             let options = GcOptions {
                 max_bytes: to_bytes,
                 max_executable_bytes,
+                evict_missing_checkouts: !keep_missing_checkouts_from_env(),
                 ..GcOptions::default()
             };
             match store.try_collect_locally(&options) {
@@ -1063,6 +1122,13 @@ fn collection_summary(report: &GcReport, max_bytes: u64) -> String {
         report.blobs_evicted,
         report.duration_ms as f64 / 1000.0
     );
+    if report.deleted_checkout_records > 0 {
+        line.push_str(&format!(
+            " · {} of them pinned to {}",
+            report.deleted_checkout_records,
+            plural(report.deleted_checkouts.len(), "deleted checkout")
+        ));
+    }
     if report.bytes_after > max_bytes {
         line.push_str(
             " · still over budget: blobs that builds in progress are writing are kept for an hour",
@@ -1481,7 +1547,7 @@ impl Remote {
             "{}/v1/actions/{}/{}",
             self.base, candidate.static_key, candidate.action_key
         )))
-        .json(candidate)
+        .json(&for_server(candidate))
         .send()?
         .error_for_status()?;
         Ok(())
@@ -3487,7 +3553,7 @@ fn try_candidates(
         match restored {
             Ok(()) => {
                 if let Some(store) = l1 {
-                    let _ = store.put_candidate(candidate.clone(), 8);
+                    let _ = store.put_candidate(for_local_store(candidate, identity), 8);
                 }
                 record_event(
                     "hit",
@@ -4375,6 +4441,7 @@ fn capture_outputs(
     blobs.insert(stdout_digest.clone(), normalized_stdout);
     blobs.insert(stderr_digest.clone(), normalized_stderr);
     let action_key = compiler_action_key(&identity.static_key, &files, &host_files, &env_inputs);
+    let pinned_checkouts = pinned_checkouts(identity, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -4394,6 +4461,7 @@ fn capture_outputs(
             len: stderr_len,
         },
         proc_macros: invocation.proc_macros.clone(),
+        pinned_checkouts,
     };
     validate_candidate_manifest(&candidate).map_err(|error| {
         if error.to_string().contains("cardinality") {
@@ -4707,6 +4775,45 @@ fn publish(remote: &Remote, captured: Captured) -> Result<String> {
     let action_key = captured.candidate.action_key.clone();
     remote.put_candidate(&captured.candidate)?;
     Ok(action_key)
+}
+
+/// The checkouts a candidate carrying these inputs can only be reused from:
+/// for each root it is pinned to, the checkout containing that root. A root
+/// outside every checkout names none (a registry package, a target directory
+/// shared by several checkouts), so such a pin is never judged by whether a
+/// directory exists. A target directory inside a checkout names the checkout,
+/// not itself: `cargo clean` removes it, and the next build puts it back.
+pub(crate) fn pinned_checkouts(identity: &Identity, inputs: &[EnvInput]) -> Vec<PinnedCheckout> {
+    let mut checkouts = inputs
+        .iter()
+        .filter(|input| input.name.starts_with(PIN_PREFIX))
+        .filter_map(|input| identity.pin_value(&input.name))
+        .filter_map(|root| checkout_root(Path::new(root)))
+        .filter_map(|checkout| PinnedCheckout::locate(&checkout))
+        .collect::<Vec<_>>();
+    checkouts.sort();
+    checkouts.dedup();
+    checkouts.truncate(bellows_core::MAX_PINNED_CHECKOUTS);
+    checkouts
+}
+
+/// A candidate as a server stores it: without the checkouts it is pinned to,
+/// which mean something only on the machine that holds them.
+fn for_server(candidate: &ActionCandidate) -> ActionCandidate {
+    ActionCandidate {
+        pinned_checkouts: Vec::new(),
+        ..candidate.clone()
+    }
+}
+
+/// A candidate restored from a server, as this machine's local store keeps
+/// it: pinned to this compile's checkouts. Its pins matched this compile's
+/// roots, or it would not have been restored.
+pub(crate) fn for_local_store(candidate: &ActionCandidate, identity: &Identity) -> ActionCandidate {
+    ActionCandidate {
+        pinned_checkouts: pinned_checkouts(identity, &candidate.env),
+        ..candidate.clone()
+    }
 }
 
 fn cache_captured(store: &Store, captured: &Captured) -> Result<()> {
@@ -6474,7 +6581,67 @@ mod tests {
                 len: 0,
             },
             proc_macros: vec![],
+            pinned_checkouts: vec![],
         }
+    }
+
+    #[test]
+    fn a_pinned_candidate_names_its_checkout_locally_and_never_to_a_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A git checkout holding a package and its target directory.
+        let checkout = root.join("checkout");
+        let package = checkout.join("crates").join("fixture");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::create_dir_all(checkout.join("target")).unwrap();
+        let workspace_pin = format!("{PIN_PREFIX}$WORKSPACE");
+        let target_pin = format!("{PIN_PREFIX}$TARGET");
+        let mut identity = test_identity(&package);
+        identity.pins.push((
+            target_pin.clone(),
+            checkout.join("target").to_string_lossy().into_owned(),
+        ));
+        let pins = |identity: &Identity, names: &[&String]| {
+            names
+                .iter()
+                .map(|name| EnvInput::capture(name.as_str(), identity.pin_value(name)))
+                .collect::<Vec<_>>()
+        };
+        let expected = PinnedCheckout::locate(&checkout).unwrap();
+        // Both roots lie in one checkout. It is named once, and the target
+        // directory, which `cargo clean` removes, is not named itself.
+        assert_eq!(
+            pinned_checkouts(&identity, &pins(&identity, &[&workspace_pin, &target_pin])),
+            vec![expected.clone()]
+        );
+        assert!(
+            pinned_checkouts(&identity, &[EnvInput::capture("MODE", Some("release"))]).is_empty()
+        );
+        // A target directory shared by several checkouts belongs to none.
+        if git_root(&root).is_none() {
+            let shared = root.join("shared-target");
+            fs::create_dir_all(&shared).unwrap();
+            identity.pins[1].1 = shared.to_string_lossy().into_owned();
+            assert!(pinned_checkouts(&identity, &pins(&identity, &[&target_pin])).is_empty());
+        }
+
+        // A candidate restored from a server carries no checkout; the local
+        // store's copy names this compile's, under the same action key.
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        candidate.env = pins(&identity, &[&workspace_pin]);
+        candidate.action_key = compiler_action_key(&identity.static_key, &[], &[], &candidate.env);
+        let local = for_local_store(&candidate, &identity);
+        assert_eq!(local.pinned_checkouts, vec![expected]);
+        assert_eq!(local.action_key, candidate.action_key);
+        validate_candidate_manifest(&local).unwrap();
+        let sent = for_server(&local);
+        assert_eq!(sent, candidate);
+        assert!(
+            !serde_json::to_string(&sent)
+                .unwrap()
+                .contains("pinned_checkouts")
+        );
     }
 
     #[test]

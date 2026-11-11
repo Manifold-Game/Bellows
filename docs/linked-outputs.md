@@ -230,6 +230,18 @@ Each one keeps the guarantees above.
   receiving checkout's value in its `# env-dep:` line, escaped as rustc
   escapes it. The producer's value would make Cargo rebuild for any variable
   it does not set itself.
+- **Pinned candidates name their checkout (0.3.17).** A pin is the digest of a
+  path, which cannot say whether the path still exists, so pinned candidates
+  of deleted worktrees stayed in local stores until the budget reached them
+  (525 GiB in one store). The client now records, beside the candidate in
+  its local store, the checkout that contains each pinned root
+  (`pinned_checkouts`: the checkout's path and the root of its volume), and a
+  local collection evicts the candidate once that checkout is gone from a
+  volume that is still present (see the
+  [runbook](operations.md#capacity-and-recovery)). The field is optional and
+  outside the action key: earlier clients read such a candidate unchanged,
+  and their own candidates are collected as before. It never leaves the
+  machine.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler
