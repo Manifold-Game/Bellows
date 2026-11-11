@@ -252,7 +252,8 @@ fn cached_run(
             match restored {
                 Ok(()) => {
                     if remote && let Some(store) = &stores.l1 {
-                        let _ = store.put_candidate(candidate.clone(), 8);
+                        let _ =
+                            store.put_candidate(super::for_local_store(candidate, &identity), 8);
                     }
                     if !remote && let Some(store) = &stores.l1 {
                         let _ = store.record_use(&candidate.static_key, &candidate.action_key);
@@ -377,8 +378,16 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
     // Cargo runs build scripts in the package directory.
     let workspace = env::current_dir()?.canonicalize()?;
     // Cargo runs build scripts in their package directory, inside its checkout.
-    let normalizer = normalizer(&workspace, out_dir, None);
-    let root_normalizer = PathNormalizer::new(root_bases(&workspace, out_dir, None));
+    let mut normalizer = normalizer(&workspace, out_dir, None);
+    let mut root_normalizer = PathNormalizer::new(root_bases(&workspace, out_dir, None));
+    let checkout = super::checkout_root(&workspace);
+    // What a restored run prints and writes names this package as Cargo
+    // spells it, as the script itself would.
+    super::localize_through_links(
+        [&mut normalizer, &mut root_normalizer],
+        &workspace,
+        checkout.as_deref(),
+    );
     let digests = super::digests::Digests::new(&state_dir(&workspace));
     let mut hasher = blake3::Hasher::new();
     hash_field(
@@ -426,14 +435,20 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
     let static_key = hasher.finalize().to_hex().to_string();
     let mut pins = vec![(
         format!("{PIN_PREFIX}$WORKSPACE"),
-        workspace.to_string_lossy().into_owned(),
+        super::pin_value(
+            &workspace.to_string_lossy(),
+            &root_normalizer.spellings("$WORKSPACE"),
+        ),
     )];
     for token in ["$TARGET", "$CHECKOUT"] {
-        if let Some(root) = root_normalizer.spellings(token).first() {
-            pins.push((format!("{PIN_PREFIX}{token}"), root.clone()));
+        let spellings = root_normalizer.spellings(token);
+        if let Some(longest) = spellings.first() {
+            pins.push((
+                format!("{PIN_PREFIX}{token}"),
+                super::pin_value(longest, &spellings),
+            ));
         }
     }
-    let checkout = super::checkout_root(&workspace);
     Ok(Identity {
         static_key: static_key.clone(),
         normalizer,
@@ -447,6 +462,9 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
         digests,
         pins,
         virtual_env: BTreeMap::new(),
+        // A build script's inputs are found by walking its package, never
+        // through `canonical_compiler_input`.
+        own_roots: Vec::new(),
         checkout,
         diagnostic_width: None,
     })
@@ -787,6 +805,7 @@ fn capture(
     let stderr_len = stderr.len() as u64;
     blobs.insert(stdout_digest.clone(), stdout);
     blobs.insert(stderr_digest.clone(), stderr);
+    let pinned_checkouts = super::pinned_checkouts(identity, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -810,6 +829,7 @@ fn capture(
             len: stderr_len,
         },
         proc_macros: Vec::new(),
+        pinned_checkouts,
     };
     validate_candidate_manifest(&candidate)?;
     Ok((candidate, blobs, !leaked.is_empty()))

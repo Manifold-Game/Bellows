@@ -177,8 +177,47 @@ the budget. A blob is deleted only when no remaining record references it.
   report's kind breakdown lists executables separately from other linked
   outputs. The client refuses to report success from a server too old to
   apply it.
+- A collection of a store on the machine that wrote it (`--local`,
+  `--store-dir`, and a build's own collection) also evicts every record
+  *pinned to a checkout that no longer exists*, whatever the budget and its
+  age. Such a record can only be reused from the checkout path that made it
+  (see [linked outputs](linked-outputs.md#leak-scan-relocatability-requirements-2-and-4)),
+  so once that checkout is deleted nothing can use it again. The report lists
+  them on their own, in a dry run too: a `deleted checkouts` line with each
+  checkout's path, and `deleted_checkout_records`, `deleted_checkout_bytes`
+  and `deleted_checkouts` in `--json`. The scope breakdown separates
+  `pinned to a checkout`, `pinned to a deleted checkout`,
+  `pinned to a checkout out of reach` and `pinned, checkout not recorded`.
+  - A checkout is the git checkout (or, outside git, the directory the
+    wrapped command was started in) that contains the pinned directory. A
+    target directory inside a checkout counts as that checkout, so
+    `cargo clean` deletes nothing from the store. A pin outside every
+    checkout, such as a registry package or a target directory shared by
+    several checkouts, is never judged this way.
+  - A checkout counts as deleted only while the volume that held it is
+    present: the drive or share root on Windows, the mount point elsewhere.
+    On an unplugged drive, an unmounted file system or below a link that no
+    longer resolves it is *out of reach*, and its records are kept.
+  - Records stored before 0.3.17 hold only a digest of their checkout's
+    path, which cannot say whether the path exists. They are kept as before
+    (`pinned, checkout not recorded`) until the budget reaches them.
+  - `--keep-missing-checkouts`, or `BELLOWS_KEEP_MISSING_CHECKOUTS=1` for
+    every collection, leaves such records to the budget. Use it for a store
+    directory that was copied from another machine, or is shared with one:
+    whether a checkout exists is judged on the machine that collects.
+  - A server never does this, and never learns a client's checkout paths:
+    clients remove them before publishing, and `bellowsd` drops any it is
+    sent.
 - `bellowsd --max-store-gb GIB` (or `BELLOWS_MAX_STORE_GB`) collects to that
   budget every `--gc-interval-mins` (default 30). It is off unless set.
+- A client's local stores have their own budget: with `BELLOWS_MAX_MB` set,
+  every wrapped build that ends above it collects its store (see
+  [local builds](local-builds.md#a-budget-that-enforces-itself)).
+
+Collections that change a store run one at a time, under the store's
+collection lock (`.gc.lock`): each rotates and compacts the access journal the
+other reads. `bellows gc` waits for a collection in progress; a build's
+automatic collection skips instead. A dry run only reads and never waits.
 
 Collection applies its plan in batches of 256 under the store's mutation
 lock, so builds keep publishing while it runs. It never deletes a blob that

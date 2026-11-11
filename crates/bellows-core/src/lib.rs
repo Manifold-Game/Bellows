@@ -151,6 +151,162 @@ pub struct ActionCandidate {
     /// Diagnostic only; their artifact digests are part of the static key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proc_macros: Vec<String>,
+    /// The checkouts this candidate is pinned to (see [`PinnedCheckout`]).
+    /// Empty for a shareable candidate, for one pinned only to directories
+    /// outside every checkout, and for one stored before 0.3.17.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned_checkouts: Vec<PinnedCheckout>,
+}
+
+pub const MAX_PINNED_CHECKOUTS: usize = 8;
+
+/// A checkout that a pinned candidate can only ever be reused from. A pin in
+/// `env` holds just the digest of a path, which cannot say whether that path
+/// still exists, so the client that stores a pinned candidate in a local
+/// store records the checkout beside it. A local collection then evicts the
+/// candidate once the checkout is gone.
+///
+/// It is not part of the action key, so a client that does not know the
+/// field reads the candidate unchanged. Only the machine that holds a
+/// checkout can tell whether it exists: clients never send this to a server,
+/// and a server never stores it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PinnedCheckout {
+    /// The checkout's directory: absolute, as a fresh process spells it.
+    pub path: String,
+    /// The root of the volume that held the checkout: a drive or share root
+    /// on Windows, a mount point elsewhere. A missing checkout counts as
+    /// deleted only while this is present; on an unplugged or unmounted
+    /// volume it is merely out of reach.
+    pub volume: String,
+}
+
+/// What a local collection can tell about a [`PinnedCheckout`] right now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckoutState {
+    Present,
+    /// Gone from a volume that is still there: its candidates are dead.
+    Deleted,
+    /// Out of reach, or not judgeable here: its volume is missing, a link or
+    /// mount point above it does not resolve, it cannot be read, or it was
+    /// recorded on another platform. Its candidates are kept.
+    Unavailable,
+}
+
+impl PinnedCheckout {
+    /// Describes `checkout`, an existing absolute directory. `None` when the
+    /// volume that holds it cannot be determined; its candidates are then
+    /// collected by budget alone, like those of earlier versions.
+    pub fn locate(checkout: &Path) -> Option<Self> {
+        let path = ordinary_path(checkout);
+        if !path.is_absolute() {
+            return None;
+        }
+        let volume = volume_root(&path)?;
+        Some(Self {
+            path: path.to_string_lossy().into_owned(),
+            volume: volume.to_string_lossy().into_owned(),
+        })
+    }
+
+    pub fn state(&self) -> CheckoutState {
+        let (path, volume) = (Path::new(&self.path), Path::new(&self.volume));
+        if !path.is_absolute() || !volume.is_absolute() || !path.starts_with(volume) {
+            return CheckoutState::Unavailable;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => return CheckoutState::Present,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return CheckoutState::Unavailable,
+        }
+        // "Not found" is also what a path below a missing volume or an
+        // unresolvable link answers. The checkout is deleted only when the
+        // nearest thing that does exist above it is a directory that can be
+        // entered, on the volume that held the checkout.
+        let Some(nearest) = path
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| fs::symlink_metadata(ancestor).is_ok())
+        else {
+            return CheckoutState::Unavailable;
+        };
+        if !nearest.starts_with(volume) || fs::metadata(nearest).is_err() || !volume_present(volume)
+        {
+            return CheckoutState::Unavailable;
+        }
+        CheckoutState::Deleted
+    }
+}
+
+/// A path without the Windows verbatim prefix `canonicalize` adds.
+fn ordinary_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(share) => PathBuf::from(format!(r"\\{share}")),
+            None => PathBuf::from(rest),
+        },
+        None => path.to_path_buf(),
+    }
+}
+
+/// The drive or share root of an absolute Windows path.
+#[cfg(windows)]
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    match (components.next()?, components.next()?) {
+        (Component::Prefix(prefix), Component::RootDir) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR_STR);
+            Some(root)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn volume_present(volume: &Path) -> bool {
+    fs::metadata(volume).is_ok()
+}
+
+/// The mount point of the file system that holds `path`: its highest
+/// ancestor on the same device.
+#[cfg(unix)]
+fn volume_root(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let device = fs::metadata(path).ok()?.dev();
+    let mut root = path;
+    for ancestor in path.ancestors().skip(1) {
+        if fs::metadata(ancestor).ok()?.dev() != device {
+            break;
+        }
+        root = ancestor;
+    }
+    Some(root.to_path_buf())
+}
+
+/// Whether a file system is mounted at `volume`. An unmounted mount point is
+/// an ordinary directory of its parent's device, or absent.
+#[cfg(unix)]
+fn volume_present(volume: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(metadata) = fs::metadata(volume) else {
+        return false;
+    };
+    match volume.parent() {
+        None => true,
+        Some(parent) => fs::metadata(parent).is_ok_and(|parent| parent.dev() != metadata.dev()),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_root(_path: &Path) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(any(unix, windows)))]
+fn volume_present(_volume: &Path) -> bool {
+    false
 }
 
 pub fn validate_content_key(key: &str) -> Result<()> {
@@ -259,6 +415,16 @@ pub fn validate_candidate_manifest(candidate: &ActionCandidate) -> Result<()> {
     for name in &candidate.proc_macros {
         if name.is_empty() || name.len() > 256 {
             bail!("invalid candidate proc-macro name")
+        }
+    }
+    if candidate.pinned_checkouts.len() > MAX_PINNED_CHECKOUTS {
+        bail!("candidate manifest exceeds cardinality limits")
+    }
+    for checkout in &candidate.pinned_checkouts {
+        for value in [&checkout.path, &checkout.volume] {
+            if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+                bail!("invalid candidate checkout path")
+            }
         }
     }
     let mut environment_names = BTreeSet::new();
@@ -389,8 +555,26 @@ pub struct GcReport {
     pub newest_evicted_ms: Option<u64>,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Records pinned to a checkout that no longer exists, which a local
+    /// collection evicts whatever the budget and their age. Like `breakdown`
+    /// this is the plan, also after a real collection.
+    #[serde(default)]
+    pub deleted_checkout_records: u64,
+    /// Bytes that evicting those records frees.
+    #[serde(default)]
+    pub deleted_checkout_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted_checkouts: Vec<GcCheckout>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breakdown: Vec<GcBucket>,
+}
+
+/// One deleted checkout in a collection report, and what was pinned to it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GcCheckout {
+    pub path: String,
+    pub records: u64,
+    pub evicted_bytes: u64,
 }
 
 /// Totals for one label of one grouping (protocol, kind, scope, last use,
@@ -748,6 +932,41 @@ impl Store {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Bytes held in blobs: what a storage budget is measured against.
+    ///
+    /// Sizes come from the directory listing where the platform supplies
+    /// them, so a wrapped build can afford to ask once when it finishes.
+    pub fn blob_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        let shards = match fs::read_dir(self.root.join("blobs")) {
+            Ok(shards) => shards,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        for shard in shards {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for blob in fs::read_dir(shard.path())? {
+                let blob = blob?;
+                if blob.file_name().to_string_lossy().starts_with(".tmp-") {
+                    continue;
+                }
+                match blob.metadata() {
+                    Ok(metadata) if metadata.is_file() => {
+                        total = total.saturating_add(metadata.len());
+                    }
+                    Ok(_) => {}
+                    // Deleted by a collection between the listing and the stat.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+        Ok(total)
     }
 
     pub fn check_writable(&self) -> Result<()> {
@@ -1296,6 +1515,8 @@ fn sync_parent(path: &Path) -> Result<()> {
 #[derive(Clone, Debug)]
 pub struct PathNormalizer {
     bases: Vec<(String, String)>,
+    /// Tokens whose localization was chosen by `localize_as`.
+    localized: Vec<(String, String)>,
 }
 
 impl PathNormalizer {
@@ -1321,7 +1542,25 @@ impl PathNormalizer {
             }
         }
         rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
-        Self { bases: rendered }
+        Self {
+            bases: rendered,
+            localized: Vec::new(),
+        }
+    }
+
+    /// Localizes `token` to `spelling`, one of its recognized spellings,
+    /// instead of the default choice. A directory the build reaches through a
+    /// symlink or junction is localized to that spelling: it is how the
+    /// compiler itself would name the files in what a restore writes.
+    pub fn localize_as(&mut self, token: &str, spelling: &str) {
+        if self
+            .bases
+            .iter()
+            .any(|(candidate, path)| candidate == token && path == spelling)
+        {
+            self.localized.retain(|(chosen, _)| chosen != token);
+            self.localized.push((token.to_owned(), spelling.to_owned()));
+        }
     }
 
     /// Every recognized spelling of the directory a token stands for.
@@ -1354,11 +1593,20 @@ impl PathNormalizer {
     /// restored build-script directive such as `rustc-link-search` becomes a
     /// later rustc argument, so it must be spelled as the script printed it.
     fn localizations(&self) -> Vec<(&str, &str)> {
-        let mut chosen: Vec<(&str, &str)> = Vec::new();
+        let mut chosen: Vec<(&str, &str)> = self
+            .localized
+            .iter()
+            .map(|(token, path)| (token.as_str(), path.as_str()))
+            .collect();
+        let fixed = chosen.len();
         for (token, path) in &self.bases {
             let (token, path) = (token.as_str(), path.as_str());
-            if let Some(entry) = chosen.iter_mut().find(|entry| entry.0 == token) {
-                if entry.1.starts_with(r"\\?\") && !path.starts_with(r"\\?\") && !path.contains('/')
+            if let Some(index) = chosen.iter().position(|entry| entry.0 == token) {
+                let entry = &mut chosen[index];
+                if index >= fixed
+                    && entry.1.starts_with(r"\\?\")
+                    && !path.starts_with(r"\\?\")
+                    && !path.contains('/')
                 {
                     entry.1 = path;
                 }
@@ -1528,6 +1776,7 @@ mod tests {
                 len: 6,
             },
             proc_macros: vec![],
+            pinned_checkouts: vec![],
         }
     }
 
@@ -1596,6 +1845,64 @@ mod tests {
                 r"\\server\share\source.rs",
             ]
         );
+    }
+
+    #[test]
+    fn a_candidates_checkouts_are_optional_and_outside_its_key() {
+        let mut candidate = valid_candidate();
+        // Absent when empty: such a record is what earlier versions wrote.
+        let plain = serde_json::to_value(&candidate).unwrap();
+        assert!(plain.get("pinned_checkouts").is_none());
+        candidate.pinned_checkouts = vec![PinnedCheckout {
+            path: "/work/checkout".into(),
+            volume: "/".into(),
+        }];
+        // Not part of the action key: the record is as valid with it.
+        validate_candidate_manifest(&candidate).unwrap();
+        // A reader that does not know a field ignores it, as a client from
+        // before this one ignores `pinned_checkouts`.
+        let mut newer = serde_json::to_value(&candidate).unwrap();
+        newer["a_field_added_later"] = serde_json::json!(["ignored"]);
+        let read: ActionCandidate = serde_json::from_value(newer).unwrap();
+        assert_eq!(read, candidate);
+        let read: ActionCandidate = serde_json::from_value(plain).unwrap();
+        assert!(read.pinned_checkouts.is_empty());
+        candidate.pinned_checkouts[0].path.clear();
+        assert!(validate_candidate_manifest(&candidate).is_err());
+        candidate.pinned_checkouts = vec![
+            PinnedCheckout {
+                path: "/work/checkout".into(),
+                volume: "/".into(),
+            };
+            MAX_PINNED_CHECKOUTS + 1
+        ];
+        assert!(validate_candidate_manifest(&candidate).is_err());
+    }
+
+    #[test]
+    fn a_token_can_be_localized_to_a_chosen_spelling() {
+        let mut normalizer = PathNormalizer::new(vec![
+            ("$WORKSPACE".into(), "/real/checkout/crate".into()),
+            ("$WORKSPACE".into(), "/link/crate".into()),
+        ]);
+        assert_eq!(
+            normalizer.localize("$WORKSPACE/src/lib.rs"),
+            "/real/checkout/crate/src/lib.rs"
+        );
+        normalizer.localize_as("$WORKSPACE", "/link/crate");
+        assert_eq!(
+            normalizer.localize("$WORKSPACE/src/lib.rs"),
+            "/link/crate/src/lib.rs"
+        );
+        assert_eq!(normalizer.localize_bytes(b"$WORKSPACE/x"), b"/link/crate/x");
+        // Every spelling still normalizes.
+        assert_eq!(
+            normalizer.normalize("/real/checkout/crate/a /link/crate/b"),
+            "$WORKSPACE/a $WORKSPACE/b"
+        );
+        // Only a recognized spelling can be chosen.
+        normalizer.localize_as("$WORKSPACE", "/elsewhere");
+        assert_eq!(normalizer.localize("$WORKSPACE"), "/link/crate");
     }
 
     #[test]

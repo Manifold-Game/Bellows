@@ -16,8 +16,9 @@
 //! - a blob referenced by any record published or used after the snapshot
 //!   began, found by re-reading the journal under the lock before each batch.
 use crate::{
-    ArchiveManifest, CandidateIndex, DeclaredActionRecord, GcBucket, GcReport, PIN_PREFIX, Store,
-    UNPUBLISHED_BLOB_GRACE, atomic_write, collect_paths, now_ms, validate_content_key,
+    ArchiveManifest, CandidateIndex, CheckoutState, DeclaredActionRecord, GcBucket, GcCheckout,
+    GcReport, PIN_PREFIX, PinnedCheckout, Store, UNPUBLISHED_BLOB_GRACE, atomic_write,
+    collect_paths, now_ms, validate_content_key,
 };
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const JOURNAL_DIR: &str = "access";
 const JOURNAL_FILE: &str = "journal.log";
+const COLLECTION_LOCK: &str = ".gc.lock";
 const BATCH: usize = 256;
 const TOP_CRATES: usize = 15;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
@@ -50,6 +52,11 @@ pub struct GcOptions {
     /// links far more than it compiles: by recency alone its newest outputs,
     /// the links, would push out the libraries the next build needs most.
     pub max_executable_bytes: Option<u64>,
+    /// Evict every candidate pinned to a checkout that no longer exists,
+    /// whatever the budget and its age: nothing can ever reuse it. Only for a
+    /// store on the machine whose checkouts its candidates name, so a local
+    /// collection sets it and a server's never does.
+    pub evict_missing_checkouts: bool,
 }
 
 /// Runs each batch of mutations; a server wraps them in its own write lock.
@@ -100,7 +107,38 @@ impl Store {
         self.collect(options, &unserialized)
     }
 
+    /// Collects like [`Store::collect_locally`], unless another process is
+    /// collecting this store: then nothing is done and `None` is returned.
+    /// Builds that finish together each try to enforce the same budget; one
+    /// collection serves them all.
+    pub fn try_collect_locally(&self, options: &GcOptions) -> Result<Option<GcReport>> {
+        if options.dry_run {
+            return self.collect_unlocked(options, &unserialized).map(Some);
+        }
+        let Some(_lock) = collection_lock(&self.root, false)? else {
+            return Ok(None);
+        };
+        self.collect_unlocked(options, &unserialized).map(Some)
+    }
+
+    /// Plans a collection and, unless it is a dry run, applies it. Collections
+    /// that change a store run one at a time: a second one waits for the
+    /// first, because each rotates and compacts the access journal the other
+    /// reads. A dry run only reads and never waits.
     pub fn collect(&self, options: &GcOptions, serialize: BatchRunner<'_>) -> Result<GcReport> {
+        let _lock = if options.dry_run {
+            None
+        } else {
+            collection_lock(&self.root, true)?
+        };
+        self.collect_unlocked(options, serialize)
+    }
+
+    fn collect_unlocked(
+        &self,
+        options: &GcOptions,
+        serialize: BatchRunner<'_>,
+    ) -> Result<GcReport> {
         let started = now_ms();
         let started_time = SystemTime::now();
         // Rotate before reading so every use from here on lands in a fresh
@@ -108,7 +146,7 @@ impl Store {
         if !options.dry_run {
             rotate_journal(&self.root)?;
         }
-        let snapshot = Snapshot::read(self, started_time)?;
+        let snapshot = Snapshot::read(self, started_time, options.evict_missing_checkouts)?;
         let plan = Plan::new(&snapshot, options, started);
         let mut report = plan.report(&snapshot, options);
         if !options.dry_run {
@@ -147,6 +185,33 @@ impl Kind {
     }
 }
 
+/// Whether a record can be reused from any checkout, or only from one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Shareable,
+    /// Pinned to a checkout that exists, or one this collection does not
+    /// judge: a server holds the records of other machines.
+    Pinned,
+    /// Pinned to a checkout that is gone: index into `Snapshot::deleted`.
+    PinnedDeleted(u32),
+    /// Pinned to a checkout that is out of reach for now.
+    PinnedUnavailable,
+    /// Pinned, by a client that did not record where.
+    PinnedUnrecorded,
+}
+
+impl Scope {
+    fn label(self) -> &'static str {
+        match self {
+            Scope::Shareable => "shareable",
+            Scope::Pinned => "pinned to a checkout",
+            Scope::PinnedDeleted(_) => "pinned to a deleted checkout",
+            Scope::PinnedUnavailable => "pinned to a checkout out of reach",
+            Scope::PinnedUnrecorded => "pinned, checkout not recorded",
+        }
+    }
+}
+
 /// One evictable unit: a compiler candidate, or a whole declared/archive record.
 struct Unit {
     path: PathBuf,
@@ -156,7 +221,7 @@ struct Unit {
     protocol: Option<u32>,
     crate_name: String,
     kind: Kind,
-    pinned: bool,
+    scope: Scope,
     last_used_ms: u64,
     blobs: Vec<u32>,
 }
@@ -172,13 +237,17 @@ struct Snapshot {
     blobs: Vec<Blob>,
     /// Blob index -> units referencing it.
     referrers: Vec<Vec<u32>>,
+    /// Checkouts that are gone and have candidates pinned to them.
+    deleted: Vec<String>,
     journal_entries: u64,
     total_bytes: u64,
     started_ms: u64,
 }
 
 impl Snapshot {
-    fn read(store: &Store, started: SystemTime) -> Result<Self> {
+    /// `judge_checkouts` looks on this machine for the checkout each pinned
+    /// candidate names.
+    fn read(store: &Store, started: SystemTime, judge_checkouts: bool) -> Result<Self> {
         let started_ms = millis(started);
         let journal = read_journal(&store.root)?;
         let mut blob_files = Vec::new();
@@ -219,6 +288,48 @@ impl Snapshot {
             units.push(unit);
         };
 
+        let mut states: HashMap<PinnedCheckout, CheckoutState> = HashMap::new();
+        let mut deleted: Vec<String> = Vec::new();
+        let mut scope_of = |pinned: bool, checkouts: Vec<PinnedCheckout>| {
+            if !pinned {
+                return Scope::Shareable;
+            }
+            if !judge_checkouts {
+                return Scope::Pinned;
+            }
+            if checkouts.is_empty() {
+                return Scope::PinnedUnrecorded;
+            }
+            // Every pin must match for a reuse, so one deleted checkout is
+            // enough to make the candidate unusable.
+            let mut scope = Scope::Pinned;
+            for checkout in checkouts {
+                let state = match states.get(&checkout) {
+                    Some(state) => *state,
+                    None => {
+                        let state = checkout.state();
+                        states.insert(checkout.clone(), state);
+                        state
+                    }
+                };
+                match state {
+                    CheckoutState::Present => {}
+                    CheckoutState::Unavailable => scope = Scope::PinnedUnavailable,
+                    CheckoutState::Deleted => {
+                        let index = match deleted.iter().position(|path| *path == checkout.path) {
+                            Some(index) => index,
+                            None => {
+                                deleted.push(checkout.path);
+                                deleted.len() - 1
+                            }
+                        };
+                        return Scope::PinnedDeleted(index as u32);
+                    }
+                }
+            }
+            scope
+        };
+
         let mut files = Vec::new();
         collect_paths(&store.root.join("actions"), &mut files)?;
         for (path, index) in read_parallel::<CandidateIndex>(files, "action")? {
@@ -243,10 +354,13 @@ impl Snapshot {
                         protocol: Some(candidate.protocol),
                         crate_name: candidate.crate_name,
                         kind,
-                        pinned: candidate
-                            .env
-                            .iter()
-                            .any(|input| input.name.starts_with(PIN_PREFIX)),
+                        scope: scope_of(
+                            candidate
+                                .env
+                                .iter()
+                                .any(|input| input.name.starts_with(PIN_PREFIX)),
+                            candidate.pinned_checkouts,
+                        ),
                         last_used_ms: used.max(candidate.created_ms),
                         blobs: Vec::new(),
                     },
@@ -274,7 +388,7 @@ impl Snapshot {
                     protocol: None,
                     crate_name: record.name,
                     kind: Kind::Declared,
-                    pinned: false,
+                    scope: Scope::Shareable,
                     last_used_ms: modified,
                     blobs: Vec::new(),
                 },
@@ -293,7 +407,7 @@ impl Snapshot {
                     protocol: Some(manifest.protocol),
                     crate_name: manifest.name,
                     kind: Kind::Archive,
-                    pinned: false,
+                    scope: Scope::Shareable,
                     last_used_ms: modified.max(manifest.created_ms),
                     blobs: Vec::new(),
                 },
@@ -308,6 +422,7 @@ impl Snapshot {
             units,
             blobs,
             referrers,
+            deleted,
             journal_entries: journal.len() as u64,
             total_bytes,
             started_ms,
@@ -342,12 +457,15 @@ impl Plan {
             }
         }
         let mut order = (0..snapshot.units.len() as u32).collect::<Vec<_>>();
+        // Evicted whatever the budget: nothing can use them again.
         let obsolete = |unit: &Unit| {
             unit.candidate.is_some()
-                && options
+                && (options
                     .min_protocol
                     .zip(unit.protocol)
                     .is_some_and(|(minimum, protocol)| protocol < minimum)
+                    || (options.evict_missing_checkouts
+                        && matches!(unit.scope, Scope::PinnedDeleted(_))))
         };
         order.sort_by_key(|&index| {
             let unit = &snapshot.units[index as usize];
@@ -463,13 +581,7 @@ impl Plan {
             }),
         );
         breakdown.extend(self.buckets(snapshot, "kind", |unit| unit.kind.label().into()));
-        breakdown.extend(self.buckets(snapshot, "scope", |unit| {
-            if unit.pinned {
-                "pinned to a checkout".into()
-            } else {
-                "shareable".into()
-            }
-        }));
+        breakdown.extend(self.buckets(snapshot, "scope", |unit| unit.scope.label().into()));
         breakdown.extend(self.buckets(snapshot, "last use", age));
         let mut crates = self.buckets(snapshot, "crate", |unit| unit.crate_name.clone());
         crates.sort_by(|a, b| {
@@ -477,6 +589,28 @@ impl Plan {
         });
         crates.truncate(TOP_CRATES);
         breakdown.extend(crates);
+        let mut deleted_checkouts = snapshot
+            .deleted
+            .iter()
+            .map(|path| GcCheckout {
+                path: path.clone(),
+                ..GcCheckout::default()
+            })
+            .collect::<Vec<_>>();
+        for unit in units {
+            if let Scope::PinnedDeleted(checkout) = unit.scope {
+                deleted_checkouts[checkout as usize].records += 1;
+            }
+        }
+        for &(blob, unit) in &self.freed {
+            if let Scope::PinnedDeleted(checkout) = units[unit as usize].scope {
+                deleted_checkouts[checkout as usize].evicted_bytes +=
+                    snapshot.blobs[blob as usize].bytes;
+            }
+        }
+        deleted_checkouts.sort_by(|a, b| {
+            (b.evicted_bytes, b.records, &a.path).cmp(&(a.evicted_bytes, a.records, &b.path))
+        });
         GcReport {
             bytes_before: snapshot.total_bytes,
             bytes_after: self.bytes_after,
@@ -498,6 +632,9 @@ impl Plan {
             newest_evicted_ms: newest_evicted,
             duration_ms: 0,
             skipped_blobs: 0,
+            deleted_checkout_records: deleted_checkouts.iter().map(|c| c.records).sum(),
+            deleted_checkout_bytes: deleted_checkouts.iter().map(|c| c.evicted_bytes).sum(),
+            deleted_checkouts,
             breakdown,
         }
     }
@@ -744,6 +881,31 @@ fn candidate_kind(crate_name: &str, artifacts: &[crate::Artifact]) -> Kind {
     }
 }
 
+/// Holds a store's collection lock until dropped. With `wait` false, returns
+/// `None` when another process holds it.
+fn collection_lock(root: &Path, wait: bool) -> Result<Option<fs::File>> {
+    let path = root.join(COLLECTION_LOCK);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open collection lock {}", path.display()))?;
+    if wait {
+        fs2::FileExt::lock_exclusive(&file)
+            .with_context(|| format!("lock {} for collection", root.display()))?;
+        return Ok(Some(file));
+    }
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(None)
+        }
+        Err(error) => Err(error).with_context(|| format!("lock {} for collection", root.display())),
+    }
+}
+
 fn rotate_journal(root: &Path) -> Result<()> {
     let directory = root.join(JOURNAL_DIR);
     let current = directory.join(JOURNAL_FILE);
@@ -972,6 +1134,7 @@ mod tests {
                     len: 0,
                 },
                 proc_macros: vec![],
+                pinned_checkouts: vec![],
             };
             if protocol == PROTOCOL_VERSION {
                 self.store.put_candidate(candidate.clone(), 8).unwrap();
@@ -1246,7 +1409,7 @@ mod tests {
         fixture.uses(&[]);
         fixture.age_blobs();
         rotate_journal(&fixture.root).unwrap();
-        let snapshot = Snapshot::read(&fixture.store, SystemTime::now()).unwrap();
+        let snapshot = Snapshot::read(&fixture.store, SystemTime::now(), false).unwrap();
         let options = fixture.options(0);
         let plan = Plan::new(&snapshot, &options, now_ms());
         let mut report = plan.report(&snapshot, &options);
@@ -1287,6 +1450,280 @@ mod tests {
         assert_eq!(second.records_evicted, 1);
         assert!(fixture.present(&older));
         assert!(!fixture.present(&newer));
+    }
+
+    #[test]
+    fn blob_bytes_measure_what_a_budget_counts() {
+        let fixture = Fixture::new("bytes");
+        assert_eq!(fixture.store.blob_bytes().unwrap(), 0);
+        fixture.publish("one", 1, 1_000, PROTOCOL_VERSION);
+        fixture.publish("two", 2, 2_000, PROTOCOL_VERSION);
+        // A write in flight is not stored yet.
+        let temp = fixture.store.blob_temp_path(&digest_bytes(b"x")).unwrap();
+        fs::write(&temp, vec![0u8; 50]).unwrap();
+        assert_eq!(fixture.store.blob_bytes().unwrap(), 200);
+        assert_eq!(
+            fixture.store.blob_bytes().unwrap(),
+            crate::directory_bytes(&fixture.root.join("blobs")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_collection_steps_aside_while_another_is_running() {
+        let fixture = Fixture::new("contended");
+        let older = fixture.publish("older", 1, 1_000, PROTOCOL_VERSION);
+        let newer = fixture.publish("newer", 2, 2_000, PROTOCOL_VERSION);
+        fixture.uses(&[]);
+        fixture.age_blobs();
+        let running = collection_lock(&fixture.root, false).unwrap().unwrap();
+        assert!(
+            fixture
+                .store
+                .try_collect_locally(&fixture.options(100))
+                .unwrap()
+                .is_none()
+        );
+        assert!(fixture.present(&older) && fixture.present(&newer));
+        // A dry run only reads, so it never has to wait.
+        let plan = fixture
+            .store
+            .try_collect_locally(&GcOptions {
+                dry_run: true,
+                ..fixture.options(100)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.records_evicted, 1);
+        drop(running);
+        let report = fixture
+            .store
+            .try_collect_locally(&fixture.options(100))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert!(!fixture.present(&older) && fixture.present(&newer));
+    }
+
+    /// Republishes `candidate` as one pinned to a checkout: with the pin a
+    /// leaking compile records, and with `checkout` when the client knew it.
+    fn pin(
+        fixture: &Fixture,
+        mut candidate: ActionCandidate,
+        checkout: Option<PinnedCheckout>,
+    ) -> ActionCandidate {
+        fs::remove_file(fixture.store.action_path(&candidate.static_key).unwrap()).unwrap();
+        candidate.env = vec![crate::EnvInput::capture(
+            format!("{PIN_PREFIX}$WORKSPACE"),
+            Some("a checkout path"),
+        )];
+        candidate.action_key = compiler_action_key(
+            &candidate.static_key,
+            &candidate.files,
+            &candidate.host_files,
+            &candidate.env,
+        );
+        candidate.pinned_checkouts = checkout.into_iter().collect();
+        fixture.store.put_candidate(candidate.clone(), 8).unwrap();
+        candidate
+    }
+
+    fn local(max_bytes: u64) -> GcOptions {
+        GcOptions {
+            max_bytes,
+            evict_missing_checkouts: true,
+            ..GcOptions::default()
+        }
+    }
+
+    fn scope<'a>(report: &'a GcReport, label: &str) -> Option<&'a GcBucket> {
+        report
+            .breakdown
+            .iter()
+            .find(|bucket| bucket.group == "scope" && bucket.label == label)
+    }
+
+    #[test]
+    fn a_checkout_is_deleted_only_when_it_is_gone_from_a_volume_that_is_there() {
+        let fixture = Fixture::new("checkout-state");
+        let checkout = fixture.root.join("checkouts").join("one");
+        fs::create_dir_all(&checkout).unwrap();
+        let located = PinnedCheckout::locate(&checkout).unwrap();
+        assert!(Path::new(&located.volume).is_absolute());
+        assert!(Path::new(&located.path).starts_with(&located.volume));
+        assert!(!located.path.starts_with(r"\\?\"), "{}", located.path);
+        assert_eq!(located.state(), CheckoutState::Present);
+        fs::remove_dir_all(&checkout).unwrap();
+        assert_eq!(located.state(), CheckoutState::Deleted);
+        // Its parent directory is gone too: still deleted.
+        fs::remove_dir_all(fixture.root.join("checkouts")).unwrap();
+        assert_eq!(located.state(), CheckoutState::Deleted);
+        assert!(PinnedCheckout::locate(Path::new("relative/checkout")).is_none());
+        // A volume that is not there says nothing about what it holds.
+        let unplugged = missing_volume(&fixture);
+        assert_eq!(unplugged.state(), CheckoutState::Unavailable);
+        // Neither does a path this platform cannot have recorded.
+        let foreign = if cfg!(windows) {
+            ("/home/dev/checkout", "/")
+        } else {
+            (r"C:\Users\dev\checkout", r"C:\")
+        };
+        let foreign = PinnedCheckout {
+            path: foreign.0.into(),
+            volume: foreign.1.into(),
+        };
+        assert_eq!(foreign.state(), CheckoutState::Unavailable);
+    }
+
+    /// A checkout on a volume that is not mounted.
+    fn missing_volume(fixture: &Fixture) -> PinnedCheckout {
+        if cfg!(windows) {
+            let letter = ('D'..='Z')
+                .rev()
+                .find(|letter| !Path::new(&format!(r"{letter}:\")).exists())
+                .expect("a drive letter with no volume");
+            PinnedCheckout {
+                path: format!(r"{letter}:\work\checkout"),
+                volume: format!(r"{letter}:\"),
+            }
+        } else {
+            // An unmounted mount point is an ordinary empty directory.
+            let mount = fixture.root.join("mnt");
+            fs::create_dir_all(&mount).unwrap();
+            PinnedCheckout {
+                path: mount.join("checkout").to_string_lossy().into_owned(),
+                volume: mount.to_string_lossy().into_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn candidates_pinned_to_a_deleted_checkout_are_evicted_whatever_the_budget() {
+        let fixture = Fixture::new("deleted-checkout");
+        let kept_dir = fixture.root.join("kept");
+        let gone_dir = fixture.root.join("gone");
+        fs::create_dir_all(&kept_dir).unwrap();
+        fs::create_dir_all(&gone_dir).unwrap();
+        // Newest first by use: age alone would evict none of them.
+        let now = now_ms();
+        let gone_checkout = PinnedCheckout::locate(&gone_dir).unwrap();
+        let gone = pin(
+            &fixture,
+            fixture.publish("gone", 1, now, PROTOCOL_VERSION),
+            Some(gone_checkout.clone()),
+        );
+        let kept = pin(
+            &fixture,
+            fixture.publish("kept", 2, 2_000, PROTOCOL_VERSION),
+            PinnedCheckout::locate(&kept_dir),
+        );
+        // Stored before checkouts were recorded: treated as it always was.
+        let unrecorded = pin(
+            &fixture,
+            fixture.publish("unrecorded", 3, 3_000, PROTOCOL_VERSION),
+            None,
+        );
+        let unplugged = pin(
+            &fixture,
+            fixture.publish("unplugged", 4, 4_000, PROTOCOL_VERSION),
+            Some(missing_volume(&fixture)),
+        );
+        let shareable = fixture.publish("shareable", 5, 5_000, PROTOCOL_VERSION);
+        fs::remove_dir_all(&gone_dir).unwrap();
+        fixture.age_blobs();
+        let all = [&gone, &kept, &unrecorded, &unplugged, &shareable];
+
+        // A server's collection never looks for a client's checkout.
+        let remote = fixture
+            .store
+            .collect(&fixture.options(u64::MAX), &unserialized)
+            .unwrap();
+        assert_eq!(remote.records_evicted, 0);
+        assert_eq!(remote.deleted_checkout_records, 0);
+        assert_eq!(scope(&remote, "pinned to a checkout").unwrap().records, 4);
+        assert!(all.iter().all(|candidate| fixture.present(candidate)));
+
+        // A dry run reports the group and changes nothing.
+        let plan = fixture
+            .store
+            .collect(
+                &GcOptions {
+                    dry_run: true,
+                    ..local(u64::MAX)
+                },
+                &unserialized,
+            )
+            .unwrap();
+        assert_eq!((plan.records_evicted, plan.evicted_bytes), (1, 100));
+        assert_eq!(
+            (plan.deleted_checkout_records, plan.deleted_checkout_bytes),
+            (1, 100)
+        );
+        assert_eq!(plan.deleted_checkouts.len(), 1);
+        assert_eq!(plan.deleted_checkouts[0].path, gone_checkout.path);
+        assert_eq!(
+            (
+                plan.deleted_checkouts[0].records,
+                plan.deleted_checkouts[0].evicted_bytes
+            ),
+            (1, 100)
+        );
+        let deleted = scope(&plan, "pinned to a deleted checkout").unwrap();
+        assert_eq!((deleted.records, deleted.evicted_records), (1, 1));
+        assert_eq!(scope(&plan, "pinned to a checkout").unwrap().records, 1);
+        assert_eq!(
+            scope(&plan, "pinned to a checkout out of reach")
+                .unwrap()
+                .records,
+            1
+        );
+        assert_eq!(
+            scope(&plan, "pinned, checkout not recorded")
+                .unwrap()
+                .records,
+            1
+        );
+        assert!(all.iter().all(|candidate| fixture.present(candidate)));
+
+        // A local collection evicts it, and only it.
+        let report = fixture
+            .store
+            .collect(&local(u64::MAX), &unserialized)
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert_eq!(report.deleted_checkout_records, 1);
+        assert!(!fixture.present(&gone) && !fixture.blob(&gone));
+        for candidate in [&kept, &unrecorded, &unplugged, &shareable] {
+            assert!(fixture.present(candidate) && fixture.blob(candidate));
+        }
+    }
+
+    #[test]
+    fn a_candidate_pinned_to_two_checkouts_dies_with_either() {
+        let fixture = Fixture::new("two-checkouts");
+        let source = fixture.root.join("source");
+        let target = fixture.root.join("elsewhere");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        let mut candidate = fixture.publish("both", 1, now_ms(), PROTOCOL_VERSION);
+        candidate = pin(&fixture, candidate, PinnedCheckout::locate(&source));
+        fs::remove_file(fixture.store.action_path(&candidate.static_key).unwrap()).unwrap();
+        candidate
+            .pinned_checkouts
+            .push(PinnedCheckout::locate(&target).unwrap());
+        fixture.store.put_candidate(candidate.clone(), 8).unwrap();
+        fixture.age_blobs();
+        let kept = fixture
+            .store
+            .collect(&local(u64::MAX), &unserialized)
+            .unwrap();
+        assert_eq!(kept.records_evicted, 0);
+        fs::remove_dir_all(&target).unwrap();
+        let report = fixture
+            .store
+            .collect(&local(u64::MAX), &unserialized)
+            .unwrap();
+        assert_eq!(report.records_evicted, 1);
+        assert!(!fixture.present(&candidate));
     }
 
     #[test]

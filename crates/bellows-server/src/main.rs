@@ -476,7 +476,11 @@ async fn put_candidate(
         .map_err(internal)?
 }
 
-fn store_candidate(state: &AppState, candidate: ActionCandidate) -> ApiResult<StatusCode> {
+fn store_candidate(state: &AppState, mut candidate: ActionCandidate) -> ApiResult<StatusCode> {
+    // Which checkouts a pinned candidate belongs to means something only on
+    // the client that holds them; clients do not send it, and a server never
+    // keeps it.
+    candidate.pinned_checkouts.clear();
     let _guard = state
         .writes
         .lock()
@@ -713,6 +717,9 @@ async fn gc(
         dry_run: request.dry_run,
         min_protocol: request.min_protocol,
         max_executable_bytes: request.max_executable_bytes,
+        // A server holds other machines' records: whether a client's
+        // checkout exists is not something it can look up.
+        evict_missing_checkouts: false,
     };
     collect(&state, options).await.map(Json).map_err(internal)
 }

@@ -78,6 +78,18 @@ bellows stats --local
 bellows gc --local --max-mb 20000
 ```
 
+A local store only grows until it is collected. Set `BELLOWS_MAX_MB` and every
+wrapped build that ends with its store above that many mebibytes collects it,
+least recently used first, down to 80% of the budget, and says so in one line
+of its summary. Without it, a store that has reached 20 GiB says so after each
+build (`BELLOWS_MAX_MB=0` keeps it unbounded, quietly). See
+[local builds](docs/local-builds.md#a-budget-that-enforces-itself).
+
+Results that embed a checkout path can only be reused from that checkout.
+Every local collection evicts those whose checkout has been deleted (a
+finished git worktree, say), whatever the budget, and reports them as their
+own group.
+
 Each wrapped build prints its build ID, elapsed time, hit/miss/bypass counts,
 and the most common reasons. Inspect that build without lifetime-log noise:
 
@@ -184,8 +196,13 @@ Every output is scanned for the workspace, target, and session checkout paths
 after a remapped compile. A result that embeds one is pinned to that checkout;
 otherwise path-valued `env!` values compare relative to those roots, so
 worktrees share it.
-Inputs reached through symlinks conservatively bypass publication until their
-resolution can be modeled. Unmodeled emit kinds and custom output destinations
+An input reached through a symlink or junction is not cached: a record that
+named the link's target would be trusted after the link moved. The exception
+is a link at or above the compile's own working directory or checkout, such
+as a project that reaches another checkout's packages through a linked folder.
+Those inputs are named relative to that root, which every compile derives for
+itself (see [linked outputs](docs/linked-outputs.md)). Unmodeled emit kinds and
+custom output destinations
 also bypass, so a successful hit always supplies the requested output set.
 Search paths that can supply crates (bare `-L`, `-L all=`, `-L crate=`), custom
 sysroots and target JSON files, and `target-cpu=native` bypass. `-L native=`
@@ -238,6 +255,8 @@ Client connection and overall request timeouts can be bounded with
 to 600,000 ms. `BELLOWS_FETCH_CONCURRENCY` (default 16) bounds one wrapper's
 parallel blob requests; `BELLOWS_RELAY`, `BELLOWS_RELAY_UPLOADS`,
 `BELLOWS_RELAY_SPOOL_MB` and `BELLOWS_RELAY_DRAIN_SECS` configure the relay.
+`BELLOWS_MAX_MB` (and `BELLOWS_MAX_EXECUTABLE_MB`) set the budget wrapped
+builds hold each local store to.
 
 Terminal output uses aligned, Cargo-style status labels and semantic color.
 Color is automatic for interactive terminals and supported CI providers,

@@ -3,9 +3,9 @@ use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord, EnvInput,
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcOptions, GcReport, GcRequest,
     HealthResponse, LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
-    PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write, compiler_action_key,
-    declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home, tree_digest,
-    validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
+    PinnedCheckout, PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write,
+    compiler_action_key, declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home,
+    tree_digest, validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
     validate_declared_record, validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
@@ -151,6 +151,11 @@ enum Commands {
         /// procedural macros and build scripts never make room for them.
         #[arg(long)]
         max_executable_mb: Option<u64>,
+        /// Keep records pinned to a checkout that no longer exists until the
+        /// budget reaches them. A local collection otherwise evicts them
+        /// whatever the budget (also set by BELLOWS_KEEP_MISSING_CHECKOUTS=1).
+        #[arg(long)]
+        keep_missing_checkouts: bool,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -350,6 +355,7 @@ fn run_cli() -> Result<i32> {
             dry_run,
             min_protocol,
             max_executable_mb,
+            keep_missing_checkouts,
             json,
             local,
             cache_dir,
@@ -361,6 +367,10 @@ fn run_cli() -> Result<i32> {
                 dry_run,
                 min_protocol,
                 max_executable_bytes: max_executable_mb.map(|mb| mb.saturating_mul(1024 * 1024)),
+                // Only a store on this machine names checkouts that can be
+                // looked for here; a server never does (see `PinnedCheckout`).
+                evict_missing_checkouts: (local || store_dir.is_some())
+                    && !(keep_missing_checkouts || keep_missing_checkouts_from_env()),
             };
             let report = if let Some(directory) = store_dir {
                 collect_store_directory(&directory, &options)?
@@ -427,6 +437,22 @@ fn collect_store_directory(directory: &Path, options: &GcOptions) -> Result<GcRe
     store.collect_locally(options)
 }
 
+/// How many deleted checkouts a text report lists by path.
+const DELETED_CHECKOUTS_SHOWN: usize = 20;
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
+}
+
+/// Whether collections on this machine keep records of deleted checkouts.
+fn keep_missing_checkouts_from_env() -> bool {
+    env::var("BELLOWS_KEEP_MISSING_CHECKOUTS").as_deref() == Ok("1")
+}
+
 fn print_gc_report(report: &GcReport) {
     let color = terminal::stdout_color();
     let verb = if report.dry_run {
@@ -472,6 +498,38 @@ fn print_gc_report(report: &GcReport) {
             human_bytes(report.evicted_bytes)
         )
     );
+    if report.deleted_checkout_records > 0 {
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "deleted checkouts",
+                format!(
+                    "{verb} {} records ({}) pinned to {}{}",
+                    report.deleted_checkout_records,
+                    human_bytes(report.deleted_checkout_bytes),
+                    plural(report.deleted_checkouts.len(), "deleted checkout"),
+                    if report.deleted_checkouts.len() > DELETED_CHECKOUTS_SHOWN {
+                        format!("; the {DELETED_CHECKOUTS_SHOWN} largest follow, --json lists all")
+                    } else {
+                        String::new()
+                    }
+                )
+            )
+        );
+        for checkout in report
+            .deleted_checkouts
+            .iter()
+            .take(DELETED_CHECKOUTS_SHOWN)
+        {
+            println!(
+                "    {:>10}  {:>7} records  {}",
+                human_bytes(checkout.evicted_bytes),
+                checkout.records,
+                checkout.path
+            );
+        }
+    }
     println!(
         "{}",
         terminal::key_value(
@@ -540,6 +598,7 @@ fn print_gc_report(report: &GcReport) {
 
 fn run_command(server: String, token: Option<String>, command: Vec<OsString>) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
+    let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = state_dir(&workspace);
     if let Err(error) = fs::create_dir_all(&state_dir) {
@@ -621,7 +680,12 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     if let Some(relay) = relay {
         finish_relay(relay)?;
     }
+    // The wrappers' local store, unless they ran without one.
+    let cache_line = (env::var("BELLOWS_L1").as_deref() != Ok("0"))
+        .then(|| enforce_budget(&state_dir.join(format!("l1-v{PROTOCOL_VERSION}")), budget))
+        .flatten();
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    print_summary_line(cache_line);
     if let Some(message) = &unreachable {
         eprintln!(
             "{}",
@@ -827,6 +891,7 @@ fn unreachable_message(server: &str, error: &anyhow::Error) -> String {
 
 fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
+    let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = match local_state_dir(cache_dir.as_deref()).and_then(|state| {
         local_store(Some(&state), true)?.check_writable()?;
@@ -858,8 +923,227 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
     let result = child.status().context("start locally wrapped command");
+    let cache_line = enforce_budget(
+        &state_dir.join(format!("store-v{PROTOCOL_VERSION}")),
+        budget,
+    );
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    print_summary_line(cache_line);
     Ok(result?.code().unwrap_or(1))
+}
+
+const MEBIBYTE: u64 = 1024 * 1024;
+
+/// An automatic collection frees a store down to this share of its budget, so
+/// the builds that follow have room before another collection is due.
+const COLLECT_TO_PERCENT: u64 = 80;
+
+/// A local store this large with no budget is reported after every build that
+/// uses it: nothing else would ever say that it only grows.
+const UNBUDGETED_NOTICE_BYTES: u64 = 20 * 1024 * MEBIBYTE;
+
+/// How large a local store may grow before a wrapped build collects it. It
+/// applies to each store on its own: the daemonless store that
+/// `bellows cargo` and `bellows local` use, and the local store beside a
+/// `bellows run` session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Budget {
+    /// `BELLOWS_MAX_MB` is not set: only `bellows gc` ever collects.
+    Unset,
+    /// `BELLOWS_MAX_MB=0`: unbounded on purpose.
+    Unbounded,
+    Limited {
+        max_bytes: u64,
+        max_executable_bytes: Option<u64>,
+    },
+}
+
+/// What a wrapped build does about its store once it has finished.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetAction {
+    Nothing,
+    /// Say that the store is large and nothing bounds it.
+    Notice,
+    /// Collect least recently used records until the blobs fit `to_bytes`.
+    Collect {
+        max_bytes: u64,
+        to_bytes: u64,
+        max_executable_bytes: Option<u64>,
+    },
+}
+
+impl Budget {
+    fn from_env() -> Result<Self> {
+        let value = |name: &str| -> Result<Option<String>> {
+            match env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => {
+                    bail!("{name} must be a whole number of mebibytes")
+                }
+            }
+        };
+        Self::parse(
+            value("BELLOWS_MAX_MB")?.as_deref(),
+            value("BELLOWS_MAX_EXECUTABLE_MB")?.as_deref(),
+        )
+    }
+
+    fn parse(max_mb: Option<&str>, max_executable_mb: Option<&str>) -> Result<Self> {
+        let mebibytes = |name: &str, value: Option<&str>| -> Result<Option<u64>> {
+            let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+                return Ok(None);
+            };
+            let parsed = value.parse::<u64>().with_context(|| {
+                format!("{name} must be a whole number of mebibytes, not {value:?}")
+            })?;
+            Ok(Some(parsed.saturating_mul(MEBIBYTE)))
+        };
+        let max_bytes = mebibytes("BELLOWS_MAX_MB", max_mb)?;
+        let max_executable_bytes = mebibytes("BELLOWS_MAX_EXECUTABLE_MB", max_executable_mb)?;
+        match max_bytes {
+            Some(0) | None if max_executable_bytes.is_some() => {
+                bail!(
+                    "BELLOWS_MAX_EXECUTABLE_MB needs BELLOWS_MAX_MB: it is a share of that budget"
+                )
+            }
+            None => Ok(Self::Unset),
+            Some(0) => Ok(Self::Unbounded),
+            Some(max_bytes) => Ok(Self::Limited {
+                max_bytes,
+                max_executable_bytes,
+            }),
+        }
+    }
+
+    /// What an automatic collection under a budget of `max_bytes` frees to.
+    fn collect_to(max_bytes: u64) -> u64 {
+        max_bytes / 100 * COLLECT_TO_PERCENT
+    }
+
+    fn action(self, stored_bytes: u64) -> BudgetAction {
+        match self {
+            Self::Unset if stored_bytes >= UNBUDGETED_NOTICE_BYTES => BudgetAction::Notice,
+            Self::Unset | Self::Unbounded => BudgetAction::Nothing,
+            Self::Limited {
+                max_bytes,
+                max_executable_bytes,
+            } if stored_bytes > max_bytes => BudgetAction::Collect {
+                max_bytes,
+                to_bytes: Self::collect_to(max_bytes),
+                max_executable_bytes,
+            },
+            Self::Limited { .. } => BudgetAction::Nothing,
+        }
+    }
+}
+
+/// Applies the budget to the store a wrapped build used, once the build has
+/// finished, and returns what to say about it in the build summary: nothing
+/// when the store is within its budget, or when another build is already
+/// collecting it. A collection that fails is reported and never fails the
+/// build.
+fn enforce_budget(store_root: &Path, budget: Budget) -> Option<String> {
+    // A session whose wrappers never ran has no store, and creates none.
+    if !store_root.join("blobs").is_dir() {
+        return None;
+    }
+    let color = terminal::stderr_color();
+    let failed = |what: &str, error: anyhow::Error| {
+        Some(terminal::warning(
+            color,
+            "cache",
+            &format!("{what} for {}: {error:#}", store_root.display()),
+        ))
+    };
+    let store = match Store::open_for_access(store_root) {
+        Ok(store) => store,
+        Err(error) => return failed("budget not applied", error),
+    };
+    let stored = match store.blob_bytes() {
+        Ok(stored) => stored,
+        Err(error) => return failed("budget not applied", error),
+    };
+    match budget.action(stored) {
+        BudgetAction::Nothing => None,
+        BudgetAction::Notice => Some(terminal::attention(
+            color,
+            "cache",
+            &format!(
+                "{} holds {} and has no budget, so it only grows. Set BELLOWS_MAX_MB (mebibytes) to \
+                 have builds collect it, or BELLOWS_MAX_MB=0 to keep it unbounded without this notice",
+                store_root.display(),
+                human_bytes(stored)
+            ),
+        )),
+        BudgetAction::Collect {
+            max_bytes,
+            to_bytes,
+            max_executable_bytes,
+        } => {
+            let options = GcOptions {
+                max_bytes: to_bytes,
+                max_executable_bytes,
+                evict_missing_checkouts: !keep_missing_checkouts_from_env(),
+                ..GcOptions::default()
+            };
+            match store.try_collect_locally(&options) {
+                Ok(Some(report)) => Some(terminal::status(
+                    color,
+                    "gc",
+                    "cache",
+                    &collection_summary(&report, max_bytes),
+                )),
+                // Another build that finished with this one is collecting.
+                Ok(None) => None,
+                Err(error) => failed(
+                    &format!(
+                        "over its {} budget at {}, and the collection failed",
+                        human_bytes(max_bytes),
+                        human_bytes(stored)
+                    ),
+                    error,
+                ),
+            }
+        }
+    }
+}
+
+/// One line for an automatic collection: what the store held and holds now
+/// against its budget, and what was evicted to get there.
+fn collection_summary(report: &GcReport, max_bytes: u64) -> String {
+    let mut line = format!(
+        "{} → {} of a {} budget · evicted {} of {} records · {} blobs · {:.1}s",
+        human_bytes(report.bytes_before),
+        human_bytes(report.bytes_after),
+        human_bytes(max_bytes),
+        report.records_evicted,
+        report.records,
+        report.blobs_evicted,
+        report.duration_ms as f64 / 1000.0
+    );
+    if report.deleted_checkout_records > 0 {
+        line.push_str(&format!(
+            " · {} of them pinned to {}",
+            report.deleted_checkout_records,
+            plural(report.deleted_checkouts.len(), "deleted checkout")
+        ));
+    }
+    if report.bytes_after > max_bytes {
+        line.push_str(
+            " · still over budget: blobs that builds in progress are writing are kept for an hour",
+        );
+    }
+    line
+}
+
+/// Prints a line that belongs to the build summary, when one is printed.
+fn print_summary_line(line: Option<String>) {
+    if let Some(line) = line
+        && terminal::Output::from_env().prints_build_summary()
+    {
+        eprintln!("{line}");
+    }
 }
 
 fn run_without_cache(
@@ -1263,7 +1547,7 @@ impl Remote {
             "{}/v1/actions/{}/{}",
             self.base, candidate.static_key, candidate.action_key
         )))
-        .json(candidate)
+        .json(&for_server(candidate))
         .send()?
         .error_for_status()?;
         Ok(())
@@ -1780,6 +2064,9 @@ struct Identity {
     virtual_env: BTreeMap<String, String>,
     /// The canonical git checkout containing this compile, if any.
     checkout: Option<PathBuf>,
+    /// This compile's working directory and checkout under every spelling
+    /// that reaches them (see `own_roots`).
+    own_roots: Vec<PathBuf>,
     /// The `--diagnostic-width` rustc was given, if any.
     diagnostic_width: Option<String>,
 }
@@ -2541,10 +2828,27 @@ fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
     }
 }
 
-// Canonicalizing a symlink loses the dependency on its resolution. Until the
-// manifest models that resolution, do not cache any input reached through one.
-fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
+/// The canonical path of a compiler input, which is how a record names it.
+///
+/// Resolving a symlink (or a junction) on the way loses what the link pointed
+/// at. The record would name the link's target, and a later compile whose
+/// link points somewhere else would be checked against the old target's
+/// files, find them unchanged, and restore code it does not compile. An input
+/// reached through a link is therefore not cacheable.
+///
+/// The exception is a link at or above one of this compile's own roots: its
+/// working directory or its checkout, under a spelling in `own_roots`. A
+/// record names such an input relative to that root (`$WORKSPACE/src/lib.rs`),
+/// never by where the link led, and every compile derives its roots afresh
+/// from its own working directory. A compile whose link points elsewhere is
+/// then checked against the files it reads itself. Below the root the rule is
+/// unchanged, so the rest of the path holds no link.
+fn canonical_compiler_input(path: &Path, own_roots: &[PathBuf]) -> Result<PathBuf> {
+    let path = without_dot_segments(path)?;
     for ancestor in path.ancestors() {
+        if own_roots.iter().any(|root| root == ancestor) {
+            break;
+        }
         if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
             bail!(
                 "symlinked compiler input is not cacheable: {}",
@@ -2553,6 +2857,150 @@ fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
         }
     }
     Ok(path.canonicalize()?)
+}
+
+/// `path` without `.` and `..` segments. A `..` that follows a link is not
+/// resolved: the system may take the parent of the link's target, not of the
+/// link, so the path cannot be judged by its spelling.
+fn without_dot_segments(path: &Path) -> Result<PathBuf> {
+    let mut plain = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if fs::symlink_metadata(&plain)?.file_type().is_symlink() {
+                    bail!(
+                        "symlinked compiler input is not cacheable: {} is followed by `..`",
+                        plain.display()
+                    );
+                }
+                plain.pop();
+            }
+            other => plain.push(other.as_os_str()),
+        }
+    }
+    Ok(plain)
+}
+
+/// This compile's working directory and checkout under every spelling that
+/// reaches them: their canonical paths, and each spelling the normalizer
+/// knows them by (Cargo's, which may pass through a symlink or junction) that
+/// resolves to one of them right now. Only spellings the normalizer knows
+/// qualify, so an input accepted below one is also normalized wherever it is
+/// written down: in arguments, dep-info and compiler messages.
+fn own_roots(
+    workspace: &Path,
+    checkout: Option<&Path>,
+    root_normalizer: &PathNormalizer,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (token, root) in [("$WORKSPACE", Some(workspace)), ("$CHECKOUT", checkout)] {
+        let Some(root) = root else {
+            continue;
+        };
+        let canonical = root.to_string_lossy();
+        roots.push(root.to_path_buf());
+        roots.push(PathBuf::from(ordinary_spelling(root)));
+        // A build that reaches its roots plainly has no other spelling, and
+        // pays for no lookup here.
+        for spelling in other_spellings(&canonical, &root_normalizer.spellings(token)) {
+            let spelling = PathBuf::from(spelling);
+            if spelling
+                .canonicalize()
+                .is_ok_and(|resolved| resolved == root)
+            {
+                roots.push(spelling);
+            }
+        }
+    }
+    roots
+}
+
+/// The spellings of a root that are not just another way to write its
+/// canonical path: without the Windows verbatim prefix, with forward slashes
+/// or, on Windows, in another letter case (some terminals start a build with
+/// a lower-case drive letter). What remains reaches the root by another
+/// route: through a symlink or junction, or by a Windows 8.3 name.
+fn other_spellings(canonical: &str, spellings: &[String]) -> Vec<String> {
+    let ordinary = ordinary_spelling(Path::new(canonical));
+    let forward = ordinary.replace('\\', "/");
+    let same = |spelling: &str, written: &str| {
+        if cfg!(windows) {
+            spelling.eq_ignore_ascii_case(written)
+        } else {
+            spelling == written
+        }
+    };
+    let mut others = spellings
+        .iter()
+        .filter(|spelling| {
+            ![canonical, ordinary.as_str(), forward.as_str()]
+                .iter()
+                .any(|written| same(spelling, written))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    others.sort();
+    others.dedup();
+    others
+}
+
+/// Cargo's spelling of `root` when it reaches the root through a symlink or
+/// junction: the one rustc prints for the files below it. A restore must
+/// write that spelling, not the link's target: Cargo decides what to rebuild
+/// from the paths in a restored dep-info file, and paths that name the target
+/// would keep it watching the old target after the link has moved.
+fn link_spelling(normalizer: &PathNormalizer, token: &str, root: &Path) -> Option<String> {
+    let through_link = |spelling: &Path| {
+        spelling.ancestors().any(|ancestor| {
+            fs::symlink_metadata(ancestor).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        })
+    };
+    other_spellings(&root.to_string_lossy(), &normalizer.spellings(token))
+        .into_iter()
+        .find(|spelling| {
+            let path = Path::new(spelling);
+            // Never the verbatim or forward-slash form of a Windows path: no
+            // fresh process spells a directory that way.
+            let unusual =
+                spelling.starts_with(r"\\?\") || (cfg!(windows) && spelling.contains('/'));
+            !unusual
+                && through_link(path)
+                && path.canonicalize().is_ok_and(|resolved| resolved == root)
+        })
+}
+
+/// Localizes this compile's roots to the spelling that reaches them through a
+/// link, where there is one (see `link_spelling`).
+pub(crate) fn localize_through_links(
+    normalizers: [&mut PathNormalizer; 2],
+    workspace: &Path,
+    checkout: Option<&Path>,
+) {
+    let [normalizer, root_normalizer] = normalizers;
+    for (token, root) in [("$WORKSPACE", Some(workspace)), ("$CHECKOUT", checkout)] {
+        if let Some(root) = root
+            && let Some(spelling) = link_spelling(root_normalizer, token, root)
+        {
+            normalizer.localize_as(token, &spelling);
+            root_normalizer.localize_as(token, &spelling);
+        }
+    }
+}
+
+/// The value a root's pin compares: the root's canonical path and, when the
+/// build reaches it under another spelling (through a symlink or junction, or
+/// by a Windows 8.3 name), those spellings too. An output that embeds a root
+/// may embed any of them, so a pinned candidate is reused only by a build
+/// that spells the root the same way. For a root reached plainly this is the
+/// canonical path alone, as it always was.
+pub(crate) fn pin_value(canonical: &str, spellings: &[String]) -> String {
+    let others = other_spellings(canonical, spellings);
+    if others.is_empty() {
+        canonical.to_owned()
+    } else {
+        format!("{canonical}\nspelled {}", others.join("\nspelled "))
+    }
 }
 
 fn diagnostic_width(args: &[String]) -> Option<String> {
@@ -2635,9 +3083,15 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     // not the parent Bellows session's launch directory.
     let workspace = env::current_dir()?.canonicalize()?;
     let crate_root = invocation.explicit_inputs.first().map(PathBuf::as_path);
-    let normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
-    let root_normalizer =
+    let mut normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
+    let mut root_normalizer =
         PathNormalizer::new(root_bases(&workspace, &invocation.out_dir, crate_root));
+    let checkout = compile_checkout(&workspace, crate_root);
+    localize_through_links(
+        [&mut normalizer, &mut root_normalizer],
+        &workspace,
+        checkout.as_deref(),
+    );
     let digests = digests::Digests::new(&state_dir(&workspace));
     let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
@@ -2706,12 +3160,13 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
             digest_bytes(found.as_bytes()),
         );
     }
+    let own_roots = own_roots(&workspace, checkout.as_deref(), &root_normalizer);
     let mut inputs = invocation.explicit_inputs.clone();
     inputs.extend(resolve_static_libraries(invocation, &workspace)?);
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace))
+        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace), &own_roots)
             .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
         let input_digest = digests.file(&absolute)?;
         components.insert(
@@ -2738,21 +3193,32 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         .unwrap_or_default();
     let mut pins = vec![(
         format!("{PIN_PREFIX}$WORKSPACE"),
-        workspace.to_string_lossy().into_owned(),
+        pin_value(
+            &workspace.to_string_lossy(),
+            &root_normalizer.spellings("$WORKSPACE"),
+        ),
     )];
     if let Some(target) = target_root(&workspace, &invocation.out_dir) {
         pins.push((
             format!("{PIN_PREFIX}$TARGET"),
-            canonical_base(target).to_string_lossy().into_owned(),
+            pin_value(
+                &canonical_base(target).to_string_lossy(),
+                &root_normalizer.spellings("$TARGET"),
+            ),
         ));
     }
-    if let Some(checkout) = root_normalizer.spellings("$CHECKOUT").first() {
-        pins.push((format!("{PIN_PREFIX}$CHECKOUT"), checkout.clone()));
+    let checkout_spellings = root_normalizer.spellings("$CHECKOUT");
+    if let Some(longest) = checkout_spellings.first() {
+        pins.push((
+            format!("{PIN_PREFIX}$CHECKOUT"),
+            pin_value(longest, &checkout_spellings),
+        ));
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
         diagnostic_width: diagnostic_width(&invocation.args),
-        checkout: compile_checkout(&workspace, crate_root),
+        checkout,
+        own_roots,
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -3082,8 +3548,16 @@ fn is_relevant_environment_name(name: &str) -> bool {
     // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
     // output. A crate that reads one with env!/option_env! is still tracked
     // exactly through dep-info.
+    //
+    // CARGO_HOLD_* belong to cargo-hold, a scheduler that runs one heavy
+    // build at a time in front of Cargo. It marks everything inside a hold
+    // with the holder's label, by default the name of the folder Cargo was
+    // started in, so keying it gave every checkout folder a cache of its own.
     const EXCLUDED_CARGO_CONTROL: &[&str] = &[
         "CARGO_BUILD_JOBS",
+        "CARGO_HOLD_ACTIVE",
+        "CARGO_HOLD_LABEL",
+        "CARGO_HOLD_SKIP",
         "CARGO_INCREMENTAL",
         "CARGO_MAKEFLAGS",
         "CARGO_PRIMARY_PACKAGE",
@@ -3269,7 +3743,7 @@ fn try_candidates(
         match restored {
             Ok(()) => {
                 if let Some(store) = l1 {
-                    let _ = store.put_candidate(candidate.clone(), 8);
+                    let _ = store.put_candidate(for_local_store(candidate, identity), 8);
                 }
                 record_event(
                     "hit",
@@ -4069,7 +4543,7 @@ fn capture_outputs(
                 absolute.display()
             )
         }
-        let absolute = canonical_compiler_input(&absolute)
+        let absolute = canonical_compiler_input(&absolute, &identity.own_roots)
             .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         record(&absolute, true)?;
     }
@@ -4157,6 +4631,7 @@ fn capture_outputs(
     blobs.insert(stdout_digest.clone(), normalized_stdout);
     blobs.insert(stderr_digest.clone(), normalized_stderr);
     let action_key = compiler_action_key(&identity.static_key, &files, &host_files, &env_inputs);
+    let pinned_checkouts = pinned_checkouts(identity, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -4176,6 +4651,7 @@ fn capture_outputs(
             len: stderr_len,
         },
         proc_macros: invocation.proc_macros.clone(),
+        pinned_checkouts,
     };
     validate_candidate_manifest(&candidate).map_err(|error| {
         if error.to_string().contains("cardinality") {
@@ -4489,6 +4965,46 @@ fn publish(remote: &Remote, captured: Captured) -> Result<String> {
     let action_key = captured.candidate.action_key.clone();
     remote.put_candidate(&captured.candidate)?;
     Ok(action_key)
+}
+
+/// The checkouts a candidate carrying these inputs can only be reused from:
+/// for each root it is pinned to, the checkout containing that root. A root
+/// outside every checkout names none (a registry package, a target directory
+/// shared by several checkouts), so such a pin is never judged by whether a
+/// directory exists. A target directory inside a checkout names the checkout,
+/// not itself: `cargo clean` removes it, and the next build puts it back.
+pub(crate) fn pinned_checkouts(identity: &Identity, inputs: &[EnvInput]) -> Vec<PinnedCheckout> {
+    let mut checkouts = inputs
+        .iter()
+        .filter(|input| input.name.starts_with(PIN_PREFIX))
+        .filter_map(|input| identity.pin_value(&input.name))
+        // The root's canonical path, before any other spelling of it.
+        .filter_map(|root| checkout_root(Path::new(root.lines().next()?)))
+        .filter_map(|checkout| PinnedCheckout::locate(&checkout))
+        .collect::<Vec<_>>();
+    checkouts.sort();
+    checkouts.dedup();
+    checkouts.truncate(bellows_core::MAX_PINNED_CHECKOUTS);
+    checkouts
+}
+
+/// A candidate as a server stores it: without the checkouts it is pinned to,
+/// which mean something only on the machine that holds them.
+fn for_server(candidate: &ActionCandidate) -> ActionCandidate {
+    ActionCandidate {
+        pinned_checkouts: Vec::new(),
+        ..candidate.clone()
+    }
+}
+
+/// A candidate restored from a server, as this machine's local store keeps
+/// it: pinned to this compile's checkouts. Its pins matched this compile's
+/// roots, or it would not have been restored.
+pub(crate) fn for_local_store(candidate: &ActionCandidate, identity: &Identity) -> ActionCandidate {
+    ActionCandidate {
+        pinned_checkouts: pinned_checkouts(identity, &candidate.env),
+        ..candidate.clone()
+    }
 }
 
 fn cache_captured(store: &Store, captured: &Captured) -> Result<()> {
@@ -4820,6 +5336,73 @@ struct CombinedStats {
     remote: ServerStats,
     events: BTreeMap<String, u64>,
     diagnostics: diagnostics::Summary,
+    /// Local statistics only: the configured budget and the stores it covers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget: Option<BudgetStats>,
+}
+
+#[derive(Serialize)]
+struct BudgetStats {
+    /// `unset`, `unbounded` or `limited`.
+    state: &'static str,
+    /// The budget each local store is held to (`BELLOWS_MAX_MB`).
+    max_bytes: Option<u64>,
+    /// What a build's automatic collection frees a store down to.
+    collect_to_bytes: Option<u64>,
+    max_executable_bytes: Option<u64>,
+    /// The store `bellows run` keeps beside this one, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wrapper_store: Option<StoreUsage>,
+}
+
+#[derive(Serialize)]
+struct StoreUsage {
+    path: String,
+    blob_bytes: u64,
+}
+
+impl BudgetStats {
+    fn new(budget: Budget, wrapper_store: Option<StoreUsage>) -> Self {
+        let (state, max_bytes, max_executable_bytes) = match budget {
+            Budget::Unset => ("unset", None, None),
+            Budget::Unbounded => ("unbounded", None, None),
+            Budget::Limited {
+                max_bytes,
+                max_executable_bytes,
+            } => ("limited", Some(max_bytes), max_executable_bytes),
+        };
+        Self {
+            state,
+            max_bytes,
+            collect_to_bytes: max_bytes.map(Budget::collect_to),
+            max_executable_bytes,
+            wrapper_store,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match (self.max_bytes, self.collect_to_bytes) {
+            (Some(max), Some(collect_to)) => {
+                let mut text = format!(
+                    "{} for each store (BELLOWS_MAX_MB); a build that ends above it collects to {}",
+                    human_bytes(max),
+                    human_bytes(collect_to)
+                );
+                if let Some(executables) = self.max_executable_bytes {
+                    text.push_str(&format!(
+                        ", executables to {} (BELLOWS_MAX_EXECUTABLE_MB)",
+                        human_bytes(executables)
+                    ));
+                }
+                text
+            }
+            _ if self.state == "unbounded" => "unbounded (BELLOWS_MAX_MB=0)".into(),
+            _ => {
+                "none: only `bellows gc` collects; set BELLOWS_MAX_MB (mebibytes) to cap each store"
+                    .into()
+            }
+        }
+    }
 }
 
 fn show_stats(
@@ -4837,7 +5420,8 @@ fn show_stats(
             serde_json::to_string_pretty(&CombinedStats {
                 remote,
                 events,
-                diagnostics
+                diagnostics,
+                budget: None,
             })?
         );
     } else {
@@ -4878,13 +5462,26 @@ fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()
     let remote = collect_local_stats(&store)?;
     let diagnostics = diagnostics::summarize(&diagnostics::read_selected(selection)?);
     let events = diagnostics.decisions.clone();
+    // The store `bellows run` keeps in the same state directory is held to
+    // the same budget, so its size belongs beside this one's.
+    let wrapper_root = state.join(format!("l1-v{PROTOCOL_VERSION}"));
+    let wrapper_store = if wrapper_root.join("blobs").is_dir() {
+        Some(StoreUsage {
+            blob_bytes: Store::open_for_access(&wrapper_root)?.blob_bytes()?,
+            path: wrapper_root.display().to_string(),
+        })
+    } else {
+        None
+    };
+    let budget = BudgetStats::new(Budget::from_env()?, wrapper_store);
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&CombinedStats {
                 remote,
                 events,
-                diagnostics
+                diagnostics,
+                budget: Some(budget),
             })?
         );
         return Ok(());
@@ -4908,6 +5505,20 @@ fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()
         "{}",
         terminal::key_value(color, "stored", human_bytes(remote.blob_bytes))
     );
+    println!(
+        "{}",
+        terminal::key_value(color, "budget", budget.describe())
+    );
+    if let Some(wrapper) = &budget.wrapper_store {
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "bellows run store",
+                format!("{} in {}", human_bytes(wrapper.blob_bytes), wrapper.path)
+            )
+        );
+    }
     println!(
         "{}",
         terminal::section(color, "Selected decisions (retained log)")
@@ -5945,6 +6556,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_budget_is_a_whole_number_of_mebibytes_and_zero_means_unbounded() {
+        assert_eq!(Budget::parse(None, None).unwrap(), Budget::Unset);
+        assert_eq!(Budget::parse(Some(""), None).unwrap(), Budget::Unset);
+        assert_eq!(Budget::parse(Some("0"), None).unwrap(), Budget::Unbounded);
+        assert_eq!(
+            Budget::parse(Some(" 100000 "), Some("20000")).unwrap(),
+            Budget::Limited {
+                max_bytes: 100_000 * MEBIBYTE,
+                max_executable_bytes: Some(20_000 * MEBIBYTE),
+            }
+        );
+        for (max, executables) in [
+            (Some("100GB"), None),
+            (Some("-1"), None),
+            (Some("1.5"), None),
+            (Some("100"), Some("many")),
+            // A share of a budget that does not exist.
+            (None, Some("10")),
+            (Some("0"), Some("10")),
+        ] {
+            assert!(
+                Budget::parse(max, executables).is_err(),
+                "{max:?} {executables:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_collects_only_above_the_budget_and_then_to_four_fifths_of_it() {
+        let budget = Budget::Limited {
+            max_bytes: 1000 * MEBIBYTE,
+            max_executable_bytes: None,
+        };
+        assert_eq!(budget.action(1000 * MEBIBYTE), BudgetAction::Nothing);
+        assert_eq!(
+            budget.action(1000 * MEBIBYTE + 1),
+            BudgetAction::Collect {
+                max_bytes: 1000 * MEBIBYTE,
+                to_bytes: 800 * MEBIBYTE,
+                max_executable_bytes: None,
+            }
+        );
+        // Without a budget nothing is collected. A large store is reported,
+        // unless it is unbounded on purpose.
+        assert_eq!(
+            Budget::Unset.action(UNBUDGETED_NOTICE_BYTES - 1),
+            BudgetAction::Nothing
+        );
+        assert_eq!(
+            Budget::Unset.action(UNBUDGETED_NOTICE_BYTES),
+            BudgetAction::Notice
+        );
+        assert_eq!(Budget::Unbounded.action(u64::MAX), BudgetAction::Nothing);
+        assert_eq!(Budget::collect_to(u64::MAX), u64::MAX / 100 * 80);
+    }
+
+    #[test]
+    fn budget_settings_never_reach_a_cache_key() {
+        for name in ["BELLOWS_MAX_MB", "BELLOWS_MAX_EXECUTABLE_MB"] {
+            assert!(!is_relevant_environment_name(name), "{name}");
+        }
+    }
+
+    #[test]
     fn protocol_skew_is_rejected_in_both_directions() {
         assert!(validate_protocol(PROTOCOL_VERSION).is_ok());
         assert!(validate_protocol(PROTOCOL_VERSION - 1).is_err());
@@ -6052,6 +6727,7 @@ mod tests {
             )],
             virtual_env: BTreeMap::new(),
             checkout: None,
+            own_roots: vec![workspace.to_path_buf()],
             diagnostic_width: None,
         }
     }
@@ -6097,6 +6773,261 @@ mod tests {
                 len: 0,
             },
             proc_macros: vec![],
+            pinned_checkouts: vec![],
+        }
+    }
+
+    #[test]
+    fn a_pinned_candidate_names_its_checkout_locally_and_never_to_a_server() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A git checkout holding a package and its target directory.
+        let checkout = root.join("checkout");
+        let package = checkout.join("crates").join("fixture");
+        fs::create_dir_all(&package).unwrap();
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        fs::create_dir_all(checkout.join("target")).unwrap();
+        let workspace_pin = format!("{PIN_PREFIX}$WORKSPACE");
+        let target_pin = format!("{PIN_PREFIX}$TARGET");
+        let mut identity = test_identity(&package);
+        identity.pins.push((
+            target_pin.clone(),
+            checkout.join("target").to_string_lossy().into_owned(),
+        ));
+        let pins = |identity: &Identity, names: &[&String]| {
+            names
+                .iter()
+                .map(|name| EnvInput::capture(name.as_str(), identity.pin_value(name)))
+                .collect::<Vec<_>>()
+        };
+        let expected = PinnedCheckout::locate(&checkout).unwrap();
+        // Both roots lie in one checkout. It is named once, and the target
+        // directory, which `cargo clean` removes, is not named itself.
+        assert_eq!(
+            pinned_checkouts(&identity, &pins(&identity, &[&workspace_pin, &target_pin])),
+            vec![expected.clone()]
+        );
+        assert!(
+            pinned_checkouts(&identity, &[EnvInput::capture("MODE", Some("release"))]).is_empty()
+        );
+        // A target directory shared by several checkouts belongs to none.
+        if git_root(&root).is_none() {
+            let shared = root.join("shared-target");
+            fs::create_dir_all(&shared).unwrap();
+            identity.pins[1].1 = shared.to_string_lossy().into_owned();
+            assert!(pinned_checkouts(&identity, &pins(&identity, &[&target_pin])).is_empty());
+        }
+
+        // A candidate restored from a server carries no checkout; the local
+        // store's copy names this compile's, under the same action key.
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        candidate.env = pins(&identity, &[&workspace_pin]);
+        candidate.action_key = compiler_action_key(&identity.static_key, &[], &[], &candidate.env);
+        let local = for_local_store(&candidate, &identity);
+        assert_eq!(local.pinned_checkouts, vec![expected]);
+        assert_eq!(local.action_key, candidate.action_key);
+        validate_candidate_manifest(&local).unwrap();
+        let sent = for_server(&local);
+        assert_eq!(sent, candidate);
+        assert!(
+            !serde_json::to_string(&sent)
+                .unwrap()
+                .contains("pinned_checkouts")
+        );
+    }
+
+    /// Links `link` to the directory `target`: a symlink, or on Windows a
+    /// junction, which needs no privilege.
+    #[cfg(any(unix, windows))]
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .stdout(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    /// `<root>/real/{pkg/src/lib.rs, shared/data.txt}` and `<root>/outside`,
+    /// with `<root>/link` leading to `real` and `pkg/selected` to `outside`.
+    /// Returns the canonical `real`, and `link` as Cargo would spell it.
+    #[cfg(any(unix, windows))]
+    fn linked_tree(temp: &Path) -> (PathBuf, PathBuf) {
+        let root = temp.canonicalize().unwrap();
+        let real = root.join("real");
+        for (directory, file) in [
+            (real.join("pkg").join("src"), "lib.rs"),
+            (real.join("shared"), "data.txt"),
+            (root.join("outside"), "value.rs"),
+        ] {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(file), "contents").unwrap();
+        }
+        let link = PathBuf::from(ordinary_spelling(&root)).join("link");
+        link_dir(&real, &link);
+        link_dir(&root.join("outside"), &real.join("pkg").join("selected"));
+        (real, link)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_link_is_followed_only_at_or_above_the_compiles_own_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let (real, link) = linked_tree(temp.path());
+        let package = real.join("pkg");
+        let spelled = link.join("pkg");
+        let source = package.join("src").join("lib.rs");
+        let refused = |path: &Path, roots: &[PathBuf]| {
+            let error = canonical_compiler_input(path, roots).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("symlinked compiler input is not cacheable"),
+                "{error:#}"
+            );
+        };
+
+        // No link on the way: as it always was, whatever the roots.
+        assert_eq!(canonical_compiler_input(&source, &[]).unwrap(), source);
+        // Reached through the spelling of the compile's own root: the record
+        // names the file under that root, so the link is the root's affair.
+        let own = vec![package.clone(), spelled.clone()];
+        assert_eq!(
+            canonical_compiler_input(&spelled.join("src").join("lib.rs"), &own).unwrap(),
+            source
+        );
+        assert_eq!(
+            canonical_compiler_input(
+                &spelled.join("src").join("..").join("src").join("lib.rs"),
+                &own
+            )
+            .unwrap(),
+            source
+        );
+        // The same path when the link is not a spelling of a root.
+        refused(
+            &spelled.join("src").join("lib.rs"),
+            std::slice::from_ref(&package),
+        );
+        // A link below the root still loses what it pointed at.
+        for base in [&spelled, &package] {
+            refused(&base.join("selected").join("value.rs"), &own);
+        }
+        // A file beside the package is inside the link only as far as the
+        // checkout the link stands for is one of the roots.
+        let sibling = spelled
+            .join("src")
+            .join("..")
+            .join("..")
+            .join("shared")
+            .join("data.txt");
+        refused(&sibling, &own);
+        let with_checkout = [own, vec![real.clone(), link.clone()]].concat();
+        assert_eq!(
+            canonical_compiler_input(&sibling, &with_checkout).unwrap(),
+            real.join("shared").join("data.txt")
+        );
+        // `..` straight after a link is not judged by its spelling.
+        refused(
+            &link
+                .join("..")
+                .join("real")
+                .join("pkg")
+                .join("src")
+                .join("lib.rs"),
+            &with_checkout,
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn own_roots_are_the_spellings_that_resolve_to_this_compiles_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let (real, link) = linked_tree(temp.path());
+        let package = real.join("pkg");
+        let elsewhere = real.parent().unwrap().join("outside");
+        let mut normalizer = PathNormalizer::new(vec![
+            ("$WORKSPACE".into(), package.clone()),
+            ("$WORKSPACE".into(), link.join("pkg")),
+            // Recorded as a spelling, but it leads somewhere else.
+            (
+                "$WORKSPACE".into(),
+                PathBuf::from(ordinary_spelling(&elsewhere)),
+            ),
+            ("$CHECKOUT".into(), link.clone()),
+            ("$CHECKOUT".into(), real.clone()),
+        ]);
+        let roots = own_roots(&package, Some(&real), &normalizer);
+        for root in [&package, &link.join("pkg"), &real, &link] {
+            assert!(roots.contains(root), "{root:?} in {roots:?}");
+        }
+        assert!(
+            !roots.iter().any(|root| root.ends_with("outside")),
+            "{roots:?}"
+        );
+
+        // A restore spells each root through its link, as rustc would.
+        assert_eq!(
+            normalizer.localize("$WORKSPACE"),
+            ordinary_spelling(&package)
+        );
+        let mut root_normalizer = normalizer.clone();
+        localize_through_links(
+            [&mut normalizer, &mut root_normalizer],
+            &package,
+            Some(&real),
+        );
+        for normalizer in [&normalizer, &root_normalizer] {
+            assert_eq!(
+                normalizer.localize("$WORKSPACE"),
+                link.join("pkg").to_string_lossy()
+            );
+            assert_eq!(normalizer.localize("$CHECKOUT"), link.to_string_lossy());
+        }
+        // A root reached plainly has no such spelling.
+        let plain = PathNormalizer::new(vec![("$WORKSPACE".into(), package.clone())]);
+        assert_eq!(link_spelling(&plain, "$WORKSPACE", &package), None);
+        assert_eq!(own_roots(&package, None, &plain).len(), 2);
+    }
+
+    #[test]
+    fn a_pin_covers_every_spelling_that_reaches_its_root() {
+        let (canonical, link, other) = if cfg!(windows) {
+            (
+                r"\\?\C:\work\checkout",
+                r"C:\link\checkout",
+                r"C:\other\checkout",
+            )
+        } else {
+            ("/work/checkout", "/link/checkout", "/other/checkout")
+        };
+        let spellings = |alias: Option<&str>| {
+            let mut bases = vec![("$WORKSPACE".to_owned(), PathBuf::from(canonical))];
+            bases.extend(alias.map(|alias| ("$WORKSPACE".to_owned(), PathBuf::from(alias))));
+            PathNormalizer::new(bases).spellings("$WORKSPACE")
+        };
+        // Reached plainly: the canonical path alone, as before, so pinned
+        // candidates stored by earlier versions still match.
+        assert_eq!(pin_value(canonical, &spellings(None)), canonical);
+        // Reached through a link: only by a build that spells it the same.
+        let linked = pin_value(canonical, &spellings(Some(link)));
+        assert_ne!(linked, canonical);
+        assert_eq!(linked.lines().next(), Some(canonical));
+        assert!(linked.contains(link), "{linked}");
+        assert_ne!(linked, pin_value(canonical, &spellings(Some(other))));
+        assert_eq!(linked, pin_value(canonical, &spellings(Some(link))));
+        // A shell that writes the drive letter in lower case reaches the
+        // same root the same way: its pinned results are not set apart.
+        if cfg!(windows) {
+            assert_eq!(
+                pin_value(canonical, &spellings(Some(r"c:\work\checkout"))),
+                canonical
+            );
         }
     }
 
@@ -7115,6 +8046,35 @@ release: 1.92.0
         assert!(is_relevant_environment_name("CC_x86_64_unknown_linux_gnu"));
         assert!(is_relevant_environment_name("CLIPPY_ARGS"));
         assert!(is_relevant_environment_name("CLIPPY_CONF_DIR"));
+    }
+
+    #[test]
+    fn a_build_schedulers_label_never_reaches_a_key() {
+        // cargo-hold marks everything inside a hold with the holder's label:
+        // by default the name of the folder Cargo was started in.
+        for name in ["CARGO_HOLD_ACTIVE", "CARGO_HOLD_LABEL", "CARGO_HOLD_SKIP"] {
+            assert!(!is_relevant_environment_name(name), "{name}");
+        }
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = |label: &str| {
+            [
+                ("CARGO_HOLD_ACTIVE", label),
+                ("Cargo_Hold_Label", label),
+                ("CARGO_PKG_NAME", "demo"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        };
+        // Neither a compile's key nor a build-script run's, which keeps the
+        // whole relevant environment, differs between two labels.
+        for case_insensitive in [false, true] {
+            let one = relevant_environment_of(vars("worktree-one"), &normalizer, case_insensitive);
+            let two = relevant_environment_of(vars("worktree-two"), &normalizer, case_insensitive);
+            assert_eq!(one, two);
+            assert_eq!(
+                one.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["CARGO_PKG_NAME"]
+            );
+        }
     }
 }
 #[test]
