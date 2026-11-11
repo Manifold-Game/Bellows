@@ -3146,3 +3146,34 @@ fn a_restore_names_files_through_the_link_so_cargo_follows_it_when_it_moves() {
     );
     assert_eq!(f.value("target"), "3");
 }
+
+/// A build scheduler in front of Cargo (cargo-hold) marks everything it runs
+/// with a label, by default the name of the folder Cargo was started in. That
+/// is bookkeeping about who is building, not an input to any compile.
+#[test]
+fn the_same_compile_under_another_hold_label_is_a_hit() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_HOLD_ACTIVE", "worktree-one"),
+    );
+    f.clean();
+    let other = checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_HOLD_ACTIVE", "worktree-two")
+            .env("CARGO_HOLD_LABEL", "worktree-two"),
+    );
+    let log = stderr(&other);
+    assert_eq!(
+        decisions(&other, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{log}"
+    );
+    assert!(!log.contains("CARGO_HOLD"), "{log}");
+    assert_eq!(f.value("target"), "42");
+}

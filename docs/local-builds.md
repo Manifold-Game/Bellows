@@ -54,6 +54,11 @@ results as *shareable* or *pinned to checkout*. Reading `CARGO_MANIFEST_DIR`
 at run time (Cargo and nextest set it for test processes) makes such a test
 shareable.
 
+Variables that only schedule or decorate a build are never part of a key:
+Cargo's job count and terminal settings, and the `CARGO_HOLD_*` marks of
+cargo-hold, a scheduler in front of Cargo whose label is by default the name
+of the folder a build was started in.
+
 A pinned result is dead weight once its checkout is deleted, as a finished
 git worktree is. The local store records which checkout each pinned result
 belongs to, and every local collection (`bellows gc --local` and a build's

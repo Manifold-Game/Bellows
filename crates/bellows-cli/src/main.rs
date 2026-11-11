@@ -3548,8 +3548,16 @@ fn is_relevant_environment_name(name: &str) -> bool {
     // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
     // output. A crate that reads one with env!/option_env! is still tracked
     // exactly through dep-info.
+    //
+    // CARGO_HOLD_* belong to cargo-hold, a scheduler that runs one heavy
+    // build at a time in front of Cargo. It marks everything inside a hold
+    // with the holder's label, by default the name of the folder Cargo was
+    // started in, so keying it gave every checkout folder a cache of its own.
     const EXCLUDED_CARGO_CONTROL: &[&str] = &[
         "CARGO_BUILD_JOBS",
+        "CARGO_HOLD_ACTIVE",
+        "CARGO_HOLD_LABEL",
+        "CARGO_HOLD_SKIP",
         "CARGO_INCREMENTAL",
         "CARGO_MAKEFLAGS",
         "CARGO_PRIMARY_PACKAGE",
@@ -8038,6 +8046,35 @@ release: 1.92.0
         assert!(is_relevant_environment_name("CC_x86_64_unknown_linux_gnu"));
         assert!(is_relevant_environment_name("CLIPPY_ARGS"));
         assert!(is_relevant_environment_name("CLIPPY_CONF_DIR"));
+    }
+
+    #[test]
+    fn a_build_schedulers_label_never_reaches_a_key() {
+        // cargo-hold marks everything inside a hold with the holder's label:
+        // by default the name of the folder Cargo was started in.
+        for name in ["CARGO_HOLD_ACTIVE", "CARGO_HOLD_LABEL", "CARGO_HOLD_SKIP"] {
+            assert!(!is_relevant_environment_name(name), "{name}");
+        }
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = |label: &str| {
+            [
+                ("CARGO_HOLD_ACTIVE", label),
+                ("Cargo_Hold_Label", label),
+                ("CARGO_PKG_NAME", "demo"),
+            ]
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+        };
+        // Neither a compile's key nor a build-script run's, which keeps the
+        // whole relevant environment, differs between two labels.
+        for case_insensitive in [false, true] {
+            let one = relevant_environment_of(vars("worktree-one"), &normalizer, case_insensitive);
+            let two = relevant_environment_of(vars("worktree-two"), &normalizer, case_insensitive);
+            assert_eq!(one, two);
+            assert_eq!(
+                one.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["CARGO_PKG_NAME"]
+            );
+        }
     }
 }
 #[test]
