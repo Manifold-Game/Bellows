@@ -405,8 +405,14 @@ fn log_events(daemon: &Daemon, event: &str) -> Vec<serde_json::Value> {
 #[test]
 fn status_flags_unleased_compilers() {
     let daemon = Daemon::start();
+    // A process named `rustc` that stays for a while: the shell under that
+    // name, waiting for a `sleep`. It cannot be `sleep` itself under that
+    // name: the coreutils of Ubuntu 26.04 refuse to run as anything but
+    // themselves. The trailing `:` keeps the shell from replacing itself
+    // with `sleep`, which would rename the process.
+    const WAIT: &str = "sleep 30; :";
     let fake = daemon.dir.path().join("rustc");
-    std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+    std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
     let unleased_dir = daemon.dir.path().join("unleased");
     let leased_dir = daemon.dir.path().join("leased");
     std::fs::create_dir_all(&unleased_dir).unwrap();
@@ -417,7 +423,7 @@ fn status_flags_unleased_compilers() {
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "\"{}\" 30 & echo $! > \"{}\"",
+            "\"{}\" -c '{WAIT}' & echo $! > \"{}\"",
             fake.display(),
             pid_file.display()
         ))
@@ -435,7 +441,7 @@ fn status_flags_unleased_compilers() {
         .lease()
         .args(["run", "laptop", "--est", "1m", "--label", "leased", "--"])
         .arg(&fake)
-        .arg("30")
+        .args(["-c", WAIT])
         .current_dir(&leased_dir)
         .stderr(Stdio::null())
         .spawn()
