@@ -3352,3 +3352,80 @@ fn the_same_compile_under_another_hold_label_is_a_hit() {
     assert!(!log.contains("CARGO_HOLD"), "{log}");
     assert_eq!(f.value("target"), "42");
 }
+
+#[test]
+fn profile_environment_keys_a_compile_only_through_its_arguments() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 7 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.build();
+    f.clean();
+    // Release's own debuginfo setting, spelled as a variable: Cargo passes rustc the same arguments, so the units
+    // stored without it serve this build (a lane without CI's CARGO_PROFILE_*_DEBUG missed them, Manifold #100916).
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "0"),
+    );
+    let same = f.explain(&["--latest", "--summary"]);
+    assert_eq!(same["decisions"]["l1_hit"], 2, "{same}");
+    assert!(same["decisions"].get("miss").is_none(), "{same}");
+    assert_eq!(f.value("target"), "7");
+    f.clean();
+    // A setting that changes the arguments never hits the old units: no stale hit.
+    let changed = stderr(&checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "1"),
+    ));
+    assert!(changed.contains("argument -C opt-level"), "{changed}");
+    let summary = f.explain(&["--latest", "--summary"]);
+    assert_eq!(summary["decisions"]["miss"], 2, "{summary}");
+    assert_eq!(f.value("target"), "7");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_library_path_that_finds_other_libraries_still_misses() {
+    // The session's checkout is normalized in a compile's LD_LIBRARY_PATH ($SESSION), so lanes share results; a
+    // value that names other directories, which could make a proc macro load other libraries, keeps its own key.
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 7 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let build = |libs: &Path| {
+        stderr(&checked(
+            f.local()
+                .args(["cargo", "build", "--release", "--offline"])
+                .env("LD_LIBRARY_PATH", libs),
+        ))
+    };
+    let outside_a = f.temp.path().join("libs-a");
+    let outside_b = f.temp.path().join("libs-b");
+    let inside_a = f.workspace.join("vendor").join("a");
+    let inside_b = f.workspace.join("vendor").join("b");
+    for dir in [&outside_a, &outside_b, &inside_a, &inside_b] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    build(&outside_a);
+    f.clean();
+    build(&outside_a);
+    let same = f.explain(&["--latest", "--summary"]);
+    assert!(same["decisions"].get("miss").is_none(), "{same}");
+    f.clean();
+    let other = build(&outside_b);
+    assert!(
+        other.contains("environment changed: LD_LIBRARY_PATH"),
+        "{other}"
+    );
+    f.clean();
+    build(&inside_a);
+    f.clean();
+    let moved = build(&inside_b);
+    assert!(
+        moved.contains("environment changed: LD_LIBRARY_PATH"),
+        "{moved}"
+    );
+    assert_eq!(f.value("target"), "7");
+}

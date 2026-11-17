@@ -3587,6 +3587,15 @@ fn without_shell(
         environment.remove("LD_LIBRARY_PATH");
         environment.remove("DYLD_LIBRARY_PATH");
     }
+    // Cargo's profile settings reach a compile only as the rustc arguments
+    // Cargo derives from them (`-C opt-level`, `-C debuginfo`,
+    // `-C debug-assertions`, `-C strip`, `-C codegen-units`, ...), and those
+    // are keyed; rustc never reads `CARGO_PROFILE_*`, and a crate that reads
+    // one with env!/option_env! is still tracked through dep-info. Keyed as
+    // well, a lane without CI's `CARGO_PROFILE_*_DEBUG=0` missed every unit
+    // whose arguments came out the same anyway (Manifold #100916: 12.9 h of
+    // missed compiles in four days). Build-script runs keep them.
+    environment.retain(|name, _| !name.starts_with("CARGO_PROFILE_"));
     if !matches!(path_use, PathUse::Whole) {
         environment.remove("PATH");
     }
@@ -8735,6 +8744,30 @@ release: 1.92.0
     }
 
     #[test]
+    fn profile_settings_leave_a_compile_key_but_not_a_build_script_run() {
+        let environment: BTreeMap<String, String> = [
+            ("CARGO_PROFILE_TEST_DEBUG", "0"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+            ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "1"),
+            ("CARGO_PKG_NAME", "demo"),
+            ("RUSTFLAGS", "-Dwarnings"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .into_iter()
+        .collect();
+        // A compile's key: the arguments Cargo derived from them are keyed instead.
+        let compile = without_shell(environment.clone(), &PathUse::None);
+        assert_eq!(
+            compile.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "RUSTFLAGS"]
+        );
+        // A build script may read them at run time: its run keeps them.
+        for name in environment.keys() {
+            assert!(is_relevant_environment_name(name), "{name}");
+        }
+    }
+
+    #[test]
     fn a_compile_keeps_only_its_own_targets_scoped_variables() {
         let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
             pairs
@@ -8814,7 +8847,8 @@ release: 1.92.0
             "CARGO_NET_GIT_FETCH_WITH_CLI"
         ));
         // What changes rustc's output stays in the key: flags (lints included, since a cached result replays its
-        // diagnostics) and profile settings.
+        // diagnostics) and profile settings (a build-script run's key; a compile keys the arguments Cargo derives
+        // from them, see without_shell).
         for compile in [
             "CARGO_ENCODED_RUSTFLAGS",
             "CARGO_PROFILE_DEV_DEBUG",
