@@ -3595,6 +3595,15 @@ fn without_shell(
     // well, a lane without CI's `CARGO_PROFILE_*_DEBUG=0` missed every unit
     // whose arguments came out the same anyway (Manifold #100916: 12.9 h of
     // missed compiles in four days). Build-script runs keep them.
+    //
+    // Untracked here, the same class as HOME and LANG above: a proc macro or a
+    // linker wrapper that reads CARGO_PROFILE_* (or another target's CC_*, see
+    // `own_target_environment`) at run time without env!/option_env!. A
+    // compile with a custom `--target` JSON spec bypasses the cache, so these
+    // rules never meet one. And since `$SESSION` normalizes a lane's own
+    // checkout in PATH and LD_LIBRARY_PATH, lane-local PATH shims (a wrapper
+    // directory inside the checkout) key the same in every lane: two lanes
+    // whose shims differ share results.
     environment.retain(|name, _| !name.starts_with("CARGO_PROFILE_"));
     if !matches!(path_use, PathUse::Whole) {
         environment.remove("PATH");

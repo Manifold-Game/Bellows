@@ -3368,12 +3368,14 @@ fn profile_environment_keys_a_compile_only_through_its_arguments() {
             .args(["cargo", "build", "--release", "--offline"])
             .env("CARGO_PROFILE_RELEASE_DEBUG", "0"),
     );
+    // The gain: these hit only because the variable left the compile key (the old key missed them).
     let same = f.explain(&["--latest", "--summary"]);
     assert_eq!(same["decisions"]["l1_hit"], 2, "{same}");
     assert!(same["decisions"].get("miss").is_none(), "{same}");
     assert_eq!(f.value("target"), "7");
     f.clean();
-    // A setting that changes the arguments never hits the old units: no stale hit.
+    // A setting that changes the arguments never hits the old units: no stale hit. (This half held before the
+    // change too; it guards that dropping the variable didn't drop what it controls.)
     let changed = stderr(&checked(
         f.local()
             .args(["cargo", "build", "--release", "--offline"])
@@ -3428,4 +3430,129 @@ fn a_library_path_that_finds_other_libraries_still_misses() {
         "{moved}"
     );
     assert_eq!(f.value("target"), "7");
+}
+
+/// A build script may read any variable, so its run keeps CARGO_PROFILE_* in its key: unlike the compiles (which
+/// hit, their arguments being the same), the run misses when one changes.
+#[test]
+fn a_build_script_run_misses_on_a_profile_variable() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]
+name=\"fixture\"
+version=\"0.1.0\"
+edition=\"2024\"
+build=\"build.rs\"
+[workspace]
+",
+            ),
+            (
+                "build.rs",
+                "fn main() {
+    let out = std::env::var(\"OUT_DIR\").unwrap();
+    std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap();
+}
+",
+            ),
+        ],
+    );
+    f.lock();
+    let kinds = |name: &str| {
+        events(&f)
+            .into_iter()
+            .filter(|e| e.crate_name == name)
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    let build = |profile: Option<&str>| {
+        let mut command = f.local();
+        command.args(["cargo", "build", "--release", "--offline"]);
+        if let Some(value) = profile {
+            command.env("CARGO_PROFILE_RELEASE_DEBUG", value);
+        }
+        checked(&mut command);
+        f.clean();
+        kinds("build-script:fixture").len()
+    };
+    let first = build(None);
+    let again = build(None);
+    assert_eq!(kinds("build-script:fixture")[first..again], ["l1_hit"]);
+    let compiles_before = kinds("fixture").len();
+    let changed = build(Some("0"));
+    assert_eq!(
+        kinds("build-script:fixture")[again..changed]
+            .first()
+            .map(String::as_str),
+        Some("miss")
+    );
+    // The crate's own compiles still hit: their arguments are the same.
+    let compiles = kinds("fixture")[compiles_before..].to_vec();
+    assert!(
+        compiles.iter().any(|k| k == "l1_hit") && !compiles.iter().any(|k| k == "miss"),
+        "{compiles:?}"
+    );
+}
+
+/// A nested build (here a crate built by `--manifest-path` from outside its own checkout, as trybuild's project or a
+/// build script's `cargo install` is) inherits paths from the session that started it. `$SESSION` normalizes the
+/// session's checkout in them, so two sessions in different directories share the crate's results; a different
+/// directory inside the session still keys differently. Without `$SESSION` (the compile's own `$CHECKOUT` is the
+/// nested crate's directory, which those paths don't name) the two sessions miss each other.
+#[cfg(not(windows))]
+#[test]
+fn a_nested_builds_library_path_keys_the_session_not_its_location() {
+    let f = Fixture::new("pub fn value() -> u32 { 7 }", "fn main() {}");
+    let nested = f.temp.path().join("nested crate");
+    write_files(
+        &nested,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"nested\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+            ),
+            ("src/lib.rs", "pub fn nested() -> u32 { 3 }"),
+        ],
+    );
+    let manifest = nested.join("Cargo.toml");
+    let sessions = [
+        f.temp.path().join("lanes").join("horde"),
+        f.temp.path().join("lanes").join("ops"),
+    ];
+    for session in &sessions {
+        fs::create_dir_all(session.join("vendor").join("libs")).unwrap();
+        fs::create_dir_all(session.join("vendor").join("other")).unwrap();
+    }
+    let build = |session: &Path, libs: &str| {
+        let output = checked(
+            f.local()
+                .current_dir(session)
+                .args([
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--offline",
+                    "--manifest-path",
+                ])
+                .arg(&manifest)
+                .env("LD_LIBRARY_PATH", session.join("vendor").join(libs)),
+        );
+        let _ = fs::remove_dir_all(nested.join("target"));
+        stderr(&output)
+    };
+    build(&sessions[0], "libs");
+    let across = build(&sessions[1], "libs");
+    assert!(across.contains("LOCAL HIT nested"), "{across}");
+    assert!(!across.contains("MISS nested"), "{across}");
+    let other = build(&sessions[1], "other");
+    assert!(
+        other.contains("environment changed: LD_LIBRARY_PATH"),
+        "{other}"
+    );
 }

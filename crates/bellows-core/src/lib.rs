@@ -1648,6 +1648,38 @@ fn note_sync() {
     SYNCS.with(|count| count.set(count.get() + 1));
 }
 
+/// `text` with each occurrence of the directory `path` replaced by `token`,
+/// where the occurrence ends the path: followed by a separator, a list or
+/// assignment delimiter, a quote or space, or the end. A sibling that merely
+/// starts with the same characters (`/lanes/horde-old` beside `/lanes/horde`)
+/// is another directory and keeps its own spelling.
+fn replace_at_boundaries(text: &str, path: &str, token: &str) -> String {
+    if path.is_empty() {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(path) {
+        let after = &rest[at + path.len()..];
+        out.push_str(&rest[..at]);
+        if after.chars().next().is_none_or(ends_a_path) {
+            out.push_str(token);
+        } else {
+            out.push_str(path);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn ends_a_path(c: char) -> bool {
+    matches!(
+        c,
+        '/' | '\\' | ':' | ';' | '=' | '"' | '\'' | ' ' | ',' | ')' | '\n' | '\t'
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct PathNormalizer {
     bases: Vec<(String, String)>,
@@ -1712,7 +1744,7 @@ impl PathNormalizer {
         self.bases
             .iter()
             .fold(value.to_owned(), |text, (token, path)| {
-                text.replace(path, token)
+                replace_at_boundaries(&text, path, token)
             })
     }
 
@@ -2580,5 +2612,40 @@ mod tests {
         assert_eq!(files, vec![directory.join("kept")]);
         assert_eq!(directory_bytes(&root.join("blobs")).unwrap(), 4);
         let _ = fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod path_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn a_base_replaces_only_whole_directories() {
+        for token in ["$CHECKOUT", "$SESSION"] {
+            let normalizer =
+                PathNormalizer::new(vec![(token.into(), PathBuf::from("/lanes/horde"))]);
+            assert_eq!(normalizer.normalize("/lanes/horde"), token);
+            assert_eq!(
+                normalizer.normalize("/lanes/horde/target/deps"),
+                format!("{token}/target/deps")
+            );
+            assert_eq!(
+                normalizer.normalize("/x/deps:/lanes/horde:/lanes/horde/t"),
+                format!("/x/deps:{token}:{token}/t")
+            );
+            assert_eq!(
+                normalizer.normalize("--out-dir=/lanes/horde"),
+                format!("--out-dir={token}")
+            );
+            // A sibling starting with the same characters is another directory.
+            assert_eq!(
+                normalizer.normalize("/lanes/horde-old/target"),
+                "/lanes/horde-old/target"
+            );
+            assert_eq!(
+                normalizer.normalize("/lanes/horde2:/lanes/horde/a"),
+                format!("/lanes/horde2:{token}/a")
+            );
+        }
     }
 }
