@@ -219,6 +219,12 @@ share a single store, and one budget, between checkouts, or pass
 cache unless `BELLOWS_STATE_DIR` names another). `lease` runs every job with
 it ([leases](lease.md#jobs-run-under-bellows)).
 
+Inside a build that `bellows run` already wraps, such as a leased job or a
+script that calls `bellows run` again, `bellows run` runs its command as part
+of that build: same wrapper, server, store and build session, and one
+summary at the end. A script that clears `RUSTC_WRAPPER` and then calls
+`bellows run` starts a build of its own.
+
 ## Declared local actions
 
 `bellows action run --local` uses the same sandbox and correctness boundary as

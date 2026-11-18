@@ -611,6 +611,18 @@ fn run_command(
     command: Vec<OsString>,
 ) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
+    if inside_wrapped_build() {
+        // A build `bellows run` already wraps (a leased job, a script that
+        // calls `bellows run` again): its wrapper, server, store and session
+        // already reach every Cargo started here. A second session would
+        // split the build's record and print a second, empty summary.
+        return Ok(Command::new(program)
+            .args(arguments)
+            .status()
+            .with_context(|| format!("start {}", program.to_string_lossy()))?
+            .code()
+            .unwrap_or(1));
+    }
     let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = if machine_state {
@@ -731,6 +743,17 @@ fn run_command(
         }
     }
     Ok(result?.code().unwrap_or(1))
+}
+
+/// Whether this process runs inside a build that `bellows run` wraps: a
+/// build session is set and Cargo's wrapper is a Bellows binary. A build
+/// under `bellows cargo` or `local` (local only) does not count, nor one
+/// whose wrapper a script has cleared or replaced.
+fn inside_wrapped_build() -> bool {
+    env::var_os("BELLOWS_SESSION_ID").is_some_and(|id| !id.is_empty())
+        && env::var_os("BELLOWS_LOCAL_ONLY").is_none()
+        && env::var_os("RUSTC_WRAPPER")
+            .is_some_and(|wrapper| Path::new(&wrapper).file_stem() == Some(OsStr::new("bellows")))
 }
 
 /// Whether `bellows run` puts a relay between its wrappers and `server`:

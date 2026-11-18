@@ -2537,6 +2537,65 @@ fn a_server_lost_during_a_build_is_reported_once() {
     assert_eq!(f.value("target"), "42");
 }
 
+/// A leased job runs under `bellows run --machine-state`, and scripts in it
+/// call `bellows run` again. The inner one joins the outer build: one build
+/// session, one set of decision lines and one summary, the machine's store.
+#[test]
+fn a_nested_bellows_run_joins_the_outer_build() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let machine = f.temp.path().join("machine state");
+    let output = checked(
+        f.command(BELLOWS)
+            .args([
+                "run",
+                "--machine-state",
+                "--server",
+                "http://127.0.0.1:1",
+                "--",
+            ])
+            .args([
+                BELLOWS,
+                "run",
+                "--",
+                "cargo",
+                "build",
+                "--release",
+                "--offline",
+            ])
+            .env("BELLOWS_STATE_DIR", &machine),
+    );
+    let text = stderr(&output);
+    assert_eq!(f.value("target"), "42");
+    assert_eq!(text.matches("CACHE MISS fixture").count(), 2, "{text}");
+    assert_eq!(text.matches("server unreachable").count(), 2, "{text}");
+    assert_eq!(text.matches("Bellows build ").count(), 1, "{text}");
+    assert!(
+        !f.workspace.join(".bellows").exists(),
+        "no per-checkout store"
+    );
+    let events = fs::read_to_string(machine.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<bellows_core::Event>(line).unwrap())
+        .collect::<Vec<_>>();
+    let sessions = events
+        .iter()
+        .filter(|e| e.kind == "build_start")
+        .map(|e| e.session_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.kind == "miss")
+            .all(|e| e.session_id == sessions[0])
+    );
+}
+
 #[test]
 fn an_unreachable_server_is_reported_loudly_and_can_be_required() {
     let f = Fixture::new(

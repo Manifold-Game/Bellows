@@ -26,7 +26,8 @@ so when `bellowsd` does not answer.
 - `--no-bellows` runs the command as given. Only the flag does this: no
   inherited environment variable can switch the cache off for a queue.
 - A job already inside a Bellows build (a nested `lease run` in a wrapped
-  `lease hold`) is not wrapped again.
+  `lease hold`) is not wrapped again, and a `bellows run` inside a job joins
+  the job's build rather than starting a second one.
 - A step inside a job that must build without the cache sets
   `RUSTC_WRAPPER=` for that command.
 - With no `bellows` on `PATH`, `lease run` refuses the job before queueing

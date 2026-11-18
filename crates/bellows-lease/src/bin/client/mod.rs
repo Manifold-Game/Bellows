@@ -403,8 +403,10 @@ extern "C" fn on_signal(signal: libc::c_int) {
 /// `lease hold` session that was wrapped), where a second wrap would only
 /// start a second build session.
 fn job_command(command: &[String], no_bellows: bool) -> Result<Vec<String>> {
-    let wrapped_already = std::env::var_os("BELLOWS_SESSION_ID").is_some()
-        && std::env::var_os("RUSTC_WRAPPER").is_some_and(|wrapper| !wrapper.is_empty());
+    let wrapped_already = std::env::var_os("BELLOWS_SESSION_ID").is_some_and(|id| !id.is_empty())
+        && std::env::var_os("RUSTC_WRAPPER").is_some_and(|wrapper| {
+            Path::new(&wrapper).file_stem() == Some(std::ffi::OsStr::new("bellows"))
+        });
     if no_bellows || wrapped_already {
         return Ok(command.to_vec());
     }
