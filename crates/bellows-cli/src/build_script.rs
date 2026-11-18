@@ -35,8 +35,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-/// Set while running as a launcher: Cargo captures the script's stderr.
-pub static SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const RECORD: &str = ".bellows-build-script.json";
 const REAL_PREFIX: &str = ".bellows-real-";
 const TREE: &str = "out-dir.tree";
@@ -131,7 +129,6 @@ pub fn launched_as(args: &[OsString]) -> Option<PathBuf> {
 }
 
 pub fn run(real: &Path, args: &[OsString]) -> Result<ExitStatus> {
-    SILENT.store(true, std::sync::atomic::Ordering::Relaxed);
     let configured = env::var_os("BELLOWS_STATE_DIR").is_some()
         && env::var("BELLOWS_BUILD_SCRIPTS").as_deref() != Ok("0");
     let (Some(out_dir), true) = (env::var_os("OUT_DIR").map(PathBuf::from), configured) else {

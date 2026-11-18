@@ -90,6 +90,12 @@ struct RunArgs {
     /// Only this flag turns it on: no inherited environment variable does.
     #[arg(long)]
     advisory: bool,
+    /// Run the command as given. By default it runs under `bellows run
+    /// --machine-state`, so every Cargo build in the job uses the compile
+    /// cache and the machine's one Bellows state directory. Only this flag
+    /// turns that off: no inherited environment variable does.
+    #[arg(long)]
+    no_bellows: bool,
     #[arg(required = true, last = true)]
     command: Vec<String>,
 }
@@ -392,7 +398,43 @@ extern "C" fn on_signal(signal: libc::c_int) {
     SIGNAL.store(signal, Ordering::SeqCst);
 }
 
+/// The command a job runs: under `bellows run`, unless the caller opted out
+/// or the job is already inside a Bellows build (a nested `lease run` in a
+/// `lease hold` session that was wrapped), where a second wrap would only
+/// start a second build session.
+fn job_command(command: &[String], no_bellows: bool) -> Result<Vec<String>> {
+    let wrapped_already = std::env::var_os("BELLOWS_SESSION_ID").is_some()
+        && std::env::var_os("RUSTC_WRAPPER").is_some_and(|wrapper| !wrapper.is_empty());
+    if no_bellows || wrapped_already {
+        return Ok(command.to_vec());
+    }
+    let bellows = find_program("bellows").context(
+        "`bellows` is not on PATH: install it, or pass --no-bellows to run the job without the compile cache",
+    )?;
+    let mut wrapped = vec![
+        bellows.to_string_lossy().into_owned(),
+        "run".into(),
+        "--machine-state".into(),
+        "--".into(),
+    ];
+    wrapped.extend(command.iter().cloned());
+    Ok(wrapped)
+}
+
+fn find_program(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
 fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
+    // Decided before queueing: a job that cannot start should not wait first.
+    let command = job_command(&args.command, args.no_bellows)?;
     // Inside a session on the same machine, the session's token runs us at once.
     let token = (std::env::var("LEASE_MACHINE").ok().as_deref() == Some(args.machine.as_str()))
         .then(|| std::env::var("LEASE_TOKEN").ok())
@@ -402,7 +444,7 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
         Err(error) if args.advisory => {
             let reason = format!("advisory: the lease daemon is unreachable ({error:#})");
             warn_unleased(socket, &args.machine, &args.label, None, &reason);
-            return run_unleased(&args.command);
+            return run_unleased(&command);
         }
         Err(error) => return Err(error),
     };
@@ -478,7 +520,7 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
                         .unwrap_or_default()
                 );
                 warn_unleased(socket, &args.machine, &args.label, Some(id), &reason);
-                return run_unleased(&args.command);
+                return run_unleased(&command);
             }
             Reply::Queued {
                 id,
@@ -512,7 +554,7 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     };
     stream.set_read_timeout(None)?;
 
-    let (program, rest) = args.command.split_first().context("missing command")?;
+    let (program, rest) = command.split_first().context("missing command")?;
     let mut command = Command::new(program);
     command
         .args(rest)

@@ -27,6 +27,7 @@ mod archive;
 mod build_script;
 mod diagnostics;
 mod digests;
+mod incremental;
 mod leak;
 mod link;
 mod relay;
@@ -53,6 +54,12 @@ enum Commands {
         server: String,
         #[arg(long, env = "BELLOWS_AUTH_TOKEN")]
         token: Option<String>,
+        /// Keep the local store and logs in the machine's state directory
+        /// (`BELLOWS_STATE_DIR`, else the user cache, as `bellows cargo`
+        /// does) instead of this workspace's `.bellows`. `lease` runs jobs
+        /// this way, so every checkout shares one store and one budget.
+        #[arg(long)]
+        machine_state: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -289,8 +296,9 @@ fn run_cli() -> Result<i32> {
         Commands::Run {
             server,
             token,
+            machine_state,
             command,
-        } => run_command(server, token, command),
+        } => run_command(server, token, machine_state, command),
         Commands::Local { cache_dir, command } => run_local_command(cache_dir, command),
         Commands::Relay {
             server,
@@ -596,11 +604,20 @@ fn print_gc_report(report: &GcReport) {
     }
 }
 
-fn run_command(server: String, token: Option<String>, command: Vec<OsString>) -> Result<i32> {
+fn run_command(
+    server: String,
+    token: Option<String>,
+    machine_state: bool,
+    command: Vec<OsString>,
+) -> Result<i32> {
     let (program, arguments) = command.split_first().context("missing command")?;
     let budget = Budget::from_env()?;
     let workspace = env::current_dir()?.canonicalize()?;
-    let state_dir = state_dir(&workspace);
+    let state_dir = if machine_state {
+        local_state_dir(None)?
+    } else {
+        state_dir(&workspace)
+    };
     if let Err(error) = fs::create_dir_all(&state_dir) {
         return run_without_cache(program, arguments, &error.into());
     }
@@ -676,7 +693,11 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     digests::prune(&state_dir, Duration::from_secs(14 * 24 * 60 * 60));
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
+    let follower = session.follow();
     let result = child.status().context("start wrapped command");
+    if let Some(follower) = follower {
+        follower.finish();
+    }
     if let Some(relay) = relay {
         finish_relay(relay)?;
     }
@@ -922,7 +943,11 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
     digests::prune(&state_dir, Duration::from_secs(14 * 24 * 60 * 60));
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
+    let follower = session.follow();
     let result = child.status().context("start locally wrapped command");
+    if let Some(follower) = follower {
+        follower.finish();
+    }
     let cache_line = enforce_budget(
         &state_dir.join(format!("store-v{PROTOCOL_VERSION}")),
         budget,
@@ -2595,7 +2620,114 @@ fn rustc_command(
 
 fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
     let (rustc, args) = raw.split_first().context("missing rustc executable")?;
-    Ok(Command::new(rustc).args(args).status()?)
+    // A passthrough compiles in Cargo's own session; a library it rewrites
+    // must not stay behind, under another name, in Bellows' session.
+    let coherence = Invocation::analyze(raw).ok().and_then(|invocation| {
+        let workspace = env::current_dir().ok()?;
+        Some((
+            invocation.crate_name.clone(),
+            coherence_for(&invocation, &workspace, None)?,
+        ))
+    });
+    let started = std::time::SystemTime::now();
+    let status = Command::new(rustc).args(args).status()?;
+    if let Some((crate_name, coherence)) = &coherence {
+        settle_sessions(coherence, crate_name, None, status.success(), started);
+    }
+    Ok(status)
+}
+
+/// Bellows' own incremental session for a unit: a subdirectory of Cargo's
+/// incremental directory, named so `cargo clean -p` still removes it.
+fn unit_session_dir(invocation: &Invocation, workspace: &Path) -> Option<PathBuf> {
+    invocation.incremental.as_deref().map(|dir| {
+        absolute_path(dir, workspace).join(format!(
+            "{}-bellows{}",
+            invocation.crate_name,
+            invocation
+                .unit
+                .strip_prefix(&invocation.crate_name)
+                .unwrap_or_default()
+        ))
+    })
+}
+
+/// Records an incremental library unit's metadata output before a compile
+/// or restore replaces it; see [`incremental`].
+fn coherence_for(
+    invocation: &Invocation,
+    workspace: &Path,
+    unit_dir: Option<PathBuf>,
+) -> Option<incremental::Coherence> {
+    if invocation.kind != OutputKind::Library {
+        return None;
+    }
+    let incremental_dir = absolute_path(invocation.incremental.as_deref()?, workspace);
+    let rmeta = invocation
+        .expected_names
+        .iter()
+        .find(|name| name.ends_with(".rmeta"))?;
+    Some(incremental::Coherence::record(
+        absolute_path(&invocation.out_dir, workspace).join(rmeta),
+        incremental_dir,
+        &invocation.crate_name,
+        unit_dir,
+    ))
+}
+
+/// After rustc ran for a unit: removes sessions still holding the metadata
+/// it replaced, and repairs an output rustc left with an older time.
+fn settle_sessions(
+    coherence: &incremental::Coherence,
+    crate_name: &str,
+    static_key: Option<&str>,
+    succeeded: bool,
+    started: std::time::SystemTime,
+) {
+    match coherence.release_replaced() {
+        Ok(removed) => {
+            for path in removed {
+                record_event(
+                    "session_reset",
+                    crate_name,
+                    static_key,
+                    None,
+                    &format!(
+                        "removed incremental session {}: it holds the metadata this compile replaced",
+                        path.display()
+                    ),
+                );
+            }
+        }
+        Err(error) => record_event(
+            "fallback",
+            crate_name,
+            static_key,
+            None,
+            &format!("could not release incremental sessions holding replaced metadata: {error:#}"),
+        ),
+    }
+    if !succeeded {
+        return;
+    }
+    match coherence.repair_mtime(started) {
+        Ok(true) => record_event(
+            "stale_metadata",
+            crate_name,
+            static_key,
+            None,
+            "rustc reused older metadata from an incremental session under its old time; \
+             gave it the current time so Cargo rebuilds what depends on it",
+        ),
+        Ok(false) => {}
+        Err(error) => record_event(
+            "fallback",
+            crate_name,
+            static_key,
+            None,
+            &format!("could not check the metadata's time: {error:#}"),
+        ),
+    }
 }
 
 fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNormalizer {
@@ -3943,6 +4075,31 @@ fn restore_with(
     {
         bail!("compiler stream length does not match manifest")
     }
+    // A restore replaces the metadata the unit's incremental sessions may
+    // hold; none of them may put the old file back (see `incremental`).
+    let coherence = coherence_for(
+        invocation,
+        &identity.workspace,
+        unit_session_dir(invocation, &identity.workspace),
+    );
+    let installed = install_restored(invocation, identity, candidate, downloaded);
+    if let Some(coherence) = &coherence {
+        settle_restored_sessions(coherence, invocation, identity, candidate);
+    }
+    installed?;
+    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
+    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
+    std::io::stdout().write_all(&stdout)?;
+    std::io::stderr().write_all(&stderr)?;
+    Ok(())
+}
+
+fn install_restored(
+    invocation: &Invocation,
+    identity: &Identity,
+    candidate: &ActionCandidate,
+    downloaded: Vec<(&Artifact, Vec<u8>)>,
+) -> Result<()> {
     for (artifact, stored) in downloaded {
         let bytes = if artifact.file_name.ends_with(".d") {
             localize_env_deps(
@@ -3960,11 +4117,47 @@ fn restore_with(
             identity.digests.remember(&destination, &artifact.digest);
         }
     }
-    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
-    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
-    std::io::stdout().write_all(&stdout)?;
-    std::io::stderr().write_all(&stderr)?;
     Ok(())
+}
+
+/// After a restore: Bellows' unit session must hold the restored metadata
+/// or nothing, and no session may keep the metadata the restore replaced.
+fn settle_restored_sessions(
+    coherence: &incremental::Coherence,
+    invocation: &Invocation,
+    identity: &Identity,
+    candidate: &ActionCandidate,
+) {
+    let restored = candidate
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.file_name.ends_with(".rmeta"));
+    if let Some(restored) = restored {
+        match coherence.reset_unit_session_unless(&restored.digest) {
+            Ok(Some(reason)) => record_event(
+                "session_reset",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                Some(&candidate.action_key),
+                &reason,
+            ),
+            Ok(None) => {}
+            Err(error) => record_event(
+                "fallback",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                Some(&candidate.action_key),
+                &format!("could not check the incremental session after a restore: {error:#}"),
+            ),
+        }
+    }
+    settle_sessions(
+        coherence,
+        &invocation.crate_name,
+        Some(&identity.static_key),
+        false,
+        std::time::SystemTime::now(),
+    );
 }
 
 /// Replace an output file. Windows refuses to replace an executable image
@@ -4037,16 +4230,41 @@ fn compile_and_capture(
     // crate's lib, test harness and binaries all create `{crate}-*` sessions
     // concurrently. Each unit gets its own subdirectory instead, named so
     // `cargo clean -p` still removes it, which makes "from scratch" exact.
-    let unit_incremental = invocation.incremental.as_deref().map(|dir| {
-        absolute_path(dir, &identity.workspace).join(format!(
-            "{}-bellows{}",
-            invocation.crate_name,
-            invocation
-                .unit
-                .strip_prefix(&invocation.crate_name)
-                .unwrap_or_default()
-        ))
-    });
+    let unit_incremental = unit_session_dir(invocation, &identity.workspace);
+    // A session that holds other metadata than the output Cargo reads would
+    // let rustc put that back under its old time (see `incremental`).
+    let coherence = coherence_for(invocation, &identity.workspace, unit_incremental.clone());
+    if let Some(coherence) = &coherence {
+        match coherence.reset_unit_session_if_stale() {
+            Ok(Some(reason)) => record_event(
+                "session_reset",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                None,
+                &reason,
+            ),
+            Ok(None) => {}
+            Err(error) => {
+                let reset = unit_incremental
+                    .as_deref()
+                    .map(fs::remove_dir_all)
+                    .transpose();
+                record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!(
+                        "could not check the incremental session ({error:#}); {}",
+                        match reset {
+                            Ok(_) => "compiling from scratch".to_owned(),
+                            Err(error) => format!("and could not reset it: {error}"),
+                        }
+                    ),
+                );
+            }
+        }
+    }
     let reused_session = unit_incremental
         .as_deref()
         .is_some_and(|dir| fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some()));
@@ -4108,6 +4326,15 @@ fn compile_and_capture(
     let stderr = stderr_thread
         .join()
         .map_err(|_| anyhow!("stderr relay panicked"))??;
+    if let Some(coherence) = &coherence {
+        settle_sessions(
+            coherence,
+            &invocation.crate_name,
+            Some(&identity.static_key),
+            status.success(),
+            started,
+        );
+    }
     if !status.success() {
         return Ok((status, None));
     }
@@ -4867,7 +5094,7 @@ fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
         .collect::<Vec<_>>();
     // Longest virtual prefix first: `/bellows/checkout/crates/x` before
     // `/bellows/checkout`.
-    roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    roots.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
     roots.dedup_by(|a, b| a.0 == b.0);
     roots
 }
@@ -5075,17 +5302,13 @@ fn record_event_duration(
         workspace: env::var("BELLOWS_WORKSPACE").ok(),
         duration_ms,
     };
+    // Decisions go to the log only. A wrapper's stderr is the compiler's:
+    // Cargo saves it with the unit and replays it whenever the unit is
+    // fresh, so a status line printed here would reappear in every later
+    // build, wrapped or not. The `bellows run`/`cargo`/`local` that started
+    // the build prints them as they are recorded (`BuildSession::follow`).
     if let Err(error) = diagnostics::append(&event_log_path(), &event) {
         eprintln!("Bellows diagnostics unavailable: {error:#}");
-    }
-    // Cargo captures a build script's stderr; decisions are recorded only.
-    if !build_script::SILENT.load(std::sync::atomic::Ordering::Relaxed)
-        && terminal::Output::from_env().prints(kind)
-    {
-        eprintln!(
-            "{}",
-            terminal::status(terminal::stderr_color(), kind, crate_name, detail)
-        );
     }
 }
 

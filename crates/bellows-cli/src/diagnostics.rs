@@ -3,11 +3,13 @@ use bellows_core::{Event, atomic_write, digest_bytes, now_ms};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const LOG_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -507,6 +509,85 @@ fn print_reasons<'a>(reasons: impl Iterator<Item = &'a ReasonSummary>, limit: us
     }
 }
 
+/// Prints a build session's decisions until the build ends.
+pub struct Follower {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Follower {
+    /// After the wrapped command exits: prints what is left, then stops.
+    pub fn finish(mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Reads events appended to a log from where it was opened, across
+/// rotations (the log is renamed to `.1` and a new one started).
+struct LogTail {
+    path: PathBuf,
+    file: File,
+    partial: Vec<u8>,
+}
+
+impl LogTail {
+    fn open(path: &Path) -> Option<Self> {
+        let mut file = File::open(path).ok()?;
+        file.seek(SeekFrom::End(0)).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            file,
+            partial: Vec::new(),
+        })
+    }
+
+    fn read(&mut self, sink: &dyn Fn(&Event)) {
+        self.drain(sink);
+        if self.rotated()
+            && let Ok(file) = File::open(&self.path)
+        {
+            // The rotated file was read to its end above.
+            self.file = file;
+            self.partial.clear();
+            self.drain(sink);
+        }
+    }
+
+    fn drain(&mut self, sink: &dyn Fn(&Event)) {
+        let mut appended = Vec::new();
+        if self.file.read_to_end(&mut appended).is_err() {
+            return;
+        }
+        self.partial.extend_from_slice(&appended);
+        // A line still being written stays until its newline arrives.
+        while let Some(end) = self.partial.iter().position(|&byte| byte == b'\n') {
+            let line = self.partial.drain(..=end).collect::<Vec<_>>();
+            if let Ok(event) = serde_json::from_slice::<Event>(&line) {
+                sink(&event);
+            }
+        }
+    }
+
+    fn rotated(&self) -> bool {
+        let (Ok(on_disk), Ok(held)) = (fs::metadata(&self.path), self.file.metadata()) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (on_disk.dev(), on_disk.ino()) != (held.dev(), held.ino())
+        }
+        // A new log starts empty, shorter than the one held.
+        #[cfg(not(unix))]
+        {
+            on_disk.len() < held.len()
+        }
+    }
+}
+
 pub struct BuildSession {
     id: String,
     workspace: String,
@@ -548,6 +629,52 @@ impl BuildSession {
         child
             .env("BELLOWS_SESSION_ID", &self.id)
             .env("BELLOWS_EVENT_LOG", &self.log);
+    }
+
+    /// Prints this session's decisions as its wrappers record them. The
+    /// wrappers print nothing: their stderr is the compiler's, which Cargo
+    /// saves with each unit and replays whenever the unit is fresh. This
+    /// process's stderr is the terminal's. `None` when the output level
+    /// prints no decisions, or the log cannot be read.
+    pub fn follow(&self) -> Option<Follower> {
+        let output = crate::terminal::Output::from_env();
+        if output == crate::terminal::Output::Quiet {
+            return None;
+        }
+        let mut tail = LogTail::open(&self.log)?;
+        let id = self.id.clone();
+        let color = crate::terminal::stderr_color();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let print = |event: &Event| {
+                if event.session_id.as_deref() == Some(id.as_str()) && output.prints(&event.kind) {
+                    eprintln!(
+                        "{}",
+                        crate::terminal::status(
+                            color,
+                            &event.kind,
+                            &event.crate_name,
+                            &event.detail
+                        )
+                    );
+                }
+            };
+            loop {
+                // Read once more after the build ends: by then every
+                // wrapper has written its last event.
+                let last = stopping.load(Ordering::SeqCst);
+                tail.read(&print);
+                if last {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Some(Follower {
+            stop,
+            handle: Some(handle),
+        })
     }
     /// Compiles in this session that fell back to plain rustc because the
     /// server stopped answering after the session started.
@@ -744,6 +871,37 @@ pub fn argument_components(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tail_reads_appended_events_across_a_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("events.jsonl");
+        let roomy = 1 << 20;
+        append_with_limit(&path, &event("miss", "s", "before"), roomy).unwrap();
+        let mut tail = LogTail::open(&path).unwrap();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let sink = |event: &Event| seen.borrow_mut().push(event.detail.clone());
+        append_with_limit(&path, &event("miss", "s", "one"), roomy).unwrap();
+        tail.read(&sink);
+        assert_eq!(*seen.borrow(), ["one"]);
+        // Written to the old log after the last read, then the log rotates.
+        append_with_limit(&path, &event("miss", "s", "late"), roomy).unwrap();
+        append_with_limit(&path, &event("miss", "s", "two"), 1).unwrap();
+        assert!(rotated(&path, 1).exists());
+        tail.read(&sink);
+        assert_eq!(*seen.borrow(), ["one", "late", "two"]);
+        // A line still being written waits for its newline.
+        let line = serde_json::to_vec(&event("miss", "s", "three")).unwrap();
+        let (head, rest) = line.split_at(10);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(head).unwrap();
+        tail.read(&sink);
+        assert_eq!(seen.borrow().len(), 3);
+        file.write_all(rest).unwrap();
+        file.write_all(b"\n").unwrap();
+        tail.read(&sink);
+        assert_eq!(*seen.borrow(), ["one", "late", "two", "three"]);
+    }
 
     fn event(kind: &str, session: &str, detail: &str) -> Event {
         Event {

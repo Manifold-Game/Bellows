@@ -1541,7 +1541,7 @@ impl PathNormalizer {
                 }
             }
         }
-        rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        rendered.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
         Self {
             bases: rendered,
             localized: Vec::new(),

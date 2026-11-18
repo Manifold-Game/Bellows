@@ -1342,6 +1342,191 @@ fn incremental_compiles_publish_only_from_scratch_sessions() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
 }
 
+/// A workspace `a` <- `b` <- `c` of libraries, with nothing but the
+/// fixture's temporary directory around it.
+fn three_crates(a: &str) -> Fixture {
+    let f = Fixture::new("", "");
+    fs::remove_dir_all(f.workspace.join("src")).unwrap();
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"2\"\n",
+            ),
+            (
+                "a/Cargo.toml",
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            ("a/src/lib.rs", a),
+            (
+                "b/Cargo.toml",
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\na = { path = \"../a\" }\n",
+            ),
+            ("b/src/lib.rs", "pub fn twice() -> u32 { a::value() * 2 }\n"),
+            (
+                "c/Cargo.toml",
+                "[package]\nname = \"c\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                 [dependencies]\nb = { path = \"../b\" }\n",
+            ),
+            ("c/src/lib.rs", "pub fn show() -> u32 { b::twice() }\n"),
+        ],
+    );
+    f.lock();
+    f
+}
+
+/// `cargo build`, incremental, without Bellows.
+fn plain_build(f: &Fixture, args: &[&str]) -> Output {
+    settle();
+    f.command("cargo")
+        .args(["build", "--offline"])
+        .args(args)
+        .env("CARGO_INCREMENTAL", "1")
+        .output()
+        .unwrap()
+}
+
+/// `cargo build`, incremental, through the local cache.
+fn wrapped_build(f: &Fixture, args: &[&str]) -> Output {
+    f.local()
+        .args(["cargo", "build", "--offline"])
+        .args(args)
+        .env("CARGO_INCREMENTAL", "1")
+        .output()
+        .unwrap()
+}
+
+fn succeeded(output: Output) -> Output {
+    assert!(output.status.success(), "{}", stderr(&output));
+    output
+}
+
+/// Writes a crate's source (the same bytes again marks it changed).
+fn write_source(f: &Fixture, krate: &str, source: Option<&str>) {
+    settle();
+    let path = f.workspace.join(krate).join("src/lib.rs");
+    let source = source.map_or_else(|| fs::read(&path).unwrap(), |s| s.as_bytes().to_vec());
+    fs::write(path, source).unwrap();
+}
+
+/// The E0463 of 2026-11-17: Bellows compiles a miss in its own incremental
+/// session with remapped paths, a plain build of the same unit uses Cargo's
+/// session, and the two hold different metadata. rustc reuses unchanged
+/// metadata by hard-linking the saved file back under its old time, so a
+/// plain build brought back Cargo's older rmeta and Cargo kept `b`, built
+/// against Bellows' rmeta, fresh: `c` failed with E0460. Bellows now removes
+/// the session holding the rmeta it replaced.
+#[test]
+fn mixed_plain_and_wrapped_builds_keep_dependents_consistent() {
+    let f = three_crates("pub fn value() -> u32 { 1 }\n");
+    succeeded(plain_build(&f, &[]));
+    write_source(&f, "a", None);
+    succeeded(wrapped_build(&f, &[]));
+    // Only `a` rebuilds here: `b` is not part of this build.
+    write_source(&f, "a", None);
+    succeeded(plain_build(&f, &["-p", "a"]));
+    write_source(&f, "c", None);
+    succeeded(plain_build(&f, &[]));
+}
+
+/// The same with Bellows alone: a restore replaced `a`'s rmeta while
+/// Bellows' own session still held another version, and the next compile in
+/// that session put the older one back under its older time. Bellows now
+/// resets a session that holds other metadata than the restored file.
+#[test]
+fn a_restore_resets_a_stale_unit_session() {
+    let v1 = "pub fn value() -> u32 { 1 }\n";
+    let v2 = "pub fn value() -> u32 { 1 }\npub fn extra() -> u32 { 2 }\n";
+    let f = three_crates(v1);
+    succeeded(wrapped_build(&f, &[]));
+    write_source(&f, "a", Some(v2));
+    succeeded(wrapped_build(&f, &[]));
+    write_source(&f, "a", Some(v1));
+    let restored = succeeded(wrapped_build(&f, &[]));
+    assert_eq!(
+        decisions(&restored, "a"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    write_source(&f, "a", Some(v2));
+    succeeded(wrapped_build(&f, &["-p", "a"]));
+    // A new `c`, so it compiles here rather than being restored.
+    write_source(&f, "c", Some("pub fn show() -> u32 { b::twice() + 1 }\n"));
+    succeeded(wrapped_build(&f, &[]));
+    assert!(
+        events(&f)
+            .iter()
+            .any(|e| e.kind == "session_reset" && e.crate_name == "a"),
+        "the restore should have reset a's session"
+    );
+}
+
+/// Edit loops keep their incremental session: it holds the metadata in the
+/// output, so nothing is reset and no compile starts from scratch.
+#[test]
+fn an_edit_loop_keeps_its_incremental_session() {
+    let f = three_crates("pub fn value() -> u32 { 1 }\n");
+    succeeded(wrapped_build(&f, &[]));
+    for n in 2..4 {
+        write_source(&f, "a", Some(&format!("pub fn value() -> u32 {{ {n} }}\n")));
+        succeeded(wrapped_build(&f, &[]));
+    }
+    let events = events(&f);
+    let resets = events
+        .iter()
+        .filter(|e| e.kind == "session_reset")
+        .map(|e| format!("{}: {}", e.crate_name, e.detail))
+        .collect::<Vec<_>>();
+    assert!(resets.is_empty(), "{resets:#?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e.crate_name == "a" && e.detail.contains("reused an existing session"))
+            .count(),
+        2
+    );
+}
+
+/// Bellows' status lines go to the terminal of the command that started the
+/// build, never to the compiler's stderr: Cargo saves that with each unit
+/// and replays it whenever the unit is fresh, so a line written there would
+/// reappear in every later build, wrapped or not.
+#[test]
+fn status_lines_stay_out_of_cargos_saved_compiler_output() {
+    // A warning, so Cargo saves the library's compiler output.
+    let f = Fixture::new(
+        "pub fn value() -> u32 { let unused = 1; 1 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let built = f.build();
+    assert_eq!(decisions(&built, "fixture"), ["CACHE MISS", "CACHE MISS"]);
+    let fingerprints = f.workspace.join("target/release/.fingerprint");
+    let mut saved = 0;
+    for unit in fs::read_dir(&fingerprints).unwrap() {
+        for file in fs::read_dir(unit.unwrap().path()).unwrap() {
+            let file = file.unwrap();
+            if file.file_name().to_string_lossy().starts_with("output-") {
+                saved += 1;
+                let text = fs::read_to_string(file.path()).unwrap();
+                assert!(
+                    !text.contains("CACHE MISS"),
+                    "{}: {text}",
+                    file.path().display()
+                );
+            }
+        }
+    }
+    // Unwrapped and fresh: nothing replayed.
+    let again = checked(f.command("cargo").args(["build", "--release", "--offline"]));
+    assert!(saved > 0, "Cargo saved no compiler output to check");
+    assert!(stderr(&again).contains("unused"), "{}", stderr(&again));
+    assert!(!stderr(&again).contains("CACHE"), "{}", stderr(&again));
+}
+
 #[test]
 fn proc_macro_consumers_share_across_checkouts() {
     let mut f = Fixture::new(

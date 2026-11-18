@@ -84,6 +84,36 @@ Cargo's own (`{crate}-bellows{extra}`, still removed by `cargo clean -p`).
 Only a compile that started without a session is published. Edit-loop
 recompiles that reuse a session stay in their checkout.
 
+### Sessions follow the output Cargo reads
+
+When a crate's metadata is unchanged, rustc reuses the copy saved in its
+incremental session by hard-linking it back to `deps/lib….rmeta`, and the
+file keeps the saved copy's modification time. Cargo decides whether a later
+build's dependents are fresh by that time. A unit compiled in two sessions,
+Bellows' for a miss (with remapped paths) and Cargo's for a plain `cargo`
+build or a passthrough (without them), holds different metadata in each, so
+rustc could put the older one back under its older time while dependents
+built against the newer one stayed fresh: E0460 or E0463 in a later build.
+A restore that replaces the file can do the same.
+
+Since 0.3.18 Bellows keeps every session coherent with the output (see
+`crates/bellows-cli/src/incremental.rs`):
+
+- Before compiling in its unit session, Bellows resets the session if the
+  metadata rustc would reuse from it is neither the output Cargo reads nor
+  the same bytes. After a restore it does the same unless the session holds
+  the restored bytes.
+- When a compile or restore replaces the output, any session whose latest
+  metadata is still the replaced file (Cargo's included) is removed, unless
+  the new output has the same bytes.
+- If a compile still leaves the output older than the compile and different
+  from what dependents last read, Bellows gives it the current time and
+  records `stale_metadata` (`REPAIRED`).
+
+Edit loops are unaffected: their session holds the current output. Resets are
+recorded as `session_reset` for `bellows explain`. Sessions are matched by
+hard link, so on Windows only the first and last rules apply.
+
 ## Build-script runs
 
 After a build script is compiled or restored, a Bellows launcher takes its
@@ -184,7 +214,10 @@ export BELLOWS_MAX_MB=100000   # mebibytes, for each local store
 `bellows run` keeps its local store in `BELLOWS_STATE_DIR`, or in
 `<workspace>/.bellows` when that is unset, so every checkout then grows a
 private store. Set `BELLOWS_STATE_DIR` to one directory for the machine to
-share a single store, and one budget, between checkouts.
+share a single store, and one budget, between checkouts, or pass
+`--machine-state`: it uses the same directory as `bellows cargo` (the user
+cache unless `BELLOWS_STATE_DIR` names another). `lease` runs every job with
+it ([leases](lease.md#jobs-run-under-bellows)).
 
 ## Declared local actions
 

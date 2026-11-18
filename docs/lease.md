@@ -13,6 +13,25 @@ lease status
 lease log --since 2h
 ```
 
+## Jobs run under Bellows
+
+Since 0.3.18 every job runs as `bellows run --machine-state -- COMMAND`, so
+each Cargo build in it uses the compile cache and the machine's one Bellows
+state directory (`BELLOWS_STATE_DIR`, else `~/.cache/bellows`), whichever
+checkout it builds. Builds in a target directory are then either all wrapped
+or deliberately not, rather than wrapped only when a script remembered to
+say so. The job prints Bellows' decisions and its closing summary, and says
+so when `bellowsd` does not answer.
+
+- `--no-bellows` runs the command as given. Only the flag does this: no
+  inherited environment variable can switch the cache off for a queue.
+- A job already inside a Bellows build (a nested `lease run` in a wrapped
+  `lease hold`) is not wrapped again.
+- A step inside a job that must build without the cache sets
+  `RUSTC_WRAPPER=` for that command.
+- With no `bellows` on `PATH`, `lease run` refuses the job before queueing
+  it (exit 75) and says to install Bellows or pass `--no-bellows`.
+
 ## A lease is held by a connection
 
 `lease run` connects to the daemon's Unix socket, waits for its grant, runs the

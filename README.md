@@ -268,7 +268,9 @@ output remains free of styling and safe to pipe into other tools.
 `events` (default) prints one line per cache decision; `summary` prints only
 problems as they happen (fallbacks and corrupt entries) plus each wrapped
 build's closing summary, which suits CI logs; `quiet` prints errors only. Every
-decision is still recorded for `bellows stats` and `bellows explain`.
+decision is still recorded for `bellows stats` and `bellows explain`. The
+command that started the build prints the lines, never the wrappers: a
+wrapper's stderr is saved by Cargo and replayed in later builds.
 Configuration such as `BELLOWS_L1=0` is reported once by `bellows doctor`, never
 as the reason for an individual miss.
 

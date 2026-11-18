@@ -69,6 +69,22 @@ decision, `summary` prints only problems plus each wrapped build's closing line,
 and `quiet` prints errors only. All decisions are recorded regardless. CI logs
 are clearest with `summary` followed by `bellows stats`.
 
+The `bellows cargo`, `local` or `run` that started the build prints these lines,
+following the build's event log as wrappers record decisions. Wrappers print
+nothing themselves: their stderr is the compiler's, which Cargo saves with each
+unit and replays whenever the unit is fresh, so a line written there would
+reappear in every later build of that target directory, wrapped or not.
+(Before 0.3.18 it did, which is how a plain `cargo` build could look cached.)
+Cargo running with `RUSTC_WRAPPER` set directly, as in CI, prints no decisions;
+`bellows explain` reads them from the log.
+
+Two records keep incremental sessions coherent (see
+[local builds](local-builds.md#sessions-follow-the-output-cargo-reads)):
+`session_reset` (an incremental session was removed because it held other
+metadata than the output; recorded only) and `stale_metadata` (`REPAIRED`: an
+output rustc left with an old time and changed bytes was given the current
+time).
+
 `bellows doctor` also inspects the current checkout's Cargo target directory
 (`CARGO_TARGET_DIR`, or `target/` at the git root). It reports packages whose
 build-script `output` or dep-info depends on files in a *different* git

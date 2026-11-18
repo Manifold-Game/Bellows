@@ -121,6 +121,10 @@ key.
   prior state. Edit-loop recompiles that reuse a session are never published,
   so incremental state from one checkout cannot reach another. (Implemented
   with a per-unit session directory; see below.)
+- **Coherence (0.3.18):** a session may hold only metadata that is the
+  output Cargo reads, or the same bytes; restores, plain builds and
+  passthroughs no longer leave a session that would put older metadata back
+  (see [local builds](local-builds.md#sessions-follow-the-output-cargo-reads)).
 
 ## Proc-macro consumers (owner decision, 2026-09-30)
 

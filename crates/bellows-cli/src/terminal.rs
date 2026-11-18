@@ -103,8 +103,9 @@ impl Output {
                     | "single_flight"
                     | "corrupt"
                     | "not_stored"
+                    | "stale_metadata"
             ),
-            Self::Summary => matches!(kind, "fallback" | "corrupt"),
+            Self::Summary => matches!(kind, "fallback" | "corrupt" | "stale_metadata"),
             Self::Quiet => false,
         }
     }
@@ -136,6 +137,8 @@ fn event_label(kind: &str) -> (&'static str, &'static str) {
         "corrupt" | "candidate_rejected" => ("REJECTED", RED),
         "store" => ("STORED", BLUE),
         "not_stored" => ("KEPT LOCAL", CYAN),
+        "session_reset" => ("RESET", CYAN),
+        "stale_metadata" => ("REPAIRED", YELLOW),
         "running" => ("RUNNING", CYAN),
         "published" => ("PUBLISHED", GREEN),
         "restored" => ("RESTORED", GREEN),

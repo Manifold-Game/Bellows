@@ -30,6 +30,20 @@ impl Daemon {
             assert!(Instant::now() < deadline, "leased did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
+        // Jobs run under `bellows run` by default. This stand-in records how
+        // it was called and runs the job itself in its place (`exec`), so
+        // process groups and exit codes are the job's.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let bellows = bin.join("bellows");
+        std::fs::write(
+            &bellows,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_BELLOWS_LOG\"\n\
+             [ \"$1 $2 $3\" = 'run --machine-state --' ] || exit 99\nshift 3\nexec \"$@\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bellows, std::fs::Permissions::from_mode(0o755)).unwrap();
         Self {
             child,
             socket,
@@ -43,15 +57,41 @@ impl Daemon {
         // A test run under `lrun` or `lease hold` inherits that lease
         // (LEASE_ID, LEASE_MACHINE, LEASE_ADVISORY, ...); a client that sees
         // one runs at once as part of it, so these clients would never queue.
+        // Nor may it see the Bellows build the tests run in, if any: a job
+        // inside one is not wrapped again.
         for (name, _) in std::env::vars_os() {
-            if name.to_string_lossy().starts_with("LEASE_") {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("LEASE_")
+                || name_text.starts_with("BELLOWS_")
+                || name_text == "RUSTC_WRAPPER"
+            {
                 command.env_remove(name);
             }
         }
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let path = std::env::join_paths(
+            std::iter::once(self.dir.path().join("bin")).chain(std::env::split_paths(&path)),
+        )
+        .unwrap();
         command
             .env("LEASE_SOCKET", &self.socket)
-            .env("LEASE_STATE_DIR", &self.state);
+            .env("LEASE_STATE_DIR", &self.state)
+            .env("PATH", path)
+            .env("FAKE_BELLOWS_LOG", self.bellows_log());
         command
+    }
+
+    /// Each `bellows` invocation, one line of arguments each.
+    fn bellows_log(&self) -> PathBuf {
+        self.dir.path().join("bellows.log")
+    }
+
+    fn bellows_calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.bellows_log())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 
     fn log(&self) -> String {
@@ -389,6 +429,65 @@ fn wrappers_record_runs_that_skip_the_lease() {
     assert!(
         shown.contains("unleased") && shown.contains("LEASE_MODE=off"),
         "{shown}"
+    );
+}
+
+#[test]
+fn jobs_run_under_bellows_by_default() {
+    let daemon = Daemon::start();
+    let mut client = run_shell(&daemon, "wrapped", "exit 3");
+    assert_eq!(client.wait().unwrap().code(), Some(3));
+    assert_eq!(
+        daemon.bellows_calls(),
+        ["run --machine-state -- sh -c exit 3"]
+    );
+}
+
+#[test]
+fn no_bellows_runs_the_command_as_given() {
+    let daemon = Daemon::start();
+    let status = daemon
+        .lease()
+        .args(["run", "laptop", "--est", "1m", "--label", "plain"])
+        .args(["--no-bellows", "--", "sh", "-c", "exit 4"])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(4));
+    assert!(daemon.bellows_calls().is_empty());
+}
+
+#[test]
+fn a_job_inside_a_bellows_build_is_not_wrapped_again() {
+    let daemon = Daemon::start();
+    let status = daemon
+        .lease()
+        .args(["run", "laptop", "--est", "1m", "--label", "nested"])
+        .args(["--", "sh", "-c", "exit 0"])
+        .env("BELLOWS_SESSION_ID", "outer")
+        .env("RUSTC_WRAPPER", "/usr/bin/bellows")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(daemon.bellows_calls().is_empty());
+}
+
+#[test]
+fn a_job_without_bellows_on_path_is_refused_before_it_queues() {
+    let daemon = Daemon::start();
+    let out = daemon
+        .lease()
+        .args(["run", "laptop", "--est", "1m", "--label", "nowhere"])
+        .args(["--", "true"])
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(75));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--no-bellows"), "{stderr}");
+    assert!(
+        log_events(&daemon, "request").is_empty(),
+        "{}",
+        daemon.log()
     );
 }
 
