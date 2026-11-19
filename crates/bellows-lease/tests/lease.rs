@@ -25,8 +25,13 @@ impl Daemon {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // Ready once it accepts a connection, not once the socket file exists:
+        // bind creates the file before listen, and a client connecting in that
+        // gap is refused and exits EX_TEMPFAIL (75), which failed
+        // an_exit_code_passes_through on a loaded build host (ready 8457). An
+        // empty connection is one the daemon closes at once.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(Instant::now() < deadline, "leased did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
