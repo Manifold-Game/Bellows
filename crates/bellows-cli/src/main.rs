@@ -6472,6 +6472,7 @@ fn link_store() -> Option<PathBuf> {
 }
 
 /// Outputs smaller than this are written, not linked: the copy costs little, and a link shares the file.
+#[cfg(unix)]
 const LINK_MIN_BYTES: u64 = 64 * 1024;
 
 /// The store blob `artifact` can be linked from into `out_dir`, or None:
@@ -6514,6 +6515,7 @@ fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Opti
     }
 }
 
+#[cfg(unix)]
 static LINK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Replace `destination` with a hardlink to `blob`, through a temporary name and a rename (as `atomic_write`). The
