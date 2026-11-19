@@ -96,8 +96,12 @@ fn identity(path: &Path, metadata: &fs::Metadata) -> String {
     digest_bytes(identity_fields(path, metadata).as_bytes())
 }
 
-/// What a memo's key is made of: the path, the length, the modification and creation times, and on Unix the device,
-/// inode and change time. A file replaced in place must change at least one of them.
+/// What a memo's key is made of: the path, the length, the modification and creation times, then on Unix the
+/// device, inode and change time, and on Windows the volume and file id. A file replaced in place must change at
+/// least one of them. Times alone don't: Windows stamps files at clock-tick granularity, so a same-length file
+/// written within one tick of the file it replaces has its times, and a rename into a recently used name can keep
+/// the old creation time (Bellows #49's Windows CI printed identical fields before and after a replacement; main
+/// passed only while the memo write's fsyncs slowed the tests past a tick).
 fn identity_fields(path: &Path, metadata: &fs::Metadata) -> String {
     let nanos = |time: std::io::Result<SystemTime>| {
         time.ok()
@@ -123,6 +127,8 @@ fn identity_fields(path: &Path, metadata: &fs::Metadata) -> String {
             metadata.ctime_nsec()
         ));
     }
+    #[cfg(windows)]
+    fields.push_str(&windows_file_id(path));
     fields
 }
 
@@ -159,6 +165,62 @@ pub fn prune(state_dir: &Path, max_age: Duration) {
             }
         }
     }
+}
+
+/// `\0<volume serial>\0<128-bit file id>` of `path` (GetFileInformationByHandleEx, FileIdInfo): the Windows
+/// equivalent of the device and inode, so a file replaced by rename is told apart from the one it replaced. A file
+/// whose id can't be read gets a field no later read repeats, so its memo is never served.
+#[cfg(windows)]
+fn windows_file_id(path: &Path) -> String {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileIdInfo {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_ID_INFO_CLASS: i32 = 0x12;
+    let id = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .open(path)
+        .ok()
+        .and_then(|file| {
+            let mut info = FileIdInfo::default();
+            // SAFETY: `file` is an open handle and `info` is a FILE_ID_INFO-sized
+            // buffer that outlives the call.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle().cast(),
+                    FILE_ID_INFO_CLASS,
+                    (&mut info as *mut FileIdInfo).cast(),
+                    std::mem::size_of::<FileIdInfo>() as u32,
+                )
+            };
+            (ok != 0).then(|| {
+                format!(
+                    "\0{}\0{}",
+                    info.volume_serial_number,
+                    u128::from_le_bytes(info.file_id)
+                )
+            })
+        });
+    id.unwrap_or_else(|| {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        format!("\0unidentified\0{unique}")
+    })
 }
 
 #[cfg(test)]
@@ -198,6 +260,21 @@ mod tests {
             digest_bytes(&second),
             "the memo served the replaced file's digest; identity before {before:?}, after {after:?}"
         );
+    }
+
+    /// A same-length file renamed over another within the same timestamp tick has a different identity, on every
+    /// platform: nothing here waits, so on Windows only the file id tells the two apart.
+    #[test]
+    fn a_replacement_within_one_tick_has_another_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("same-tick.rlib");
+        fs::write(&file, [1u8; 64]).unwrap();
+        let before = identity_fields(&file, &fs::metadata(&file).unwrap());
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, [2u8; 64]).unwrap();
+        fs::rename(&replacement, &file).unwrap();
+        let after = identity_fields(&file, &fs::metadata(&file).unwrap());
+        assert_ne!(before, after, "a replaced file kept its identity");
     }
 
     #[test]
