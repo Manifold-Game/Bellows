@@ -3556,3 +3556,177 @@ fn a_nested_builds_library_path_keys_the_session_not_its_location() {
         "{other}"
     );
 }
+
+/// Serves the package `dep` 0.1.0 from a local registry at `<temp>/registry`
+/// and makes the fixture's binary depend on it, with line tables so its
+/// library records the directory it was compiled in. Cargo unpacks the
+/// package into the `registry/src` of whichever home it is given, and runs
+/// rustc in the unpacked directory, as for any crates.io package.
+#[cfg(unix)]
+fn depend_on_registry_package(f: &Fixture) {
+    let source = f.temp.path().join("dep-source");
+    write_files(
+        &source,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\ndescription=\"fixture\"\nlicense=\"MIT\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod inner;\npub fn value() -> u32 { inner::value() }\npub fn here() -> &'static str { file!() }\n",
+            ),
+            ("src/inner.rs", "pub fn value() -> u32 { 7 }\n"),
+        ],
+    );
+    checked(f.command("cargo").current_dir(&source).args([
+        "package",
+        "--offline",
+        "--no-verify",
+        "--allow-dirty",
+    ]));
+    let registry = f.temp.path().join("registry");
+    let packaged = registry.join("dep-0.1.0.crate");
+    fs::create_dir_all(registry.join("index/3/d")).unwrap();
+    fs::copy(source.join("target/package/dep-0.1.0.crate"), &packaged).unwrap();
+    let sum = checked(f.command("sha256sum").arg(&packaged));
+    let sum = String::from_utf8(sum.stdout).unwrap();
+    let cksum = sum.split_whitespace().next().unwrap();
+    fs::write(
+        registry.join("index/3/d/dep"),
+        format!(
+            "{{\"name\":\"dep\",\"vers\":\"0.1.0\",\"deps\":[],\"cksum\":\"{cksum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ),
+    )
+    .unwrap();
+    write_files(
+        &f.workspace,
+        &[(
+            ".cargo/config.toml",
+            &format!(
+                "[source.crates-io]\nreplace-with = \"fixture-registry\"\n[source.fixture-registry]\nlocal-registry = \"{}\"\n",
+                registry.display()
+            ),
+        )],
+    );
+    let manifest = f.workspace.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[workspace]",
+            "[dependencies]\ndep = \"0.1.0\"\n[profile.release]\ndebug = \"line-tables-only\"\n[workspace]",
+        ),
+    )
+    .unwrap();
+}
+
+/// The fixture's build with `home` as Cargo's home.
+#[cfg(unix)]
+fn build_in_home(f: &Fixture, home: &Path) -> Output {
+    checked(
+        f.local()
+            .env("CARGO_HOME", home)
+            .args(["cargo", "build", "--release", "--offline"]),
+    )
+}
+
+/// The library Cargo links the fixture's binary with for its dependency `dep`.
+#[cfg(unix)]
+fn dependency_library(f: &Fixture) -> Vec<u8> {
+    let deps = f.workspace.join("target/release/deps");
+    let path = fs::read_dir(&deps)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("libdep-") && name.ends_with(".rlib")
+        })
+        .unwrap();
+    fs::read(path).unwrap()
+}
+
+/// The build host gives each lane a Cargo home of its own, so that lanes stop
+/// waiting on one another's package-cache lock, with its registry and git
+/// directories linked to one shared home. A registry package compiled through
+/// a lane's home is the same compile as through the shared home: one key, and
+/// the same library, embedded paths included, so every lane and the shared
+/// home serve one another.
+#[cfg(unix)]
+#[test]
+fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths() {
+    use std::os::unix::fs::symlink;
+
+    let mut f = Fixture::new(
+        "",
+        "fn main() { println!(\"{} {}\", dep::value(), dep::here()); }",
+    );
+    depend_on_registry_package(&f);
+    let shared = f.temp.path().join("shared-home");
+    let lane = f.temp.path().join("lane-home");
+    let entries = ["registry/index", "registry/cache", "registry/src", "git"];
+    for entry in entries {
+        fs::create_dir_all(shared.join(entry)).unwrap();
+    }
+    fs::create_dir_all(lane.join("registry")).unwrap();
+    for entry in entries {
+        symlink(shared.join(entry), lane.join(entry)).unwrap();
+    }
+    checked(
+        f.command("cargo")
+            .env("CARGO_HOME", &shared)
+            .args(["generate-lockfile", "--offline"]),
+    );
+    let shared_cache = f.temp.path().join("cache-shared");
+    let lane_cache = f.temp.path().join("cache-lane");
+
+    // Each home, with nothing cached, compiles the package itself.
+    f.cache = shared_cache.clone();
+    let cold = build_in_home(&f, &shared);
+    assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"], "{}", stderr(&cold));
+    let value = f.value("target");
+    assert!(
+        value.starts_with("7 /bellows/cargo-home/registry/src/")
+            && value.ends_with("/dep-0.1.0/src/lib.rs"),
+        "{value}"
+    );
+    let library = dependency_library(&f);
+    f.clean();
+    f.cache = lane_cache.clone();
+    let cold = build_in_home(&f, &lane);
+    assert!(
+        !stderr(&cold).contains("symlinked compiler input"),
+        "{}",
+        stderr(&cold)
+    );
+    assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"], "{}", stderr(&cold));
+    assert_eq!(f.value("target"), value);
+    // rustc was given the package through the lane's home.
+    let lane_info = dependency_dep_info(&f);
+    assert!(lane_info.contains(&*lane.to_string_lossy()), "{lane_info}");
+    // Byte for byte the same library: no path in it names the home.
+    assert!(
+        dependency_library(&f) == library,
+        "the lane's library differs from the shared home's"
+    );
+    f.clean();
+
+    // Each is served by the other's result, and runs as if it compiled.
+    f.cache = shared_cache;
+    let warm = build_in_home(&f, &lane);
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    assert_eq!(f.value("target"), value);
+    assert!(dependency_library(&f) == library);
+    // The restored dep-info names the files through the lane's home, as
+    // rustc did, so Cargo watches what the lane reads.
+    assert_eq!(
+        dependency_dep_info(&f).lines().next(),
+        lane_info.lines().next()
+    );
+    f.clean();
+    f.cache = lane_cache;
+    let warm = build_in_home(&f, &shared);
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    assert_eq!(f.value("target"), value);
+    assert!(dependency_library(&f) == library);
+}
