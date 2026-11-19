@@ -70,6 +70,27 @@ fn unserialized(batch: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     batch()
 }
 
+/// A handle that may set `path`'s times and nothing more, so a read-only blob refreshes too.
+/// - Unix: opened read-only. Setting a file's times needs its owner, not write permission (Manifold, 2026-10-28:
+///   blobs a link had left read-only failed every upload that found them, with HTTP 500).
+/// - Windows: opened with FILE_WRITE_ATTRIBUTES only. A read-only handle can't set times (Access is denied, os
+///   error 5, on every publication that found its blob already stored: CI on Bellows #49), and write access fails
+///   on a file with the read-only attribute; the attribute right is granted on both.
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
 impl Store {
     /// Records that a compiler candidate was published or reused. The GC
     /// treats the newest such entry as the candidate's last use.
@@ -77,7 +98,8 @@ impl Store {
         validate_content_key(static_key)?;
         validate_content_key(action_key)?;
         let directory = self.root.join(JOURNAL_DIR);
-        fs::create_dir_all(&directory)?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("create access journal directory {}", directory.display()))?;
         // One short append per line: concurrent writers never interleave
         // within a line, and a torn final line is skipped when read.
         let line = format!("{static_key} {action_key} {}\n", now_ms());
@@ -94,10 +116,10 @@ impl Store {
     /// keeps it for the record about to reference it.
     pub fn touch_blob(&self, digest: &str) -> Result<()> {
         let path = self.blob_path(digest)?;
-        // Opened read-only: setting a file's times needs its owner, not write permission, so a read-only blob refreshes
-        // too (Manifold, 2026-10-28: blobs left read-only failed every upload that found them, with HTTP 500).
-        let file = fs::File::open(&path)?;
-        file.set_modified(SystemTime::now())?;
+        let file =
+            open_for_times(&path).with_context(|| format!("open blob {digest} to refresh it"))?;
+        file.set_modified(SystemTime::now())
+            .with_context(|| format!("refresh blob {digest}"))?;
         Ok(())
     }
 
@@ -1238,6 +1260,65 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The same blob published twice: the second finds it stored, refreshes it and succeeds, on every platform
+    /// (Bellows #49's Windows CI: the refresh's read-only handle could not set its time, os error 5).
+    #[test]
+    fn a_blob_published_twice_is_refreshed_and_accepted() {
+        let fixture = Fixture::new("twice");
+        let payload = vec![5u8; 100];
+        let digest = digest_bytes(&payload);
+        assert!(fixture.store.put_blob(&digest, &payload).unwrap(), "stored");
+        let path = fixture.store.blob_path(&digest).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            !fixture.store.put_blob(&digest, &payload).unwrap(),
+            "already stored, not an error"
+        );
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+    }
+
+    /// A blob with the read-only attribute refreshes too (the Windows side of the read-only case below).
+    #[test]
+    fn a_blob_marked_read_only_still_refreshes() {
+        let fixture = Fixture::new("read-only-attribute");
+        let payload = vec![4u8; 100];
+        let digest = digest_bytes(&payload);
+        fixture.store.put_blob(&digest, &payload).unwrap();
+        let path = fixture.store.blob_path(&digest).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        fixture.store.touch_blob(&digest).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+        assert!(
+            fs::metadata(&path).unwrap().permissions().readonly(),
+            "still read-only"
+        );
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
     }
 
     /// Manifold, 2026-10-28: blobs a link had left read-only failed every upload that found them already stored

@@ -1044,13 +1044,17 @@ impl Store {
             let mut file = fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(&temp)?;
-            file.write_all(bytes)?;
+                .open(&temp)
+                .with_context(|| format!("create {}", temp.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("write {}", temp.display()))?;
             if durable {
-                file.sync_all()?;
+                file.sync_all()
+                    .with_context(|| format!("sync {}", temp.display()))?;
             }
             Ok(())
-        })();
+        })()
+        .with_context(|| format!("write blob {expected}"));
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(error);
@@ -1064,7 +1068,8 @@ impl Store {
     pub fn blob_temp_path(&self, digest: &str) -> Result<PathBuf> {
         let path = self.blob_path(digest)?;
         let parent = path.parent().context("blob path has no parent")?;
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create blob directory {}", parent.display()))?;
         Ok(parent.join(format!(
             ".tmp-{}-{}-{}",
             std::process::id(),
@@ -1097,7 +1102,8 @@ impl Store {
             }
             fs::rename(temp, &path).with_context(|| format!("move blob {expected} into place"))?;
             if durable {
-                sync_parent(&path)?;
+                sync_parent(&path)
+                    .with_context(|| format!("sync the directory of blob {expected}"))?;
             }
             Ok(true)
         });
@@ -1166,7 +1172,9 @@ impl Store {
         max_candidates: usize,
     ) -> Result<()> {
         let path = self.action_path(&candidate.static_key)?;
-        fs::create_dir_all(path.parent().context("action path has no parent")?)?;
+        let parent = path.parent().context("action path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create candidate directory {}", parent.display()))?;
         let mut index = self.read_candidates(&candidate.static_key)?;
         index
             .candidates
@@ -1174,8 +1182,10 @@ impl Store {
         let (static_key, action_key) = (candidate.static_key.clone(), candidate.action_key.clone());
         index.candidates.insert(0, candidate);
         index.candidates.truncate(max_candidates.max(1));
-        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, self.durable())?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, self.durable())
+            .with_context(|| format!("write candidate index {}", path.display()))?;
         self.record_use(&static_key, &action_key)
+            .with_context(|| format!("journal the use of candidate {static_key}/{action_key}"))
     }
 
     pub fn read_declared(&self, key: &str) -> Result<Option<DeclaredActionRecord>> {
@@ -1590,7 +1600,7 @@ pub fn sync_outputs() -> bool {
 /// after it.
 pub fn atomic_write_with(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     let parent = path.parent().context("destination has no parent")?;
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     let tmp = parent.join(format!(
         ".tmp-{}-{}-{}",
         std::process::id(),
@@ -1601,26 +1611,34 @@ pub fn atomic_write_with(path: &Path, bytes: &[u8], durable: bool) -> Result<()>
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
         if durable {
-            file.sync_all()?;
+            file.sync_all()
+                .with_context(|| format!("sync {}", tmp.display()))?;
             note_sync();
         }
     }
+    let replaced = || format!("replace {} with {}", path.display(), tmp.display());
     match fs::rename(&tmp, path) {
-        Ok(()) if durable => sync_parent(path),
+        Ok(()) if durable => {
+            sync_parent(path).with_context(|| format!("sync the directory of {}", path.display()))
+        }
         Ok(()) => Ok(()),
         Err(error) if path.exists() => {
+            let what = replaced();
             let _ = fs::remove_file(&tmp);
             match fs::read(path) {
                 Ok(existing) if existing == bytes => Ok(()),
-                _ => Err(error.into()),
+                _ => Err(anyhow::Error::from(error).context(what)),
             }
         }
         Err(error) => {
+            let what = replaced();
             let _ = fs::remove_file(&tmp);
-            Err(error.into())
+            Err(anyhow::Error::from(error).context(what))
         }
     }
 }

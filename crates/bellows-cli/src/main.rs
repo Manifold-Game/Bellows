@@ -5278,9 +5278,17 @@ pub(crate) fn for_local_store(candidate: &ActionCandidate, identity: &Identity) 
 
 fn cache_captured(store: &Store, captured: &Captured) -> Result<()> {
     for (digest, bytes) in &captured.blobs {
-        store.put_blob(digest, bytes)?;
+        store
+            .put_blob(digest, bytes)
+            .with_context(|| format!("store output blob {digest} ({} bytes)", bytes.len()))?;
     }
-    store.put_candidate(captured.candidate.clone(), 8)?;
+    let candidate = &captured.candidate;
+    store.put_candidate(candidate.clone(), 8).with_context(|| {
+        format!(
+            "store candidate {}/{}",
+            candidate.static_key, candidate.action_key
+        )
+    })?;
     Ok(())
 }
 
