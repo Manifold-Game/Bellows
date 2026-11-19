@@ -93,6 +93,12 @@ fn changed(metadata: &fs::Metadata) -> SystemTime {
 }
 
 fn identity(path: &Path, metadata: &fs::Metadata) -> String {
+    digest_bytes(identity_fields(path, metadata).as_bytes())
+}
+
+/// What a memo's key is made of: the path, the length, the modification and creation times, and on Unix the device,
+/// inode and change time. A file replaced in place must change at least one of them.
+fn identity_fields(path: &Path, metadata: &fs::Metadata) -> String {
     let nanos = |time: std::io::Result<SystemTime>| {
         time.ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -117,7 +123,7 @@ fn identity(path: &Path, metadata: &fs::Metadata) -> String {
             metadata.ctime_nsec()
         ));
     }
-    digest_bytes(fields.as_bytes())
+    fields
 }
 
 /// Remove memo entries not used for `max_age`; called by parent commands.
@@ -174,6 +180,7 @@ mod tests {
             .set_modified(old)
             .unwrap();
         assert_eq!(digests.file(&file).unwrap(), digest_bytes(&first));
+        let before = identity_fields(&file, &fs::metadata(&file).unwrap());
         // Same length, restored mtime: inode/ctime (or creation time) differ.
         let second = vec![2u8; SMALL as usize + 1];
         let replacement = temp.path().join("replacement");
@@ -185,7 +192,12 @@ mod tests {
             .set_modified(old)
             .unwrap();
         fs::rename(&replacement, &file).unwrap();
-        assert_eq!(digests.file(&file).unwrap(), digest_bytes(&second));
+        let after = identity_fields(&file, &fs::metadata(&file).unwrap());
+        assert_eq!(
+            digests.file(&file).unwrap(),
+            digest_bytes(&second),
+            "the memo served the replaced file's digest; identity before {before:?}, after {after:?}"
+        );
     }
 
     #[test]
@@ -197,10 +209,16 @@ mod tests {
         fs::write(&file, &bytes).unwrap();
         digests.remember(&file, &digest_bytes(&bytes));
         assert_eq!(digests.file(&file).unwrap(), digest_bytes(&bytes));
+        let before = identity_fields(&file, &fs::metadata(&file).unwrap());
         let other = vec![8u8; SMALL as usize + 1];
         let replacement = temp.path().join("replacement");
         fs::write(&replacement, &other).unwrap();
         fs::rename(&replacement, &file).unwrap();
-        assert_eq!(digests.file(&file).unwrap(), digest_bytes(&other));
+        let after = identity_fields(&file, &fs::metadata(&file).unwrap());
+        assert_eq!(
+            digests.file(&file).unwrap(),
+            digest_bytes(&other),
+            "the remembered digest outlived its file; identity before {before:?}, after {after:?}"
+        );
     }
 }
