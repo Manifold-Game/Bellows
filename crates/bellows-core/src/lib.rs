@@ -1124,7 +1124,7 @@ impl Store {
     /// resident. Returns the blob's size.
     pub fn verify_blob(&self, digest: &str) -> Result<u64> {
         let path = self.blob_path(digest)?;
-        let mut file = File::open(&path).with_context(|| format!("read blob {digest}"))?;
+        let mut file = std::fs::File::open(&path).with_context(|| format!("read blob {digest}"))?;
         let mut hasher = blake3::Hasher::new();
         let size =
             std::io::copy(&mut file, &mut hasher).with_context(|| format!("read blob {digest}"))?;
