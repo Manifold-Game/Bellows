@@ -38,6 +38,7 @@ impl Fixture {
                 cmd.env_remove(name);
             }
         }
+        cmd.env("CARGO_HOME", fixture_cargo_home());
         cmd.env("BELLOWS_COLOR", "never");
         cmd
     }
@@ -106,11 +107,11 @@ impl Fixture {
 }
 /// Whether a fixture's commands inherit a variable of the test process. The
 /// build under test must not see the Bellows, Cargo and rustc settings of the
-/// build that runs the tests, with two exceptions: `CARGO_HOME`, and the
-/// marks of a build scheduler in front of Cargo (cargo-hold's `CARGO_HOLD_*`).
-/// Those say that this process already runs inside a hold; without them a
-/// fixture's Cargo waits for the hold its own `cargo test` holds. No cache
-/// key covers them.
+/// build that runs the tests, with one exception: the marks of a build
+/// scheduler in front of Cargo (cargo-hold's `CARGO_HOLD_*`). Those say that
+/// this process already runs inside a hold; without them a fixture's Cargo
+/// waits for the hold its own `cargo test` holds. No cache key covers them.
+/// `CARGO_HOME` is not inherited either: fixtures get fixture_cargo_home.
 fn inherited(name: &str) -> bool {
     let from_the_outer_build = name.starts_with("BELLOWS_")
         || name.starts_with("CARGO_")
@@ -118,8 +119,27 @@ fn inherited(name: &str) -> bool {
             name,
             "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTC"
         );
-    // Keep CARGO_HOME for the installed toolchain's normal lookup.
-    !from_the_outer_build || name == "CARGO_HOME" || name.starts_with("CARGO_HOLD_")
+    !from_the_outer_build || name.starts_with("CARGO_HOLD_")
+}
+
+/// The `CARGO_HOME` of every fixture command: an empty one, shared by the
+/// fixtures of this test run. A fixture's Cargo reads the configuration in its
+/// home, and the home of the machine that runs the tests can hold settings the
+/// build under test must not see: the build host's sets `BELLOWS_L1 = "0"`
+/// under `[env]`, which turned the fixtures' local store off and failed every
+/// test that expects a local hit (ready 8335, 2026-11-19). The fixtures depend
+/// only on path crates and build offline, so they need nothing from a real
+/// home. The toolchain is found as before, through `PATH` and `RUSTUP_HOME`.
+fn fixture_cargo_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fixture-cargo-home");
+        fs::create_dir_all(&home).unwrap();
+        for config in ["config.toml", "config", "credentials.toml", "credentials"] {
+            let _ = fs::remove_file(home.join(config));
+        }
+        home
+    })
 }
 
 #[test]
@@ -127,6 +147,7 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     for name in [
         "BELLOWS_STATE_DIR",
         "BELLOWS_MAX_MB",
+        "CARGO_HOME",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_JOBS",
         "CARGO_MANIFEST_DIR",
@@ -135,13 +156,7 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     ] {
         assert!(!inherited(name), "{name}");
     }
-    for name in [
-        "PATH",
-        "HOME",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "RUSTUP_TOOLCHAIN",
-    ] {
+    for name in ["PATH", "HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         assert!(inherited(name), "{name}");
     }
     // A scheduler in front of Cargo (cargo-hold) marks everything inside a
@@ -149,6 +164,35 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     // `cargo test` that is running it, and never starts.
     for name in ["CARGO_HOLD_ACTIVE", "CARGO_HOLD_LABEL", "CARGO_HOLD_SKIP"] {
         assert!(inherited(name), "{name}");
+    }
+}
+
+#[test]
+fn fixtures_read_no_cargo_configuration_of_the_machine_running_the_tests() {
+    // The home of the machine that runs the tests may set `[env]` values for
+    // Bellows (the build host's turns the local store off); a fixture's Cargo
+    // must not apply them to the build under test.
+    let home = fixture_cargo_home();
+    assert!(
+        home.starts_with(env!("CARGO_TARGET_TMPDIR")),
+        "{}",
+        home.display()
+    );
+    for config in ["config.toml", "config"] {
+        assert!(
+            !home.join(config).exists(),
+            "{}",
+            home.join(config).display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let f = Fixture::new("pub fn value() -> u32 { 1 }", "fn main() {}");
+        let seen = checked(f.command("sh").args(["-c", "printf %s \"$CARGO_HOME\""]));
+        assert_eq!(
+            String::from_utf8(seen.stdout).unwrap(),
+            home.to_string_lossy()
+        );
     }
 }
 
