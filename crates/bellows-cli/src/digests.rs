@@ -64,6 +64,24 @@ impl Digests {
     /// it verified, so downstream link validation in a fresh checkout does
     /// not rehash every restored rlib. The memo is keyed on the identity
     /// observed after the write; any later rewrite changes it.
+    ///
+    /// Unlike [`Digests::file`], this memoizes a file written moments ago, with
+    /// no settle window, so a rewrite of the same length that keeps every
+    /// identity field would be served this digest. Two things rule that out:
+    /// - Nothing else writes the file within its timestamp granularity. Every
+    ///   caller runs inside the wrapper process of the unit that owns the path,
+    ///   while Cargo waits for that wrapper: Bellows wrote the file itself (a
+    ///   restore) or its rustc child has exited and Bellows just read the bytes
+    ///   (a capture). The next writer of the path is a later rustc for the same
+    ///   unit, which starts only after this wrapper exits and Cargo schedules
+    ///   the unit again, and writes its outputs at the end of a compilation:
+    ///   far longer than a Windows clock tick (at most 15.6 ms), and with a
+    ///   new change time and file id on Unix and Windows alike.
+    /// - A filesystem whose timestamps are coarser than that (whole seconds:
+    ///   FAT and exFAT, some FUSE, NFS and SMB mounts) could still keep every
+    ///   field across a later rewrite within its granularity, and may report
+    ///   reused inode numbers. On such a file this records nothing
+    ///   ([`fine_grained`]), and `file` memoizes it once it has settled.
     pub fn remember(&self, path: &Path, digest: &str) {
         let Some(root) = &self.root else {
             return;
@@ -71,7 +89,10 @@ impl Digests {
         let Ok(metadata) = fs::metadata(path) else {
             return;
         };
-        if metadata.len() < SMALL || validate_content_key(digest).is_err() {
+        if metadata.len() < SMALL
+            || validate_content_key(digest).is_err()
+            || !fine_grained(&metadata)
+        {
             return;
         }
         let key = identity(path, &metadata);
@@ -94,6 +115,25 @@ fn changed(metadata: &fs::Metadata) -> SystemTime {
 
 fn identity(path: &Path, metadata: &fs::Metadata) -> String {
     digest_bytes(identity_fields(path, metadata).as_bytes())
+}
+
+/// Whether `metadata`'s timestamps carry sub-second precision: a modification
+/// time with a fractional second, and on Unix a change time with one too. A
+/// filesystem that stamps whole seconds (FAT, exFAT, some network and FUSE
+/// mounts) gives neither; a fine-grained one gives a whole second about once
+/// in a billion writes, which only skips that memo.
+fn fine_grained(metadata: &fs::Metadata) -> bool {
+    let fractional = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .is_some_and(|since| since.subsec_nanos() != 0);
+    #[cfg(unix)]
+    let fractional = fractional && {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ctime_nsec() != 0
+    };
+    fractional
 }
 
 /// What a memo's key is made of: the path, the length, the modification and creation times, then on Unix the
@@ -260,6 +300,59 @@ mod tests {
             digest_bytes(&second),
             "the memo served the replaced file's digest; identity before {before:?}, after {after:?}"
         );
+    }
+
+    /// The memo files under `root`, at any depth.
+    fn memo_count(root: &Path) -> usize {
+        let Ok(entries) = fs::read_dir(root) else {
+            return 0;
+        };
+        entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() { memo_count(&path) } else { 1 }
+            })
+            .sum()
+    }
+
+    /// A file stamped in whole seconds, as a coarse filesystem stamps every
+    /// file, is never remembered: a rewrite within that second could keep its
+    /// identity. A finely stamped one is.
+    #[test]
+    fn remember_skips_a_file_stamped_in_whole_seconds() {
+        let temp = tempfile::tempdir().unwrap();
+        let memos = temp.path().join("memos");
+        let digests = Digests::new(&memos);
+        let bytes = vec![3u8; SMALL as usize + 1];
+        let coarse = temp.path().join("coarse.rlib");
+        fs::write(&coarse, &bytes).unwrap();
+        let whole = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&coarse)
+            .unwrap()
+            .set_modified(whole)
+            .unwrap();
+        assert!(!fine_grained(&fs::metadata(&coarse).unwrap()));
+        digests.remember(&coarse, &digest_bytes(&bytes));
+        assert_eq!(
+            memo_count(&memos),
+            0,
+            "a whole-second stamp is not remembered"
+        );
+        let fine = temp.path().join("fine.rlib");
+        fs::write(&fine, &bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&fine)
+            .unwrap()
+            .set_modified(whole + Duration::from_nanos(123_400))
+            .unwrap();
+        assert!(fine_grained(&fs::metadata(&fine).unwrap()));
+        digests.remember(&fine, &digest_bytes(&bytes));
+        assert_eq!(memo_count(&memos), 1, "a fine stamp is remembered");
+        assert_eq!(digests.file(&fine).unwrap(), digest_bytes(&bytes));
     }
 
     /// A same-length file renamed over another within the same timestamp tick has a different identity, on every
