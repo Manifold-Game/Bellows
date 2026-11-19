@@ -3791,11 +3791,13 @@ fn is_relevant_environment_name(name: &str) -> bool {
     // started in, so keying it gave every checkout folder a cache of its own.
     const EXCLUDED_CARGO_CONTROL: &[&str] = &[
         "CARGO_BUILD_JOBS",
+        "CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY",
         "CARGO_HOLD_ACTIVE",
         "CARGO_HOLD_LABEL",
         "CARGO_HOLD_SKIP",
         "CARGO_HTTP_DEBUG",
         "CARGO_INCREMENTAL",
+        "CARGO_INSTALL_ROOT",
         "CARGO_LOG",
         "CARGO_LOG_PROFILE",
         "CARGO_LOG_PROFILE_CAPTURE",
@@ -3824,6 +3826,21 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
     ];
+    // Whole families of Cargo's own settings that steer how Cargo fetches, talks to registries, prints or caches,
+    // and never reach rustc's output: the sources they fetch are hashed as inputs anyway. Keyed, a lane that builds
+    // offline (CARGO_NET_OFFLINE, Manifold's build host, 2026-11-19) or behind a proxy split every unit from the
+    // same unit elsewhere, and a registry token would have entered a key's hash.
+    const EXCLUDED_CARGO_CONTROL_PREFIXES: &[&str] = &[
+        "CARGO_ALIAS_",
+        "CARGO_CACHE_",
+        "CARGO_CARGO_NEW_",
+        "CARGO_GC_",
+        "CARGO_HTTP_",
+        "CARGO_NET_",
+        "CARGO_REGISTRIES_",
+        "CARGO_REGISTRY_",
+        "CARGO_TERM_",
+    ];
     const PREFIXES: &[&str] = &[
         "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
         "LDFLAGS", "RUST",
@@ -3840,6 +3857,9 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     !BELLOWS_CONTROL.contains(&name)
         && !EXCLUDED_CARGO_CONTROL.contains(&name)
+        && !EXCLUDED_CARGO_CONTROL_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
         && (EXACT_ENVIRONMENT.contains(&name)
             || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
 }
@@ -8865,6 +8885,44 @@ release: 1.92.0
         assert!(!is_relevant_environment_name(
             "CARGO_NET_GIT_FETCH_WITH_CLI"
         ));
+        // How Cargo fetches, talks to registries, prints and caches never keys a unit: an offline lane, a proxy
+        // or a registry token must not split a cache (Manifold's build host, 2026-11-19).
+        for control in [
+            "CARGO_NET_OFFLINE",
+            "CARGO_NET_RETRY",
+            "CARGO_NET_SSH_KNOWN_HOSTS",
+            "CARGO_HTTP_PROXY",
+            "CARGO_HTTP_TIMEOUT",
+            "CARGO_HTTP_MULTIPLEXING",
+            "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_TERM_UNICODE",
+            "CARGO_TERM_HYPERLINKS",
+            "CARGO_CACHE_AUTO_CLEAN_FREQUENCY",
+            "CARGO_GC_AUTO_FREQUENCY",
+            "CARGO_ALIAS_B",
+            "CARGO_CARGO_NEW_VCS",
+            "CARGO_INSTALL_ROOT",
+            "CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY",
+        ] {
+            assert!(
+                !is_relevant_environment_name(control),
+                "{control} never reaches rustc"
+            );
+        }
+        // Cargo's settings that do reach rustc's output, and the variables Cargo sets for a crate, stay keyed.
+        for keyed in [
+            "CARGO_PKG_VERSION",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_CRATE_NAME",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_CFG_TARGET_OS",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+            "CARGO_HOME",
+            "CARGO_UNSTABLE_BUILD_STD",
+        ] {
+            assert!(is_relevant_environment_name(keyed), "{keyed} stays keyed");
+        }
         // What changes rustc's output stays in the key: flags (lints included, since a cached result replays its
         // diagnostics) and profile settings (a build-script run's key; a compile keys the arguments Cargo derives
         // from them, see without_shell).
