@@ -3646,22 +3646,77 @@ fn dependency_library(f: &Fixture) -> Vec<u8> {
     fs::read(path).unwrap()
 }
 
+/// Makes the fixture's binary depend on the package `dep` from a git
+/// repository at `<temp>/dep-repo`, with line tables as in
+/// `depend_on_registry_package`. The package sits in the repository's `dep`
+/// directory and reads a file beside it, outside its own directory, so its
+/// compile reads a file of the git checkout that only Cargo's home holds.
+#[cfg(unix)]
+fn depend_on_git_package(f: &Fixture) {
+    let repository = f.temp.path().join("dep-repo");
+    write_files(
+        &repository,
+        &[
+            (
+                "dep/Cargo.toml",
+                "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            (
+                "dep/src/lib.rs",
+                "pub fn value() -> u32 { include_str!(\"../../value.txt\").trim().parse().unwrap() }\npub fn here() -> &'static str { file!() }\n",
+            ),
+            ("value.txt", "7\n"),
+        ],
+    );
+    let git = |args: &[&str]| {
+        checked(
+            f.command("git")
+                .current_dir(&repository)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    let manifest = f.workspace.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[workspace]",
+            &format!(
+                "[dependencies]\ndep = {{ git = \"file://{}\" }}\n[profile.release]\ndebug = \"line-tables-only\"\n[workspace]",
+                repository.display()
+            ),
+        ),
+    )
+    .unwrap();
+}
+
 /// The build host gives each lane a Cargo home of its own, so that lanes stop
 /// waiting on one another's package-cache lock, with its registry and git
-/// directories linked to one shared home. A registry package compiled through
-/// a lane's home is the same compile as through the shared home: one key, and
-/// the same library, embedded paths included, so every lane and the shared
-/// home serve one another.
+/// directories linked to one shared home. A package that only Cargo's home
+/// holds (`dep`, set up by `depend`) compiled through a lane's home is the
+/// same compile as through the shared home: one key, and the same library,
+/// embedded paths included, so every lane and the shared home serve one
+/// another. `here` is the start and end of the path `dep::here()` reports.
 #[cfg(unix)]
-#[test]
-fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths() {
+fn homes_serve_each_other(depend: fn(&Fixture), here: (&str, &str)) {
     use std::os::unix::fs::symlink;
 
     let mut f = Fixture::new(
         "",
         "fn main() { println!(\"{} {}\", dep::value(), dep::here()); }",
     );
-    depend_on_registry_package(&f);
+    depend(&f);
     let shared = f.temp.path().join("shared-home");
     let lane = f.temp.path().join("lane-home");
     let entries = ["registry/index", "registry/cache", "registry/src", "git"];
@@ -3672,10 +3727,12 @@ fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths(
     for entry in entries {
         symlink(shared.join(entry), lane.join(entry)).unwrap();
     }
+    // A git dependency is fetched (from a local repository) into the shared
+    // home here; a registry one is read from its local registry.
     checked(
         f.command("cargo")
             .env("CARGO_HOME", &shared)
-            .args(["generate-lockfile", "--offline"]),
+            .args(["generate-lockfile"]),
     );
     let shared_cache = f.temp.path().join("cache-shared");
     let lane_cache = f.temp.path().join("cache-lane");
@@ -3686,11 +3743,15 @@ fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths(
     assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"], "{}", stderr(&cold));
     let value = f.value("target");
     assert!(
-        value.starts_with("7 /bellows/cargo-home/registry/src/")
-            && value.ends_with("/dep-0.1.0/src/lib.rs"),
+        value.starts_with(&format!("7 {}", here.0)) && value.ends_with(here.1),
         "{value}"
     );
     let library = dependency_library(&f);
+    let shared_info = dependency_dep_info(&f);
+    assert!(
+        shared_info.contains(&*shared.to_string_lossy()),
+        "{shared_info}"
+    );
     f.clean();
     f.cache = lane_cache.clone();
     let cold = build_in_home(&f, &lane);
@@ -3711,14 +3772,14 @@ fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths(
     );
     f.clean();
 
-    // Each is served by the other's result, and runs as if it compiled.
+    // Each is served by the other's result, and runs as if it compiled. The
+    // restored dep-info names the files as rustc named them in that home, so
+    // Cargo watches what that home reads.
     f.cache = shared_cache;
     let warm = build_in_home(&f, &lane);
     assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
     assert_eq!(f.value("target"), value);
     assert!(dependency_library(&f) == library);
-    // The restored dep-info names the files through the lane's home, as
-    // rustc did, so Cargo watches what the lane reads.
     assert_eq!(
         dependency_dep_info(&f).lines().next(),
         lane_info.lines().next()
@@ -3729,4 +3790,29 @@ fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths(
     assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
     assert_eq!(f.value("target"), value);
     assert!(dependency_library(&f) == library);
+    assert_eq!(
+        dependency_dep_info(&f).lines().next(),
+        shared_info.lines().next()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths() {
+    homes_serve_each_other(
+        depend_on_registry_package,
+        ("/bellows/cargo-home/registry/src/", "/dep-0.1.0/src/lib.rs"),
+    );
+}
+
+/// A git dependency's checkout has a `.git` of its own: through either home
+/// it is Cargo's, never the compile's checkout, and the file it reads beside
+/// the package is named under `$CARGO_HOME` both ways.
+#[cfg(unix)]
+#[test]
+fn a_lane_home_linked_to_the_shared_git_checkouts_shares_their_results_and_paths() {
+    homes_serve_each_other(
+        depend_on_git_package,
+        ("/bellows/cargo-home/git/checkouts/", "/dep/src/lib.rs"),
+    );
 }
