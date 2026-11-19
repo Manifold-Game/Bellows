@@ -363,7 +363,7 @@ async fn head_blob(
             return Err(ApiError(StatusCode::NOT_FOUND, "blob not found".into()));
         }
         // A corrupt blob reads as absent, so the client uploads a good copy.
-        if store.read_blob(&digest).is_err() {
+        if store.verify_blob(&digest).is_err() {
             return Err(ApiError(StatusCode::NOT_FOUND, "blob is corrupt".into()));
         }
         store.touch_blob(&digest).map_err(internal)?;
@@ -388,7 +388,7 @@ async fn put_blob(
         .store
         .blob_temp_path(&digest)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let received = receive_blob(&temp, body, state.max_blob_bytes).await;
+    let received = receive_blob(&temp, body, state.max_blob_bytes, state.store.durable()).await;
     let actual = match received {
         Ok(actual) => actual,
         Err(error) => {
@@ -416,7 +416,7 @@ async fn put_blob(
 }
 
 /// Writes `body` to `temp`, synced, and returns its digest.
-async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String> {
+async fn receive_blob(temp: &FsPath, body: Body, limit: u64, durable: bool) -> ApiResult<String> {
     let mut file = tokio::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -439,7 +439,9 @@ async fn receive_blob(temp: &FsPath, body: Body, limit: u64) -> ApiResult<String
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(internal)?;
     }
-    file.sync_all().await.map_err(internal)?;
+    if durable {
+        file.sync_all().await.map_err(internal)?; // skipped while the store isn't durable (Store::durable)
+    }
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -488,7 +490,7 @@ fn store_candidate(state: &AppState, mut candidate: ActionCandidate) -> ApiResul
     validate_candidate_manifest(&candidate)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     for artifact in &candidate.artifacts {
-        state.store.read_blob(&artifact.digest).map_err(|_| {
+        state.store.verify_blob(&artifact.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("referenced blob {} is absent or corrupt", artifact.digest),
@@ -612,7 +614,7 @@ async fn put_archive(
     for file in &manifest.files {
         validate_relative_path(&file.file_name)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-        state.store.read_blob(&file.digest).map_err(|_| {
+        state.store.verify_blob(&file.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("archive blob {} is absent or corrupt", file.digest),
@@ -720,6 +722,7 @@ async fn gc(
         // A server holds other machines' records: whether a client's
         // checkout exists is not something it can look up.
         evict_missing_checkouts: false,
+        drop: request.drop,
     };
     collect(&state, options).await.map(Json).map_err(internal)
 }
@@ -786,7 +789,7 @@ fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiRe
     for artifact in record.inputs.iter().chain(&record.outputs) {
         validate_relative_path(&artifact.file_name)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
-        store.read_blob(&artifact.digest).map_err(|_| {
+        store.verify_blob(&artifact.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("record blob {} is absent or corrupt", artifact.digest),

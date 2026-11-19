@@ -38,6 +38,7 @@ impl Fixture {
                 cmd.env_remove(name);
             }
         }
+        cmd.env("CARGO_HOME", fixture_cargo_home());
         cmd.env("BELLOWS_COLOR", "never");
         cmd
     }
@@ -106,11 +107,11 @@ impl Fixture {
 }
 /// Whether a fixture's commands inherit a variable of the test process. The
 /// build under test must not see the Bellows, Cargo and rustc settings of the
-/// build that runs the tests, with two exceptions: `CARGO_HOME`, and the
-/// marks of a build scheduler in front of Cargo (cargo-hold's `CARGO_HOLD_*`).
-/// Those say that this process already runs inside a hold; without them a
-/// fixture's Cargo waits for the hold its own `cargo test` holds. No cache
-/// key covers them.
+/// build that runs the tests, with one exception: the marks of a build
+/// scheduler in front of Cargo (cargo-hold's `CARGO_HOLD_*`). Those say that
+/// this process already runs inside a hold; without them a fixture's Cargo
+/// waits for the hold its own `cargo test` holds. No cache key covers them.
+/// `CARGO_HOME` is not inherited either: fixtures get fixture_cargo_home.
 fn inherited(name: &str) -> bool {
     let from_the_outer_build = name.starts_with("BELLOWS_")
         || name.starts_with("CARGO_")
@@ -118,8 +119,27 @@ fn inherited(name: &str) -> bool {
             name,
             "RUSTC_WRAPPER" | "RUSTC_WORKSPACE_WRAPPER" | "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTC"
         );
-    // Keep CARGO_HOME for the installed toolchain's normal lookup.
-    !from_the_outer_build || name == "CARGO_HOME" || name.starts_with("CARGO_HOLD_")
+    !from_the_outer_build || name.starts_with("CARGO_HOLD_")
+}
+
+/// The `CARGO_HOME` of every fixture command: an empty one, shared by the
+/// fixtures of this test run. A fixture's Cargo reads the configuration in its
+/// home, and the home of the machine that runs the tests can hold settings the
+/// build under test must not see: the build host's sets `BELLOWS_L1 = "0"`
+/// under `[env]`, which turned the fixtures' local store off and failed every
+/// test that expects a local hit (ready 8335, 2026-11-19). The fixtures depend
+/// only on path crates and build offline, so they need nothing from a real
+/// home. The toolchain is found as before, through `PATH` and `RUSTUP_HOME`.
+fn fixture_cargo_home() -> &'static Path {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fixture-cargo-home");
+        fs::create_dir_all(&home).unwrap();
+        for config in ["config.toml", "config", "credentials.toml", "credentials"] {
+            let _ = fs::remove_file(home.join(config));
+        }
+        home
+    })
 }
 
 #[test]
@@ -127,6 +147,7 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     for name in [
         "BELLOWS_STATE_DIR",
         "BELLOWS_MAX_MB",
+        "CARGO_HOME",
         "CARGO_TARGET_DIR",
         "CARGO_BUILD_JOBS",
         "CARGO_MANIFEST_DIR",
@@ -135,13 +156,7 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     ] {
         assert!(!inherited(name), "{name}");
     }
-    for name in [
-        "PATH",
-        "HOME",
-        "CARGO_HOME",
-        "RUSTUP_HOME",
-        "RUSTUP_TOOLCHAIN",
-    ] {
+    for name in ["PATH", "HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
         assert!(inherited(name), "{name}");
     }
     // A scheduler in front of Cargo (cargo-hold) marks everything inside a
@@ -149,6 +164,35 @@ fn fixtures_shed_the_outer_build_but_keep_what_a_nested_cargo_needs() {
     // `cargo test` that is running it, and never starts.
     for name in ["CARGO_HOLD_ACTIVE", "CARGO_HOLD_LABEL", "CARGO_HOLD_SKIP"] {
         assert!(inherited(name), "{name}");
+    }
+}
+
+#[test]
+fn fixtures_read_no_cargo_configuration_of_the_machine_running_the_tests() {
+    // The home of the machine that runs the tests may set `[env]` values for
+    // Bellows (the build host's turns the local store off); a fixture's Cargo
+    // must not apply them to the build under test.
+    let home = fixture_cargo_home();
+    assert!(
+        home.starts_with(env!("CARGO_TARGET_TMPDIR")),
+        "{}",
+        home.display()
+    );
+    for config in ["config.toml", "config"] {
+        assert!(
+            !home.join(config).exists(),
+            "{}",
+            home.join(config).display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        let f = Fixture::new("pub fn value() -> u32 { 1 }", "fn main() {}");
+        let seen = checked(f.command("sh").args(["-c", "printf %s \"$CARGO_HOME\""]));
+        assert_eq!(
+            String::from_utf8(seen.stdout).unwrap(),
+            home.to_string_lossy()
+        );
     }
 }
 
@@ -164,6 +208,32 @@ fn checked(command: &mut Command) -> Output {
 }
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+/// Whether `log` names one of the wrapper's virtual roots (`/bellows/checkout`, `/bellows/target`, ...). A real path
+/// that only has a `bellows` directory in it (a checkout under `.../buildhost/bellows/lanes/...`) doesn't count.
+fn names_a_virtual_root(log: &str) -> bool {
+    ["cargo-home", "checkout", "workspace", "target", "profile"]
+        .iter()
+        .any(|root| {
+            let virtual_root = format!("/bellows/{root}");
+            log.match_indices(&virtual_root).any(|(at, _)| {
+                !log[..at].ends_with(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            })
+        })
+}
+
+#[test]
+fn virtual_roots_are_told_apart_from_real_bellows_directories() {
+    assert!(names_a_virtual_root(
+        " --> /bellows/checkout/ui/warn.rs:1:17"
+    ));
+    assert!(names_a_virtual_root(
+        "\"file_name\":\"/bellows/target/out/gen.rs\""
+    ));
+    assert!(!names_a_virtual_root(
+        "RUNNING local  /home/builder/buildhost/bellows/lanes/x/target/debug/bellows rustc /tmp/w/ui/warn.rs"
+    ));
+    assert!(!names_a_virtual_root(" --> /tmp/x/bellows/target/warn.rs"));
 }
 
 #[test]
@@ -1343,6 +1413,46 @@ fn incremental_compiles_publish_only_from_scratch_sessions() {
 }
 
 #[test]
+fn an_incremental_result_and_a_non_incremental_one_never_stand_in_for_each_other() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 1 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let build = |f: &Fixture, incremental: &str| {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--offline"])
+                .env("CARGO_INCREMENTAL", incremental),
+        )
+    };
+    // A from-scratch incremental compile is stored ...
+    build(&f, "1");
+    // ... but a non-incremental build of the same sources elsewhere does not
+    // restore it, and stores its own result.
+    second_checkout(&mut f, "non-incremental checkout");
+    let plain = build(&f, "0");
+    assert!(
+        !decisions(&plain, "fixture")
+            .iter()
+            .any(|d| d.contains("HIT")),
+        "{}",
+        stderr(&plain)
+    );
+    // Each kind restores its own kind.
+    second_checkout(&mut f, "third checkout");
+    assert_eq!(
+        decisions(&build(&f, "0"), "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"]
+    );
+    second_checkout(&mut f, "fourth checkout");
+    assert_eq!(
+        decisions(&build(&f, "1"), "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"]
+    );
+}
+
+#[test]
 fn proc_macro_consumers_share_across_checkouts() {
     let mut f = Fixture::new(
         "pub fn value() -> u32 { derive::answer!() }",
@@ -1967,7 +2077,7 @@ fn diagnostics_show_real_paths_for_snapshot_tests() {
         let log = stderr(&output);
         assert!(output.status.success(), "{log}");
         assert!(log.contains(&expected), "{attempt}: {log}");
-        assert!(!log.contains("/bellows/"), "{attempt}: {log}");
+        assert!(!names_a_virtual_root(&log), "{attempt}: {log}");
         fs::remove_dir_all(f.workspace.join("out")).unwrap();
     }
     let failing = f.workspace.join("ui/fail.rs");
@@ -1976,7 +2086,7 @@ fn diagnostics_show_real_paths_for_snapshot_tests() {
     assert!(!output.status.success());
     let log = stderr(&output);
     assert!(log.contains(&format!("{}", failing.display())), "{log}");
-    assert!(!log.contains("/bellows/"), "{log}");
+    assert!(!names_a_virtual_root(&log), "{log}");
 }
 
 #[test]
@@ -2094,7 +2204,7 @@ fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
         diagnostic(&cached).contains("pub fn register<S: Side>()"),
         "{log}"
     );
-    assert!(!log.contains("/bellows/"), "{log}");
+    assert!(!names_a_virtual_root(&log), "{log}");
 }
 
 #[test]
@@ -2158,7 +2268,7 @@ fn diagnostics_quote_checkout_sources_from_a_project_outside_the_checkout() {
         "{log}"
     );
     assert!(
-        !log.contains("/bellows/") && !log.contains("trybuild/ui/engine"),
+        !names_a_virtual_root(&log) && !log.contains("trybuild/ui/engine"),
         "{log}"
     );
 }

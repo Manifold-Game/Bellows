@@ -57,6 +57,10 @@ pub struct GcOptions {
     /// store on the machine whose checkouts its candidates name, so a local
     /// collection sets it and a server's never does.
     pub evict_missing_checkouts: bool,
+    /// Evict these compiler candidates whatever the budget, each named
+    /// `<static key>/<action key>`: a result that must not be served again,
+    /// such as one published under a key that did not describe it.
+    pub drop: Vec<String>,
 }
 
 /// Runs each batch of mutations; a server wraps them in its own write lock.
@@ -66,6 +70,27 @@ fn unserialized(batch: &mut dyn FnMut() -> Result<()>) -> Result<()> {
     batch()
 }
 
+/// A handle that may set `path`'s times and nothing more, so a read-only blob refreshes too.
+/// - Unix: opened read-only. Setting a file's times needs its owner, not write permission (Manifold, 2026-10-28:
+///   blobs a link had left read-only failed every upload that found them, with HTTP 500).
+/// - Windows: opened with FILE_WRITE_ATTRIBUTES only. A read-only handle can't set times (Access is denied, os
+///   error 5, on every publication that found its blob already stored: CI on Bellows #49), and write access fails
+///   on a file with the read-only attribute; the attribute right is granted on both.
+fn open_for_times(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::File::open(path)
+    }
+}
+
 impl Store {
     /// Records that a compiler candidate was published or reused. The GC
     /// treats the newest such entry as the candidate's last use.
@@ -73,7 +98,8 @@ impl Store {
         validate_content_key(static_key)?;
         validate_content_key(action_key)?;
         let directory = self.root.join(JOURNAL_DIR);
-        fs::create_dir_all(&directory)?;
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("create access journal directory {}", directory.display()))?;
         // One short append per line: concurrent writers never interleave
         // within a line, and a torn final line is skipped when read.
         let line = format!("{static_key} {action_key} {}\n", now_ms());
@@ -90,8 +116,10 @@ impl Store {
     /// keeps it for the record about to reference it.
     pub fn touch_blob(&self, digest: &str) -> Result<()> {
         let path = self.blob_path(digest)?;
-        let file = fs::OpenOptions::new().append(true).open(&path)?;
-        file.set_modified(SystemTime::now())?;
+        let file =
+            open_for_times(&path).with_context(|| format!("open blob {digest} to refresh it"))?;
+        file.set_modified(SystemTime::now())
+            .with_context(|| format!("refresh blob {digest}"))?;
         Ok(())
     }
 
@@ -437,6 +465,8 @@ struct Plan {
     unreferenced: Vec<u32>,
     protected_unreferenced: u64,
     bytes_after: u64,
+    /// Candidates evicted because `GcOptions::drop` named them.
+    dropped: u64,
 }
 
 impl Plan {
@@ -457,13 +487,27 @@ impl Plan {
             }
         }
         let mut order = (0..snapshot.units.len() as u32).collect::<Vec<_>>();
+        let dropped = options
+            .drop
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let named = |unit: &Unit| {
+            unit.static_key
+                .as_deref()
+                .zip(unit.candidate.as_ref())
+                .is_some_and(|(static_key, (action_key, _))| {
+                    dropped.contains(format!("{static_key}/{action_key}").as_str())
+                })
+        };
         // Evicted whatever the budget: nothing can use them again.
         let obsolete = |unit: &Unit| {
             unit.candidate.is_some()
-                && (options
-                    .min_protocol
-                    .zip(unit.protocol)
-                    .is_some_and(|(minimum, protocol)| protocol < minimum)
+                && (named(unit)
+                    || options
+                        .min_protocol
+                        .zip(unit.protocol)
+                        .is_some_and(|(minimum, protocol)| protocol < minimum)
                     || (options.evict_missing_checkouts
                         && matches!(unit.scope, Scope::PinnedDeleted(_))))
         };
@@ -527,12 +571,19 @@ impl Plan {
             }
             evict(index, &mut bytes_after, &mut executable_bytes);
         }
+        let dropped = snapshot
+            .units
+            .iter()
+            .zip(&evicted)
+            .filter(|(unit, evicted)| **evicted && named(unit))
+            .count() as u64;
         Self {
             evicted,
             freed,
             unreferenced,
             protected_unreferenced,
             bytes_after,
+            dropped,
         }
     }
 
@@ -635,6 +686,7 @@ impl Plan {
             deleted_checkout_records: deleted_checkouts.iter().map(|c| c.records).sum(),
             deleted_checkout_bytes: deleted_checkouts.iter().map(|c| c.evicted_bytes).sum(),
             deleted_checkouts,
+            dropped: Some(self.dropped),
             breakdown,
         }
     }
@@ -797,7 +849,11 @@ fn evict_from(path: &Path, units: &[&Unit], recent: &HashSet<(String, String)>) 
             Err(error) => return Err(error.into()),
         }
     } else {
-        atomic_write(path, &serde_json::to_vec_pretty(&index)?)?;
+        crate::atomic_write_with(
+            path,
+            &serde_json::to_vec_pretty(&index)?,
+            crate::store_durable(),
+        )?;
     }
     Ok(removed)
 }
@@ -1187,7 +1243,9 @@ mod tests {
         }
 
         fn blob(&self, candidate: &ActionCandidate) -> bool {
-            self.store.read_blob(&candidate.artifacts[0].digest).is_ok()
+            self.store
+                .verify_blob(&candidate.artifacts[0].digest)
+                .is_ok()
         }
 
         fn options(&self, max_bytes: u64) -> GcOptions {
@@ -1202,6 +1260,144 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    /// The same blob published twice: the second finds it stored, refreshes it and succeeds, on every platform
+    /// (Bellows #49's Windows CI: the refresh's read-only handle could not set its time, os error 5).
+    #[test]
+    fn a_blob_published_twice_is_refreshed_and_accepted() {
+        let fixture = Fixture::new("twice");
+        let payload = vec![5u8; 100];
+        let digest = digest_bytes(&payload);
+        assert!(fixture.store.put_blob(&digest, &payload).unwrap(), "stored");
+        let path = fixture.store.blob_path(&digest).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert!(
+            !fixture.store.put_blob(&digest, &payload).unwrap(),
+            "already stored, not an error"
+        );
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+    }
+
+    /// A blob with the read-only attribute refreshes too (the Windows side of the read-only case below).
+    #[test]
+    fn a_blob_marked_read_only_still_refreshes() {
+        let fixture = Fixture::new("read-only-attribute");
+        let payload = vec![4u8; 100];
+        let digest = digest_bytes(&payload);
+        fixture.store.put_blob(&digest, &payload).unwrap();
+        let path = fixture.store.blob_path(&digest).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&path, permissions).unwrap();
+        fixture.store.touch_blob(&digest).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+        assert!(
+            fs::metadata(&path).unwrap().permissions().readonly(),
+            "still read-only"
+        );
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&path, permissions).unwrap();
+    }
+
+    /// Manifold, 2026-10-28: blobs a link had left read-only failed every upload that found them already stored
+    /// (commit_blob's refresh opened them for writing: Permission denied, HTTP 500).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_blob_still_refreshes_and_accepts_the_same_upload() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new("read-only");
+        let payload = vec![6u8; 100];
+        let digest = digest_bytes(&payload);
+        fixture.store.put_blob(&digest, &payload).unwrap();
+        let path = fixture.store.blob_path(&digest).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::open(&path).unwrap().set_modified(old).unwrap();
+        fixture.store.touch_blob(&digest).unwrap();
+        assert!(
+            fs::metadata(&path).unwrap().modified().unwrap() > old,
+            "refreshed"
+        );
+        assert!(
+            !fixture.store.put_blob(&digest, &payload).unwrap(),
+            "already stored, not an error"
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "mode untouched"
+        );
+    }
+
+    /// BELLOWS_STORE_SYNC=0: a store without fsyncs keeps its guarantee, that a blob is the bytes its digest names.
+    /// A write a crash cut short (simulated by truncating the blob) is found by verification and replaced by the next
+    /// upload of the same digest.
+    #[test]
+    fn a_marker_file_in_the_data_directory_turns_the_stores_fsyncs_off_at_runtime() {
+        let fixture = Fixture::new("sync-marker");
+        assert!(fixture.store.durable(), "durable by default");
+        fs::write(fixture.root.join(crate::STORE_SYNC_OFF), b"").unwrap();
+        assert!(!fixture.store.durable(), "off while the marker exists");
+        fs::remove_file(fixture.root.join(crate::STORE_SYNC_OFF)).unwrap();
+        assert!(fixture.store.durable(), "on again once it's gone");
+    }
+
+    #[test]
+    fn a_store_without_fsyncs_still_verifies_and_replaces_a_torn_blob() {
+        let fixture = Fixture::new("no-sync");
+        let payload = vec![9u8; 4096];
+        let digest = digest_bytes(&payload);
+        assert!(
+            fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "stored"
+        );
+        assert!(fixture.store.verify_blob(&digest).is_ok());
+        assert!(
+            !fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "already stored"
+        );
+        let path = fixture.store.blob_path(&digest).unwrap();
+        fs::write(&path, &payload[..100]).unwrap(); // torn by a crash
+        assert!(
+            fixture.store.verify_blob(&digest).is_err(),
+            "a torn blob fails verification"
+        );
+        assert!(
+            fixture
+                .store
+                .put_blob_with(&digest, &payload, false)
+                .unwrap(),
+            "replaced"
+        );
+        assert_eq!(fs::read(&path).unwrap(), payload);
     }
 
     #[test]
@@ -1372,6 +1568,37 @@ mod tests {
         assert_eq!(report.records_evicted, 1);
         assert!(!fixture.present(&old) && !fixture.blob(&old));
         assert!(fixture.present(&current) && fixture.blob(&current));
+    }
+
+    #[test]
+    fn named_candidates_are_dropped_whatever_the_budget_after_a_dry_run_changes_nothing() {
+        let fixture = Fixture::new("named");
+        let wrong = fixture.publish("wrong", 1, now_ms(), PROTOCOL_VERSION);
+        let kept = fixture.publish("kept", 2, 1_000, PROTOCOL_VERSION);
+        fixture.age_blobs();
+        let name = format!("{}/{}", wrong.static_key, wrong.action_key);
+        let absent = format!("{}/{}", kept.static_key, wrong.action_key);
+        let options = GcOptions {
+            drop: vec![name, absent],
+            ..fixture.options(u64::MAX)
+        };
+        let planned = fixture
+            .store
+            .collect(
+                &GcOptions {
+                    dry_run: true,
+                    ..options.clone()
+                },
+                &unserialized,
+            )
+            .unwrap();
+        assert_eq!((planned.records_evicted, planned.dropped), (1, Some(1)));
+        assert!(fixture.present(&wrong) && fixture.blob(&wrong));
+        let report = fixture.store.collect(&options, &unserialized).unwrap();
+        assert_eq!((report.records_evicted, report.dropped), (1, Some(1)));
+        assert!(!fixture.present(&wrong) && !fixture.blob(&wrong));
+        // A name whose action key belongs to another static key drops nothing.
+        assert!(fixture.present(&kept) && fixture.blob(&kept));
     }
 
     #[test]

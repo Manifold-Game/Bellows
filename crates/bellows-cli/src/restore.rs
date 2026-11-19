@@ -1,6 +1,6 @@
 //! Stage complete declared roots before replacing the previous output trees.
 use anyhow::{Context, Result, bail};
-use bellows_core::{Artifact, DeclaredActionRecord, atomic_write, validate_relative_path};
+use bellows_core::{Artifact, DeclaredActionRecord, atomic_write_output, validate_relative_path};
 use fs2::FileExt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -61,7 +61,7 @@ pub fn declared_outputs(
                 } else {
                     fresh.join(relative)
                 };
-                atomic_write(&target, bytes)?;
+                atomic_write_output(&target, bytes)?;
                 super::set_file_executable(&target, artifact.executable)?;
             }
         }

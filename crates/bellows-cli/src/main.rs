@@ -4,8 +4,9 @@ use bellows_core::{
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcOptions, GcReport, GcRequest,
     HealthResponse, LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
     PinnedCheckout, PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write,
-    compiler_action_key, declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home,
-    tree_digest, validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
+    atomic_write_output, compiler_action_key, declared_action_key, digest_bytes, now_ms,
+    parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
+    validate_candidate_manifest, validate_content_key, validate_declared_command,
     validate_declared_record, validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
@@ -85,6 +86,20 @@ enum Commands {
         #[arg(long)]
         spool_dir: Option<PathBuf>,
     },
+    /// Check that outputs linked from the store (BELLOWS_LINK_OUTPUTS) still hold their blob's bytes: every file
+    /// under the roots that shares an inode with a store blob must hash to that blob's digest. Prints each mismatch
+    /// (removing it with --remove) and exits 1 if there was any.
+    VerifyLinks {
+        /// The store's data directory (bellowsd --data-dir).
+        #[arg(long)]
+        store: PathBuf,
+        /// Remove each mismatching file (cargo rebuilds that unit).
+        #[arg(long)]
+        remove: bool,
+        /// Directories to check (a lane's target/<profile>/deps, say).
+        #[arg(required = true)]
+        roots: Vec<PathBuf>,
+    },
     /// Check server connectivity and the local toolchain.
     Doctor {
         #[arg(long, env = "BELLOWS_SERVER", default_value = "http://127.0.0.1:7878")]
@@ -156,6 +171,14 @@ enum Commands {
         /// whatever the budget (also set by BELLOWS_KEEP_MISSING_CHECKOUTS=1).
         #[arg(long)]
         keep_missing_checkouts: bool,
+        /// Evict this compiler candidate whatever the budget, named
+        /// `<static key>/<action key>` (from the `store` event that published
+        /// it). Repeatable; run with `--dry-run` first.
+        #[arg(long = "drop", value_name = "STATIC/ACTION")]
+        drop: Vec<String>,
+        /// Read more `--drop` names from this file, one per line.
+        #[arg(long, value_name = "FILE")]
+        drop_file: Option<PathBuf>,
         /// Print the full report as JSON.
         #[arg(long)]
         json: bool,
@@ -299,6 +322,22 @@ fn run_cli() -> Result<i32> {
             env_file,
             spool_dir,
         } => run_relay(server, token, listen, env_file, spool_dir),
+        Commands::VerifyLinks {
+            store,
+            remove,
+            roots,
+        } => {
+            let report = verify_links(&store, &roots, remove)?;
+            println!(
+                "verify-links: {} linked files checked, {} mismatched",
+                report.checked,
+                report.mismatched.len()
+            );
+            for (path, want, got) in &report.mismatched {
+                println!("MISMATCH {} expected {want} got {got}", path.display());
+            }
+            Ok(if report.mismatched.is_empty() { 0 } else { 1 })
+        }
         Commands::Doctor { server, token } => {
             doctor(&server, token.as_deref())?;
             Ok(0)
@@ -356,12 +395,35 @@ fn run_cli() -> Result<i32> {
             min_protocol,
             max_executable_mb,
             keep_missing_checkouts,
+            mut drop,
+            drop_file,
             json,
             local,
             cache_dir,
             store_dir,
             connection,
         } => {
+            if let Some(file) = &drop_file {
+                let text = fs::read_to_string(file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                drop.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            for name in &drop {
+                let valid = name
+                    .split_once('/')
+                    .is_some_and(|(static_key, action_key)| {
+                        validate_content_key(static_key).is_ok()
+                            && validate_content_key(action_key).is_ok()
+                    });
+                if !valid {
+                    bail!("--drop takes <static key>/<action key>, not {name:?}");
+                }
+            }
             let options = GcOptions {
                 max_bytes: max_mb.saturating_mul(1024 * 1024),
                 dry_run,
@@ -371,6 +433,7 @@ fn run_cli() -> Result<i32> {
                 // looked for here; a server never does (see `PinnedCheckout`).
                 evict_missing_checkouts: (local || store_dir.is_some())
                     && !(keep_missing_checkouts || keep_missing_checkouts_from_env()),
+                drop: drop.clone(),
             };
             let report = if let Some(directory) = store_dir {
                 collect_store_directory(&directory, &options)?
@@ -383,10 +446,14 @@ fn run_cli() -> Result<i32> {
                     dry_run,
                     min_protocol,
                     max_executable_bytes: options.max_executable_bytes,
+                    drop,
                 })?;
                 // An older server ignores the field and applies only --max-mb.
                 if options.max_executable_bytes.is_some() && report.max_executable_bytes.is_none() {
                     bail!("this server does not support --max-executable-mb; upgrade bellowsd")
+                }
+                if !options.drop.is_empty() && report.dropped.is_none() {
+                    bail!("this server does not support --drop; upgrade bellowsd")
                 }
                 report
             };
@@ -472,8 +539,14 @@ fn print_gc_report(report: &GcReport) {
                 if report.dry_run { " (dry run)" } else { "" }
             ),
             &format!(
-                "{verb} {} of {} records · {} blobs",
-                report.records_evicted, report.records, report.blobs_evicted
+                "{verb} {} of {} records · {} blobs{}",
+                report.records_evicted,
+                report.records,
+                report.blobs_evicted,
+                match report.dropped {
+                    Some(dropped) if dropped > 0 => format!(" · {dropped} named by --drop"),
+                    _ => String::new(),
+                }
             ),
         )
     );
@@ -3034,9 +3107,12 @@ fn normalized_compiler_arguments(
     let mut path_value = false;
     let mut skip_next = false;
     for (index, arg) in invocation.args.iter().enumerate() {
-        // The incremental session directory is scratch state, not an input:
-        // incremental and non-incremental compiles of the same crate share
-        // one identity (see the incremental policy in compile_and_capture).
+        // The incremental session directory is scratch state, not an input,
+        // so its path stays out of the key. Whether the compile is
+        // incremental goes in: rustc then splits code into more codegen units
+        // and may reuse session state, so an incremental result must never
+        // be restored into a non-incremental build (a gate that builds like
+        // CI) or the other way round.
         if std::mem::take(&mut skip_next) {
             continue;
         }
@@ -3046,10 +3122,12 @@ fn normalized_compiler_arguments(
                 .get(index + 1)
                 .is_some_and(|value| value.starts_with("incremental="))
         {
+            normalized.push("-Cincremental".to_owned());
             skip_next = true;
             continue;
         }
         if arg.starts_with("-Cincremental=") {
+            normalized.push("-Cincremental".to_owned());
             continue;
         }
         // Terminal width only reflows rendered diagnostics. It is checked
@@ -3062,17 +3140,27 @@ fn normalized_compiler_arguments(
         if arg.starts_with("--diagnostic-width=") {
             continue;
         }
+        // A `--remap-path-prefix` names a checkout, target or Cargo home path
+        // too (cargo-mod maps its target directory to `target` for every
+        // crate). It rewrites only the embedded paths of files under it, which
+        // enter the key through dep-info, normalized the same way; left
+        // literal, one lane's target path kept each wasm32 guest dependency
+        // from serving any other lane or the `next` warmer.
         let is_path = path_value
             || source.as_deref() == Some(arg.as_str())
             || arg.starts_with("--out-dir=")
             || arg.starts_with("--extern=")
-            || arg.starts_with("-Ldependency=");
+            || arg.starts_with("-Ldependency=")
+            || arg.starts_with("--remap-path-prefix=");
         normalized.push(if is_path {
             normalizer.normalize(arg)
         } else {
             arg.clone()
         });
-        path_value = matches!(arg.as_str(), "--out-dir" | "--extern" | "-L");
+        path_value = matches!(
+            arg.as_str(),
+            "--out-dir" | "--extern" | "-L" | "--remap-path-prefix"
+        );
     }
     normalized
 }
@@ -3320,7 +3408,7 @@ fn compiler_identity(rustc: &Path, state: &Path) -> Result<CompilerIdentity> {
         bail!("rustc -vV failed")
     }
     if let Some(memo) = memo {
-        let _ = atomic_write(&memo, &output.stdout);
+        let _ = bellows_core::atomic_write_state(&memo, &output.stdout);
     }
     Ok(CompilerIdentity {
         stdout: output.stdout,
@@ -3420,7 +3508,7 @@ fn without_shell(
     mut environment: BTreeMap<String, String>,
     path_use: &PathUse,
 ) -> BTreeMap<String, String> {
-    for name in SHELL_ENVIRONMENT {
+    for name in SHELL_ENVIRONMENT.iter().chain(OUTPUT_LOCATION_ENVIRONMENT) {
         environment.remove(*name);
     }
     if cfg!(windows) {
@@ -3435,6 +3523,14 @@ fn without_shell(
 }
 
 const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// Where Cargo puts its outputs never changes what the compiler writes: the
+/// target directory is normalized out of the compile, and a crate that reads
+/// one of these with env!/option_env! is still tracked exactly through
+/// dep-info. A build script can read them at run time, so its runs keep them.
+/// Without this, two builds of one crate that differ only in whether
+/// CARGO_TARGET_DIR is set missed each other's results.
+const OUTPUT_LOCATION_ENVIRONMENT: &[&str] = &["CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR"];
 
 /// What PATH can change about one compile.
 #[derive(Debug, PartialEq, Eq)]
@@ -3545,9 +3641,11 @@ const EXACT_ENVIRONMENT: &[&str] = &[
 ];
 
 fn is_relevant_environment_name(name: &str) -> bool {
-    // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
-    // output. A crate that reads one with env!/option_env! is still tracked
-    // exactly through dep-info.
+    // Scheduling, terminal, logging and rustup-proxy bookkeeping never reach
+    // rustc's output. A crate that reads one with env!/option_env! is still
+    // tracked exactly through dep-info. Logging especially must stay out: a
+    // probe run under CARGO_LOG missed every unit and stored a second copy of
+    // each (Manifold #100054, jobs 4093, 4106 and 4119).
     //
     // CARGO_HOLD_* belong to cargo-hold, a scheduler that runs one heavy
     // build at a time in front of Cargo. It marks everything inside a hold
@@ -3558,8 +3656,16 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CARGO_HOLD_ACTIVE",
         "CARGO_HOLD_LABEL",
         "CARGO_HOLD_SKIP",
+        "CARGO_HTTP_DEBUG",
         "CARGO_INCREMENTAL",
+        "CARGO_LOG",
+        "CARGO_LOG_PROFILE",
+        "CARGO_LOG_PROFILE_CAPTURE",
         "CARGO_MAKEFLAGS",
+        // How Cargo fetches a git dependency (its own client or the git CLI) never reaches rustc: the fetched
+        // sources are hashed as inputs anyway. Keyed, it split every unit of a lane that sets it from the same
+        // unit elsewhere (Manifold's Zomvivor lane, build host 4241, 2026-10-30).
+        "CARGO_NET_GIT_FETCH_WITH_CLI",
         "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
         "CARGO_TERM_COLOR",
@@ -3568,12 +3674,14 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "CARGO_TERM_QUIET",
         "CARGO_TERM_VERBOSE",
         "CLIPPY_TERMINAL_WIDTH",
+        "RUSTC_LOG",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
         "RUSTUP_AUTO_INSTALL",
         "RUSTUP_TOOLCHAIN_SOURCE",
         "RUST_BACKTRACE",
         "RUST_LOG",
+        "RUST_LOG_STYLE",
         "RUST_MIN_STACK",
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
@@ -3918,10 +4026,24 @@ fn restore_with(
             bail!("manifest contains unexpected output {}", artifact.file_name)
         }
     }
+    // Local link mode (`link_store`): an output whose blob is in the store on this filesystem is linked from it, not
+    // fetched and written.
+    let link_root = link_store();
+    let linked = candidate
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            link_root
+                .as_deref()
+                .and_then(|root| linkable_blob(root, artifact, &invocation.out_dir))
+        })
+        .collect::<Vec<Option<PathBuf>>>();
     let digests = candidate
         .artifacts
         .iter()
-        .map(|artifact| artifact.digest.as_str())
+        .zip(&linked)
+        .filter(|(_, link)| link.is_none())
+        .map(|(artifact, _)| artifact.digest.as_str())
         .chain([
             candidate.stdout.digest.as_str(),
             candidate.stderr.digest.as_str(),
@@ -3937,13 +4059,22 @@ fn restore_with(
     }
     let stderr_blob = blobs.pop().expect("stderr requested");
     let stdout_blob = blobs.pop().expect("stdout requested");
-    let downloaded = candidate.artifacts.iter().zip(blobs).collect::<Vec<_>>();
     if stdout_blob.len() as u64 != candidate.stdout.len
         || stderr_blob.len() as u64 != candidate.stderr.len
     {
         bail!("compiler stream length does not match manifest")
     }
-    for (artifact, stored) in downloaded {
+    let mut fetched = blobs.into_iter();
+    for (artifact, link) in candidate.artifacts.iter().zip(linked) {
+        if let Some(blob) = link {
+            let destination = invocation.out_dir.join(&artifact.file_name);
+            link_output(&blob, &destination)?;
+            identity.digests.remember(&destination, &artifact.digest);
+            continue;
+        }
+        let stored = fetched
+            .next()
+            .context("blob fetch returned too few blobs")?;
         let bytes = if artifact.file_name.ends_with(".d") {
             localize_env_deps(
                 &transform_dep_info(&stored, &identity.normalizer, true),
@@ -3971,7 +4102,7 @@ fn restore_with(
 /// that is running (a test binary still executing, or a loaded DLL) but
 /// allows renaming it; move it aside and sweep leftovers on later restores.
 fn install_output(destination: &Path, bytes: &[u8]) -> Result<()> {
-    match atomic_write(destination, bytes) {
+    match atomic_write_output(destination, bytes) {
         Ok(()) => Ok(()),
         #[cfg(windows)]
         Err(error) if destination.exists() => {
@@ -3988,7 +4119,7 @@ fn install_output(destination: &Path, bytes: &[u8]) -> Result<()> {
             fs::rename(destination, &aside).with_context(|| {
                 format!("replace in-use output {}: {error:#}", destination.display())
             })?;
-            atomic_write(destination, bytes)?;
+            atomic_write_output(destination, bytes)?;
             sweep_replaced(parent);
             Ok(())
         }
@@ -5009,9 +5140,17 @@ pub(crate) fn for_local_store(candidate: &ActionCandidate, identity: &Identity) 
 
 fn cache_captured(store: &Store, captured: &Captured) -> Result<()> {
     for (digest, bytes) in &captured.blobs {
-        store.put_blob(digest, bytes)?;
+        store
+            .put_blob(digest, bytes)
+            .with_context(|| format!("store output blob {digest} ({} bytes)", bytes.len()))?;
     }
-    store.put_candidate(captured.candidate.clone(), 8)?;
+    let candidate = &captured.candidate;
+    store.put_candidate(candidate.clone(), 8).with_context(|| {
+        format!(
+            "store candidate {}/{}",
+            candidate.static_key, candidate.action_key
+        )
+    })?;
     Ok(())
 }
 
@@ -5726,7 +5865,7 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
             for (artifact, bytes) in staged {
                 let relative = validate_relative_path(&artifact.file_name)?;
                 let destination = safe_destination(&restore_root, &relative)?;
-                atomic_write(&destination, &bytes)?;
+                atomic_write_output(&destination, &bytes)?;
                 set_file_executable(&destination, artifact.executable)?;
             }
             println!(
@@ -6193,6 +6332,170 @@ fn safe_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
     Ok(current)
 }
 
+/// The store an output may be linked from: `BELLOWS_LINK_STORE` (the store's data directory, the one `bellowsd
+/// --data-dir` names) when `BELLOWS_LINK_OUTPUTS=1`. Unix only.
+fn link_store() -> Option<PathBuf> {
+    if !cfg!(unix) || env::var_os("BELLOWS_LINK_OUTPUTS").as_deref() != Some(OsStr::new("1")) {
+        return None;
+    }
+    env::var_os("BELLOWS_LINK_STORE").map(PathBuf::from)
+}
+
+/// Outputs smaller than this are written, not linked: the copy costs little, and a link shares the file.
+#[cfg(unix)]
+const LINK_MIN_BYTES: u64 = 64 * 1024;
+
+/// The store blob `artifact` can be linked from into `out_dir`, or None:
+/// - never a `.d` (rewritten per checkout, and rustc truncates it in place);
+/// - never a `.rmeta`: a link carries the blob's mtime, and Cargo calls a dependent stale only when a dependency's
+///   output is newer than the dependent's (for a metadata-only edge, the `.rmeta` alone). A written `.rmeta` gives
+///   every restore one output with the current mtime, so a dependency replaced by a restore is seen as rebuilt
+///   (Manifold #100054: linked rmetas kept stale dependents, E0460/E0463);
+/// - never an executable output whose blob isn't executable (a link can't change the shared inode's mode);
+/// - never one under [`LINK_MIN_BYTES`], and only from a store on `out_dir`'s filesystem.
+fn linkable_blob(store_root: &Path, artifact: &Artifact, out_dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if artifact.file_name.ends_with(".d")
+            || artifact.file_name.ends_with(".rmeta")
+            || artifact.digest.len() != 64
+            || !artifact.digest.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let blob = store_root
+            .join("blobs")
+            .join(&artifact.digest[..2])
+            .join(&artifact.digest);
+        let meta = fs::metadata(&blob).ok()?;
+        if !meta.is_file() || meta.len() < LINK_MIN_BYTES {
+            return None;
+        }
+        if artifact.executable && meta.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        let dir = fs::metadata(out_dir).ok()?;
+        (dir.dev() == meta.dev()).then_some(blob)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store_root, artifact, out_dir);
+        None
+    }
+}
+
+#[cfg(unix)]
+static LINK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Replace `destination` with a hardlink to `blob`, through a temporary name and a rename (as `atomic_write`). The
+/// shared inode is never changed: no mode, no time (a read-only blob failed every upload that refreshed it, and a
+/// touched one would make every other checkout's dependents stale). The compiler, the linker and Cargo replace
+/// outputs by rename, so a linked output isn't written in place; `bellows verify-links` finds one that was.
+fn link_output(blob: &Path, destination: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(blob)?;
+        // Already this blob (a unit restored again with the same output): nothing to do. A rename of one link of an
+        // inode onto another link of it succeeds without moving anything (POSIX), which would leave the temporary.
+        if let Ok(existing) = fs::symlink_metadata(destination)
+            && existing.dev() == meta.dev()
+            && existing.ino() == meta.ino()
+        {
+            return Ok(());
+        }
+        let parent = destination.parent().context("destination has no parent")?;
+        let temp = parent.join(format!(
+            ".bellows-link-{}-{}-{}",
+            std::process::id(),
+            now_ms(),
+            LINK_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::hard_link(blob, &temp)
+            .with_context(|| format!("link {} from the store", destination.display()))?;
+        let renamed = fs::rename(&temp, destination);
+        // The temporary is gone after a rename that moved it; one that found the same inode at `destination` (a
+        // racing restore of the same blob) leaves it.
+        let _ = fs::remove_file(&temp);
+        renamed?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (blob, destination);
+        bail!("linking outputs needs a unix filesystem")
+    }
+}
+
+struct LinkReport {
+    checked: usize,
+    mismatched: Vec<(PathBuf, String, String)>,
+}
+
+/// [`Commands::VerifyLinks`]: the store's blob inodes (metadata only), then every file under `roots` with one of
+/// those inodes, hashed and compared to the blob's digest.
+fn verify_links(store: &Path, roots: &[PathBuf], remove: bool) -> Result<LinkReport> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut blobs = BTreeMap::<(u64, u64), String>::new();
+        let dir = store.join("blobs");
+        for shard in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(shard.path())? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.len() != 64 {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata()
+                    && meta.nlink() > 1
+                {
+                    blobs.insert((meta.dev(), meta.ino()), name);
+                }
+            }
+        }
+        let mut report = LinkReport {
+            checked: 0,
+            mismatched: Vec::new(),
+        };
+        let mut pending = roots.to_vec();
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                    continue;
+                }
+                let Some(want) = blobs.get(&(meta.dev(), meta.ino())) else {
+                    continue;
+                };
+                report.checked += 1;
+                let got = bellows_core::digest_file(&entry.path())?;
+                if &got != want {
+                    if remove {
+                        fs::remove_file(entry.path())?;
+                    }
+                    report.mismatched.push((entry.path(), want.clone(), got));
+                }
+            }
+        }
+        Ok(report)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, roots, remove);
+        bail!("verify-links needs a unix filesystem")
+    }
+}
+
 fn set_file_executable(path: &Path, executable: bool) -> Result<()> {
     #[cfg(unix)]
     if executable {
@@ -6553,6 +6856,127 @@ fn display_names(names: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    mod link_outputs {
+        use super::super::*;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        fn blob(store: &Path, bytes: &[u8]) -> String {
+            let digest = bellows_core::digest_bytes(bytes);
+            let dir = store.join("blobs").join(&digest[..2]);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(&digest), bytes).unwrap();
+            digest
+        }
+
+        fn artifact(name: &str, digest: &str, executable: bool) -> Artifact {
+            Artifact {
+                file_name: name.to_owned(),
+                digest: digest.to_owned(),
+                executable,
+            }
+        }
+
+        fn mode_and_mtime(path: &Path) -> (u32, std::time::SystemTime) {
+            let meta = fs::metadata(path).unwrap();
+            (meta.permissions().mode() & 0o777, meta.modified().unwrap())
+        }
+
+        #[test]
+        fn a_large_rlib_is_linked_and_the_shared_blob_keeps_its_mode_and_time() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let bytes = vec![7u8; 200 * 1024];
+            let digest = blob(&store, &bytes);
+            let source = linkable_blob(&store, &artifact("libx-1.rlib", &digest, false), &out)
+                .expect("a large rlib blob on this filesystem links");
+            let before = mode_and_mtime(&source);
+            let destination = out.join("libx-1.rlib");
+            fs::write(&destination, b"an older build").unwrap();
+            link_output(&source, &destination).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), bytes);
+            assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2, "one inode");
+            assert_eq!(
+                mode_and_mtime(&source),
+                before,
+                "the shared inode's mode and time are untouched"
+            );
+            link_output(&source, &destination).unwrap(); // again: the same inode, nothing to do
+            assert_eq!(fs::metadata(&destination).unwrap().nlink(), 2);
+            assert!(
+                fs::read_dir(&out).unwrap().all(|e| !e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bellows-link-")),
+                "no temporary left behind"
+            );
+        }
+
+        /// Never a `.rmeta` (Manifold #100054): a link carries the blob's mtime, and Cargo calls a dependent stale
+        /// only when a dependency's output is newer than its own (the `.rmeta` alone for a metadata-only edge).
+        /// Linked rlib+rmeta kept dependents of a rebuilt dependency fresh: E0460/E0463. With the `.rmeta` written,
+        /// every restore leaves one output with the current mtime (the plain-cargo red/green: rlib-only passes).
+        #[test]
+        fn rmeta_dep_info_small_and_non_executable_blobs_for_executables_are_never_linked() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let big = blob(&store, &vec![3u8; 100 * 1024]);
+            assert!(
+                linkable_blob(&store, &artifact("libbig-1.rmeta", &big, false), &out).is_none()
+            );
+            assert!(linkable_blob(&store, &artifact("x.d", &big, false), &out).is_none());
+            let small = blob(&store, b"tiny");
+            assert!(
+                linkable_blob(&store, &artifact("libtiny.rlib", &small, false), &out).is_none()
+            );
+            assert!(
+                linkable_blob(&store, &artifact("liby.rlib", &"0".repeat(64), false), &out)
+                    .is_none()
+            );
+            // An executable output only from an executable blob: a link can't make the shared inode executable.
+            assert!(linkable_blob(&store, &artifact("tests-1", &big, true), &out).is_none());
+            let exe_digest = blob(&store, &vec![4u8; 100 * 1024]);
+            let exe_blob = store.join("blobs").join(&exe_digest[..2]).join(&exe_digest);
+            fs::set_permissions(&exe_blob, fs::Permissions::from_mode(0o755)).unwrap();
+            let exe = linkable_blob(&store, &artifact("tests-2", &exe_digest, true), &out).unwrap();
+            link_output(&exe, &out.join("tests-2")).unwrap();
+            assert_eq!(
+                fs::metadata(out.join("tests-2"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+
+        #[test]
+        fn verify_links_finds_a_linked_output_whose_bytes_changed_and_removes_it() {
+            let root = tempfile::tempdir().unwrap();
+            let (store, out) = (root.path().join("store"), root.path().join("out"));
+            fs::create_dir_all(&out).unwrap();
+            let good = blob(&store, &vec![1u8; 100 * 1024]);
+            let bad = blob(&store, &vec![2u8; 100 * 1024]);
+            for (name, digest) in [("libgood.rlib", &good), ("libbad.rlib", &bad)] {
+                let source = linkable_blob(&store, &artifact(name, digest, false), &out).unwrap();
+                link_output(&source, &out.join(name)).unwrap();
+            }
+            fs::write(out.join("unlinked.rlib"), vec![9u8; 100 * 1024]).unwrap(); // not the store's: ignored
+            let report = verify_links(&store, std::slice::from_ref(&out), false).unwrap();
+            assert_eq!((report.checked, report.mismatched.len()), (2, 0));
+            // A tool writing a linked output in place changes the shared inode.
+            let target = out.join("libbad.rlib");
+            fs::write(&target, vec![3u8; 100 * 1024]).unwrap();
+            let report = verify_links(&store, std::slice::from_ref(&out), true).unwrap();
+            assert_eq!(report.mismatched.len(), 1);
+            assert_eq!(report.mismatched[0].0, target);
+            assert!(!target.exists(), "removed");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -7469,7 +7893,12 @@ mod tests {
     }
 
     #[test]
-    fn incremental_invocations_share_the_non_incremental_identity() {
+    fn incremental_invocations_share_one_identity_apart_from_non_incremental_ones() {
+        // The session path is scratch state, so every incremental compile of
+        // a crate shares one identity; whether a compile is incremental is
+        // not, so an incremental result never stands in for a
+        // non-incremental one (a gate that builds like CI restored results a
+        // fast-tier incremental probe had published, 2026-10-25).
         let temp = tempfile::tempdir().unwrap();
         let emit = ["--crate-type=rlib", "--emit=dep-info,link"];
         let plain = analyze_with(temp.path(), &emit).unwrap();
@@ -7482,9 +7911,65 @@ mod tests {
             analyze_with(temp.path(), &[emit[0], emit[1], "-Cincremental=/y/incr"]).unwrap();
         assert_eq!(spaced.incremental, Some(PathBuf::from("/x/incr")));
         let normalizer = PathNormalizer::new(vec![]);
-        let args = normalized_compiler_arguments(&plain, &normalizer);
-        assert_eq!(normalized_compiler_arguments(&spaced, &normalizer), args);
-        assert_eq!(normalized_compiler_arguments(&joined, &normalizer), args);
+        let incremental = normalized_compiler_arguments(&spaced, &normalizer);
+        assert_eq!(
+            normalized_compiler_arguments(&joined, &normalizer),
+            incremental
+        );
+        assert_ne!(
+            normalized_compiler_arguments(&plain, &normalizer),
+            incremental
+        );
+        assert!(
+            !incremental
+                .iter()
+                .any(|arg| arg.contains("incr=") || arg.contains("/incr"))
+        );
+    }
+
+    #[test]
+    fn remapped_target_and_cargo_home_paths_share_one_key_across_checkouts() {
+        // cargo-mod's guest builds pass `--remap-path-prefix=<target>=target`
+        // and `<cargo home>=/cargo` to every crate; two lanes differ only in
+        // those paths and must share each dependency's result.
+        let temp = tempfile::tempdir().unwrap();
+        let lane = |name: &str| {
+            let target = format!("/lanes/{name}/target/test-mod-slots/shared");
+            let home = format!("/homes/{name}/cargo");
+            let normalizer = PathNormalizer::new(vec![
+                ("$TARGET".into(), PathBuf::from(&target)),
+                ("$CARGO_HOME".into(), PathBuf::from(&home)),
+            ]);
+            let mut invocation = test_invocation(temp.path(), &[], vec![]);
+            invocation.args = [
+                "--crate-name".into(),
+                "serde_core".into(),
+                format!("--remap-path-prefix={home}=/cargo"),
+                "--remap-path-prefix".into(),
+                format!("{target}=target"),
+            ]
+            .to_vec();
+            normalized_compiler_arguments(&invocation, &normalizer)
+        };
+        let a = lane("a");
+        assert_eq!(a, lane("b"));
+        assert_eq!(
+            a[2..],
+            [
+                "--remap-path-prefix=$CARGO_HOME=/cargo",
+                "--remap-path-prefix",
+                "$TARGET=target"
+            ]
+        );
+        // A remap of a path outside every known base stays literal: it still
+        // tells two compiles apart.
+        let mut other = test_invocation(temp.path(), &[], vec![]);
+        other.args = vec!["--remap-path-prefix=/opt/vendored=v".into()];
+        let none = PathNormalizer::new(vec![]);
+        assert_eq!(
+            normalized_compiler_arguments(&other, &none),
+            ["--remap-path-prefix=/opt/vendored=v"]
+        );
     }
 
     #[test]
@@ -8004,6 +8489,28 @@ release: 1.92.0
     }
 
     #[test]
+    fn compile_keys_leave_out_the_target_directory_but_build_scripts_keep_it() {
+        let normalizer = PathNormalizer::new(Vec::new());
+        let vars = |target: Option<&str>| {
+            let mut vars = vec![("RUSTFLAGS".to_string(), "-Dwarnings".to_string())];
+            if let Some(target) = target {
+                vars.push(("CARGO_TARGET_DIR".to_string(), target.to_string()));
+                vars.push(("CARGO_BUILD_TARGET_DIR".to_string(), target.to_string()));
+            }
+            vars
+        };
+        let set = relevant_environment_of(vars(Some("/lanes/a/target")), &normalizer, false);
+        let unset = relevant_environment_of(vars(None), &normalizer, false);
+        // A build script's run sees it.
+        assert!(set.contains_key("CARGO_TARGET_DIR"));
+        // A compile's key is the same, set or unset.
+        assert_eq!(
+            without_shell(set, &PathUse::None),
+            without_shell(unset, &PathUse::None)
+        );
+    }
+
+    #[test]
     fn windows_keys_each_variable_in_one_spelling() {
         let normalizer = PathNormalizer::new(Vec::new());
         let vars = || {
@@ -8041,6 +8548,33 @@ release: 1.92.0
         assert!(!is_relevant_environment_name("GITHUB_RUN_ID"));
         assert!(!is_relevant_environment_name("GITHUB_ENV"));
         assert!(!is_relevant_environment_name("BELLOWS_AUTH_TOKEN"));
+        for logging in [
+            "CARGO_LOG",
+            "CARGO_LOG_PROFILE",
+            "CARGO_HTTP_DEBUG",
+            "RUSTC_LOG",
+            "RUST_LOG_STYLE",
+        ] {
+            assert!(
+                !is_relevant_environment_name(logging),
+                "{logging} only changes logging"
+            );
+        }
+        assert!(!is_relevant_environment_name(
+            "CARGO_NET_GIT_FETCH_WITH_CLI"
+        ));
+        // What changes rustc's output stays in the key: flags (lints included, since a cached result replays its
+        // diagnostics) and profile settings.
+        for compile in [
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_PROFILE_DEV_DEBUG",
+            "CARGO_PROFILE_RELEASE_OPT_LEVEL",
+        ] {
+            assert!(
+                is_relevant_environment_name(compile),
+                "{compile} stays keyed"
+            );
+        }
         assert!(is_relevant_environment_name("RUSTFLAGS"));
         assert!(is_relevant_environment_name("CARGO_MANIFEST_DIR"));
         assert!(is_relevant_environment_name("CC_x86_64_unknown_linux_gnu"));

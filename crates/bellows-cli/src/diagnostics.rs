@@ -1,5 +1,5 @@
-use anyhow::{Context, Result};
-use bellows_core::{Event, atomic_write, digest_bytes, now_ms};
+use anyhow::Result;
+use bellows_core::{Event, atomic_write_state, digest_bytes, now_ms};
 use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,7 +113,21 @@ fn rotated(path: &Path, n: usize) -> PathBuf {
 }
 
 pub fn append(path: &Path, event: &Event) -> Result<()> {
-    append_with_limit(path, event, LOG_LIMIT)
+    append_with_limit(
+        path,
+        event,
+        log_limit(std::env::var("BELLOWS_EVENT_LOG_MAX_MB").ok().as_deref()),
+    )
+}
+
+/// The size at which the event log rotates (three files are kept): `BELLOWS_EVENT_LOG_MAX_MB` megabytes, 1 to 1024,
+/// else [`LOG_LIMIT`]. A build host that wants a day of decisions (Manifold, 2026-10-28: 16 MB held about 5 hours)
+/// raises it; appends stay unsynced either way.
+fn log_limit(setting: Option<&str>) -> u64 {
+    match setting.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(mb @ 1..=1024) => mb * 1024 * 1024,
+        _ => LOG_LIMIT,
+    }
 }
 
 fn append_with_limit(path: &Path, event: &Event, limit: u64) -> Result<()> {
@@ -657,8 +671,10 @@ pub fn remember_identity(state: &Path, group: &str, current: &Fingerprint) -> Re
     fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}.json", digest_bytes(group.as_bytes())));
     let _lock = lock_log(&path, true)?;
+    // The history is written without fsyncs (atomic_write_state): one a crash left empty or torn no longer
+    // parses, and starts again rather than failing every later miss's explanation.
     let mut history: Vec<Fingerprint> = match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("read diagnostic identity history")?,
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e.into()),
     };
@@ -682,7 +698,7 @@ pub fn remember_identity(state: &Path, group: &str, current: &Fingerprint) -> Re
     history.retain(|old| old.key != current.key);
     history.insert(0, current.clone());
     history.truncate(8);
-    atomic_write(&path, &serde_json::to_vec(&history)?)?;
+    atomic_write_state(&path, &serde_json::to_vec(&history)?)?;
     Ok(explanation)
 }
 
@@ -745,6 +761,32 @@ pub fn argument_components(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_torn_identity_history_starts_again_instead_of_failing_every_explanation() {
+        // The history is written without fsyncs (atomic_write_state), so a crash can leave it empty or torn.
+        let state = tempfile::tempdir().unwrap();
+        let fingerprint = |key: &str| Fingerprint {
+            key: key.into(),
+            components: BTreeMap::from([("source".into(), key.into())]),
+        };
+        let path = state
+            .path()
+            .join("diagnostics")
+            .join(format!("{}.json", digest_bytes(b"group")));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for torn in [&b""[..], &b"[{\"key\": \"abc"[..]] {
+            fs::write(&path, torn).unwrap();
+            let explanation =
+                remember_identity(state.path(), "group", &fingerprint("one")).unwrap();
+            assert_eq!(explanation, NOT_CACHED_YET);
+            let history: Vec<Fingerprint> =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(history.len(), 1, "rewritten whole");
+        }
+        let again = remember_identity(state.path(), "group", &fingerprint("one")).unwrap();
+        assert_eq!(again, ENTRY_GONE, "and kept from then on");
+    }
+
     fn event(kind: &str, session: &str, detail: &str) -> Event {
         Event {
             timestamp_ms: now_ms(),
@@ -772,6 +814,16 @@ mod tests {
         assert_eq!(events[0].session_id.as_deref(), Some("4"));
         assert_eq!(events[2].session_id.as_deref(), Some("6"));
         assert!(!rotated(&path, 3).exists());
+    }
+
+    #[test]
+    fn the_rotation_size_comes_from_the_environment_within_bounds() {
+        assert_eq!(log_limit(None), LOG_LIMIT);
+        assert_eq!(log_limit(Some("128")), 128 * 1024 * 1024);
+        assert_eq!(log_limit(Some(" 64 ")), 64 * 1024 * 1024);
+        assert_eq!(log_limit(Some("0")), LOG_LIMIT);
+        assert_eq!(log_limit(Some("5000")), LOG_LIMIT);
+        assert_eq!(log_limit(Some("lots")), LOG_LIMIT);
     }
 
     #[test]

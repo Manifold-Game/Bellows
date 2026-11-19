@@ -547,6 +547,10 @@ pub struct GcReport {
     /// Planned blob deletions skipped because they were reused mid-collection.
     #[serde(default)]
     pub skipped_blobs: u64,
+    /// Candidates evicted because the request named them (`GcRequest::drop`);
+    /// absent from a server that predates naming them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
     #[serde(default)]
     pub journal_entries: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +604,9 @@ pub struct GcRequest {
     /// Separate budget for final executables; see `GcOptions`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_executable_bytes: Option<u64>,
+    /// Compiler candidates to evict whatever the budget; see `GcOptions`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1014,7 +1021,20 @@ impl Store {
         Ok(self.root.join("archives").join(format!("{name}.json")))
     }
 
+    /// Whether this store syncs what it writes: not under `BELLOWS_STORE_SYNC=0`, and not while
+    /// [`STORE_SYNC_OFF`] exists in its data directory. The file is a switch a running server reads at every write,
+    /// so an operator turns the fsyncs off or on without a restart or a change to the service's environment.
+    pub fn durable(&self) -> bool {
+        store_durable() && !self.root.join(STORE_SYNC_OFF).exists()
+    }
+
     pub fn put_blob(&self, expected: &str, bytes: &[u8]) -> Result<bool> {
+        self.put_blob_with(expected, bytes, self.durable())
+    }
+
+    /// [`Store::put_blob`] with the store's durability given: `durable` false skips the blob's fsync and its
+    /// directory's ([`store_durable`]).
+    pub fn put_blob_with(&self, expected: &str, bytes: &[u8], durable: bool) -> Result<bool> {
         let actual = digest_bytes(bytes);
         if actual != expected {
             bail!("blob digest mismatch: expected {expected}, got {actual}")
@@ -1024,16 +1044,22 @@ impl Store {
             let mut file = fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
-                .open(&temp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
+                .open(&temp)
+                .with_context(|| format!("create {}", temp.display()))?;
+            file.write_all(bytes)
+                .with_context(|| format!("write {}", temp.display()))?;
+            if durable {
+                file.sync_all()
+                    .with_context(|| format!("sync {}", temp.display()))?;
+            }
             Ok(())
-        })();
+        })()
+        .with_context(|| format!("write blob {expected}"));
         if let Err(error) = written {
             let _ = fs::remove_file(&temp);
             return Err(error);
         }
-        self.commit_blob(expected, &temp)
+        self.commit_blob_with(expected, &temp, durable)
     }
 
     /// A fresh temporary path beside the blob's final location, for writing
@@ -1042,7 +1068,8 @@ impl Store {
     pub fn blob_temp_path(&self, digest: &str) -> Result<PathBuf> {
         let path = self.blob_path(digest)?;
         let parent = path.parent().context("blob path has no parent")?;
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create blob directory {}", parent.display()))?;
         Ok(parent.join(format!(
             ".tmp-{}-{}-{}",
             std::process::id(),
@@ -1058,10 +1085,15 @@ impl Store {
     /// `temp`) when a verified copy was already present, refreshing it so a
     /// running collection keeps it.
     pub fn commit_blob(&self, expected: &str, temp: &Path) -> Result<bool> {
+        self.commit_blob_with(expected, temp, self.durable())
+    }
+
+    /// [`Store::commit_blob`] with the store's durability given ([`store_durable`]).
+    pub fn commit_blob_with(&self, expected: &str, temp: &Path, durable: bool) -> Result<bool> {
         let path = self.blob_path(expected)?;
         let committed = self.with_mutation_lock(|| {
             if path.exists() {
-                if self.read_blob(expected).is_ok() {
+                if self.verify_blob(expected).is_ok() {
                     self.touch_blob(expected)?;
                     return Ok(false);
                 }
@@ -1069,7 +1101,10 @@ impl Store {
                     .with_context(|| format!("remove corrupt blob {expected}"))?;
             }
             fs::rename(temp, &path).with_context(|| format!("move blob {expected} into place"))?;
-            sync_parent(&path)?;
+            if durable {
+                sync_parent(&path)
+                    .with_context(|| format!("sync the directory of blob {expected}"))?;
+            }
             Ok(true)
         });
         if !matches!(committed, Ok(true)) {
@@ -1086,6 +1121,24 @@ impl Store {
             bail!("corrupt blob {digest}: content hashes to {actual}")
         }
         Ok(bytes)
+    }
+
+    /// Checks that the stored blob is present and hashes to `digest`, reading
+    /// it as a stream: a caller that only checks a blob never holds its bytes.
+    /// Existence checks and publications used `read_blob` for this, one
+    /// whole-blob buffer per concurrent request, and bellowsd sat at 1.7 GB
+    /// resident. Returns the blob's size.
+    pub fn verify_blob(&self, digest: &str) -> Result<u64> {
+        let path = self.blob_path(digest)?;
+        let mut file = std::fs::File::open(&path).with_context(|| format!("read blob {digest}"))?;
+        let mut hasher = blake3::Hasher::new();
+        let size =
+            std::io::copy(&mut file, &mut hasher).with_context(|| format!("read blob {digest}"))?;
+        let actual = hasher.finalize().to_hex().to_string();
+        if actual != digest {
+            bail!("corrupt blob {digest}: content hashes to {actual}")
+        }
+        Ok(size)
     }
 
     pub fn read_candidates(&self, static_key: &str) -> Result<CandidateIndex> {
@@ -1119,7 +1172,9 @@ impl Store {
         max_candidates: usize,
     ) -> Result<()> {
         let path = self.action_path(&candidate.static_key)?;
-        fs::create_dir_all(path.parent().context("action path has no parent")?)?;
+        let parent = path.parent().context("action path has no parent")?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create candidate directory {}", parent.display()))?;
         let mut index = self.read_candidates(&candidate.static_key)?;
         index
             .candidates
@@ -1127,8 +1182,10 @@ impl Store {
         let (static_key, action_key) = (candidate.static_key.clone(), candidate.action_key.clone());
         index.candidates.insert(0, candidate);
         index.candidates.truncate(max_candidates.max(1));
-        atomic_write(&path, &serde_json::to_vec_pretty(&index)?)?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(&index)?, self.durable())
+            .with_context(|| format!("write candidate index {}", path.display()))?;
         self.record_use(&static_key, &action_key)
+            .with_context(|| format!("journal the use of candidate {static_key}/{action_key}"))
     }
 
     pub fn read_declared(&self, key: &str) -> Result<Option<DeclaredActionRecord>> {
@@ -1173,7 +1230,7 @@ impl Store {
             bail!("declared action key already exists with different content")
         }
         fs::create_dir_all(path.parent().context("declared path has no parent")?)?;
-        atomic_write(&path, &serde_json::to_vec_pretty(record)?)?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(record)?, self.durable())?;
         Ok(true)
     }
 
@@ -1206,7 +1263,7 @@ impl Store {
             }
             bail!("archive name is already bound to a different tree")
         }
-        atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)?;
+        atomic_write_with(&path, &serde_json::to_vec_pretty(manifest)?, self.durable())?;
         Ok(true)
     }
 
@@ -1312,7 +1369,11 @@ fn cleanup_orphan_temps(root: &Path, minimum_age: Duration) -> Result<()> {
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= minimum_age);
         if old_enough {
-            fs::remove_file(path)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
     }
     Ok(())
@@ -1322,48 +1383,67 @@ fn collect_paths(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     collect_paths_internal(root, files, false)
 }
 
+// The store changes while it is walked: a publication renames its `.tmp-`
+// file into place, and a collection deletes what it evicts. An entry listed
+// but gone by the time it is read was renamed or removed, and is skipped; on
+// a build host the bare ENOENT failed a whole collection and left the store
+// over its budget until the next one (2026-10-24).
 fn collect_paths_internal(
     root: &Path,
     files: &mut Vec<PathBuf>,
     include_temps: bool,
 ) -> Result<()> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        let metadata = fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink() {
-            bail!("store traversal encountered symlink: {}", path.display())
-        }
-        if metadata.is_dir() {
-            collect_paths_internal(&path, files, include_temps)?;
-        } else if metadata.is_file() {
-            if !include_temps
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(".tmp-"))
-            {
-                continue;
-            }
-            files.push(path);
-        } else {
-            bail!(
-                "store traversal encountered non-file entry: {}",
-                path.display()
-            )
-        }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        collect_path(entry?.path(), files, include_temps)?;
     }
     Ok(())
+}
+
+fn collect_path(path: PathBuf, files: &mut Vec<PathBuf>, include_temps: bool) -> Result<()> {
+    if !include_temps
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".tmp-"))
+    {
+        return Ok(());
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("store traversal encountered symlink: {}", path.display())
+    }
+    if metadata.is_dir() {
+        collect_paths_internal(&path, files, include_temps)
+    } else if metadata.is_file() {
+        files.push(path);
+        Ok(())
+    } else {
+        bail!(
+            "store traversal encountered non-file entry: {}",
+            path.display()
+        )
+    }
 }
 
 fn directory_bytes(root: &Path) -> Result<u64> {
     let mut files = Vec::new();
     collect_paths(root, &mut files)?;
-    files.into_iter().try_fold(0u64, |total, path| {
-        Ok(total.saturating_add(fs::metadata(path)?.len()))
-    })
+    files
+        .into_iter()
+        .try_fold(0u64, |total, path| match fs::metadata(path) {
+            Ok(metadata) => Ok(total.saturating_add(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(total),
+            Err(error) => Err(error.into()),
+        })
 }
 
 pub fn validate_relative_path(value: &str) -> Result<PathBuf> {
@@ -1469,8 +1549,58 @@ pub fn validate_declared_command(command: &[String]) -> Result<()> {
 }
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, bytes, true)
+}
+
+/// [`atomic_write`] for a restored build output (a compiler result, a build
+/// script's `OUT_DIR`, an archive tree): the temporary file and the atomic
+/// rename stay, and both fsyncs (the file, then its directory) go when
+/// `BELLOWS_SYNC_OUTPUTS=0`. A restored output can always be restored or
+/// built again, and a hit-heavy build restores thousands of them: on a build
+/// host writing 2000 files of 200 KB took 16.2 s with the two fsyncs and
+/// 0.4 s without, and its jobs sat idle waiting on the disk. The store's own
+/// records and blobs keep their fsyncs.
+pub fn atomic_write_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, bytes, sync_outputs())
+}
+
+/// [`atomic_write`] for the client's own state: its file-digest and compiler
+/// memos and its diagnostics history under the state directory. The atomic
+/// rename stays and the fsyncs go, always: every memo is keyed by what it
+/// describes and checked when read (a digest must be a content key, a compiler
+/// identity must not be empty), and a history that no longer parses starts
+/// again, so a write lost to a crash costs a recomputation or a diagnostics
+/// line, never a wrong result. On the Manifold build host these writes were
+/// 2.55 of its 4.3 fsyncs a second (ftrace of ext4_sync_file_enter, 2026-10-29).
+pub fn atomic_write_state(path: &Path, bytes: &[u8]) -> Result<()> {
+    atomic_write_with(path, bytes, false)
+}
+
+/// False when `BELLOWS_SYNC_OUTPUTS=0`: restored outputs skip their fsyncs.
+/// False when `BELLOWS_STORE_SYNC=0`: the store (bellowsd, or a local cache) writes blobs and records without
+/// their fsyncs. Every blob is digest-verified when it is read or found again, and a record that fails to parse is
+/// quarantined, so a write lost to a crash costs a cache miss, never a wrong result; what the fsyncs bought was
+/// only warmth after a host crash. On the Manifold build host they were about 14 disk flushes per stored result
+/// and drove its 90%+ busy stretches (r = 0.86 against the store events, 2026-10-28).
+/// While this file exists in a store's data directory, the store skips its fsyncs ([`Store::durable`]).
+pub const STORE_SYNC_OFF: &str = ".store-sync-off";
+
+pub fn store_durable() -> bool {
+    static DURABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DURABLE.get_or_init(|| std::env::var("BELLOWS_STORE_SYNC").as_deref() != Ok("0"))
+}
+
+pub fn sync_outputs() -> bool {
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("BELLOWS_SYNC_OUTPUTS").as_deref() != Ok("0"))
+}
+
+/// Writes `bytes` to a temporary file beside `path` and renames it into place;
+/// with `durable`, the file is synced before the rename and its directory
+/// after it.
+pub fn atomic_write_with(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     let parent = path.parent().context("destination has no parent")?;
-    fs::create_dir_all(parent)?;
+    fs::create_dir_all(parent).with_context(|| format!("create directory {}", parent.display()))?;
     let tmp = parent.join(format!(
         ".tmp-{}-{}-{}",
         std::process::id(),
@@ -1481,22 +1611,34 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let mut file = fs::OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("write {}", tmp.display()))?;
+        if durable {
+            file.sync_all()
+                .with_context(|| format!("sync {}", tmp.display()))?;
+            note_sync();
+        }
     }
+    let replaced = || format!("replace {} with {}", path.display(), tmp.display());
     match fs::rename(&tmp, path) {
-        Ok(()) => sync_parent(path),
+        Ok(()) if durable => {
+            sync_parent(path).with_context(|| format!("sync the directory of {}", path.display()))
+        }
+        Ok(()) => Ok(()),
         Err(error) if path.exists() => {
+            let what = replaced();
             let _ = fs::remove_file(&tmp);
             match fs::read(path) {
                 Ok(existing) if existing == bytes => Ok(()),
-                _ => Err(error.into()),
+                _ => Err(anyhow::Error::from(error).context(what)),
             }
         }
         Err(error) => {
+            let what = replaced();
             let _ = fs::remove_file(&tmp);
-            Err(error.into())
+            Err(anyhow::Error::from(error).context(what))
         }
     }
 }
@@ -1509,7 +1651,19 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
     #[cfg(not(unix))]
     let _ = path;
+    note_sync();
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The fsyncs this thread's atomic writes issued: what the tests count.
+    static SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn note_sync() {
+    #[cfg(test)]
+    SYNCS.with(|count| count.set(count.get() + 1));
 }
 
 #[derive(Clone, Debug)]
@@ -1745,6 +1899,59 @@ fn split_makefile_words(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_state_is_written_whole_and_without_fsyncs() {
+        let dir =
+            std::env::temp_dir().join(format!("bellows-state-{}-{}", std::process::id(), now_ms()));
+        let syncs = || SYNCS.with(|count| count.get());
+        let before = syncs();
+        atomic_write(&dir.join("store-record"), b"durable").unwrap();
+        assert_eq!(
+            syncs() - before,
+            2,
+            "a durable write syncs the file, then its directory"
+        );
+        let before = syncs();
+        let memo = dir
+            .join("state")
+            .join("digests-v1")
+            .join("ab")
+            .join("abcdef");
+        atomic_write_state(&memo, b"first").unwrap();
+        atomic_write_state(&memo, b"second").unwrap();
+        assert_eq!(syncs() - before, 0, "client state never syncs");
+        assert_eq!(fs::read(&memo).unwrap(), b"second");
+        let leftovers = fs::read_dir(memo.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "no temporary file is left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsynced_write_still_replaces_the_file_whole() {
+        let dir = std::env::temp_dir().join(format!(
+            "bellows-unsynced-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = dir.join("out").join("lib.rlib");
+        atomic_write_with(&path, b"first", false).unwrap();
+        atomic_write_with(&path, b"second", false).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        atomic_write_with(&path, b"third", true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"third");
+        let leftovers: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary file is left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn valid_candidate() -> ActionCandidate {
         let static_key = digest_bytes(b"static");
@@ -2330,6 +2537,20 @@ mod tests {
     }
 
     #[test]
+    fn verify_blob_streams_a_good_blob_and_rejects_a_corrupt_or_absent_one() {
+        let root = std::env::temp_dir().join(format!("bellows-verify-test-{}", now_ms()));
+        let store = Store::open(&root).unwrap();
+        let bytes = vec![7u8; 3 * 1024 * 1024 + 5];
+        let digest = digest_bytes(&bytes);
+        store.put_blob(&digest, &bytes).unwrap();
+        assert_eq!(store.verify_blob(&digest).unwrap(), bytes.len() as u64);
+        fs::write(store.blob_path(&digest).unwrap(), b"tampered").unwrap();
+        assert!(store.verify_blob(&digest).is_err());
+        assert!(store.verify_blob(&digest_bytes(b"never stored")).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn gc_preserves_a_recent_blob_during_record_publication() {
         let root = std::env::temp_dir().join(format!("bellows-gc-upload-test-{}", now_ms()));
         let store = Store::open(&root).unwrap();
@@ -2352,6 +2573,30 @@ mod tests {
         fs::write(&temp, b"partial json").unwrap();
         assert!(store.gc(0).is_ok());
         assert!(temp.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_store_walk_skips_entries_renamed_or_removed_after_the_listing() {
+        // What a collection sees when a publication renames its temporary
+        // file between `read_dir` and the entry's metadata: a listed path
+        // that is gone. The walk skips it instead of failing the collection.
+        let root = std::env::temp_dir().join(format!("bellows-walk-race-test-{}", now_ms()));
+        let directory = root.join("blobs").join("aa");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("kept"), b"blob").unwrap();
+        let mut files = Vec::new();
+        for include_temps in [false, true] {
+            files.clear();
+            collect_path(directory.join("renamed-away"), &mut files, include_temps).unwrap();
+            collect_path(directory.join(".tmp-1-2-3"), &mut files, include_temps).unwrap();
+            collect_path(root.join("removed-directory"), &mut files, include_temps).unwrap();
+            assert!(files.is_empty());
+        }
+        collect_paths_internal(&root.join("blobs").join("gone"), &mut files, false).unwrap();
+        collect_paths(&root.join("blobs"), &mut files).unwrap();
+        assert_eq!(files, vec![directory.join("kept")]);
+        assert_eq!(directory_bytes(&root.join("blobs")).unwrap(), 4);
         let _ = fs::remove_dir_all(root);
     }
 }

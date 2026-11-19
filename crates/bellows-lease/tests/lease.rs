@@ -25,8 +25,13 @@ impl Daemon {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        // Ready once it accepts a connection, not once the socket file exists:
+        // bind creates the file before listen, and a client connecting in that
+        // gap is refused and exits EX_TEMPFAIL (75), which failed
+        // an_exit_code_passes_through on a loaded build host (ready 8457). An
+        // empty connection is one the daemon closes at once.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(Instant::now() < deadline, "leased did not start");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -114,6 +119,12 @@ fn leases_on_one_machine_never_overlap() {
         let name = pair[0].strip_prefix("start-").expect("a start");
         assert_eq!(pair[1], format!("end-{name}"), "jobs overlapped: {lines:?}");
     }
+    // A client exits once it has told the daemon its job is done; the daemon
+    // logs the release after reading that, so the last one can land after the
+    // last client has exited (job 5237 read the log in between).
+    wait_until("the daemon to log the third release", || {
+        daemon.log().matches("\"event\":\"release\"").count() >= 3
+    });
     let log = daemon.log();
     assert_eq!(log.matches("\"event\":\"grant\"").count(), 3, "{log}");
     assert_eq!(log.matches("\"event\":\"release\"").count(), 3, "{log}");

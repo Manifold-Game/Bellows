@@ -23,7 +23,7 @@ use super::{
 use anyhow::{Context, Result, anyhow, bail};
 use bellows_core::{
     ActionCandidate, Artifact, EnvInput, FileInput, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
-    Store, StreamArtifact, atomic_write, compiler_action_key, digest_bytes, now_ms,
+    Store, StreamArtifact, atomic_write_output, compiler_action_key, digest_bytes, now_ms,
     validate_candidate_manifest, validate_relative_path,
 };
 use serde::{Deserialize, Serialize};
@@ -63,11 +63,23 @@ pub fn is_build_script_compile(crate_name: &str, out_dir: &Path) -> bool {
             .is_some_and(|name| name == "build")
 }
 
-/// Replace a freshly compiled or restored script with the launcher.
+/// Whether build-script runs go through the launcher: everything but `BELLOWS_BUILD_SCRIPTS=0`.
+fn build_scripts_enabled(setting: Option<&str>) -> bool {
+    setting != Some("0")
+}
+
+/// Replace a freshly compiled or restored script with the launcher, unless `BELLOWS_BUILD_SCRIPTS=0`.
 pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
-    if env::var("BELLOWS_BUILD_SCRIPTS").as_deref() == Ok("0") {
+    if !build_scripts_enabled(env::var("BELLOWS_BUILD_SCRIPTS").ok().as_deref()) {
         return Ok(());
     }
+    install_launcher_always(out_dir, unit_file)
+}
+
+/// The install itself, whatever the environment says: the tests call this, so they don't depend on a variable the
+/// caller's environment may set (Manifold's build host sets `BELLOWS_BUILD_SCRIPTS=0` for every job, and the launcher
+/// test failed there).
+fn install_launcher_always(out_dir: &Path, unit_file: &str) -> Result<()> {
     let script = out_dir.join(unit_file);
     let real_name = format!("{REAL_PREFIX}{unit_file}");
     let real = out_dir.join(&real_name);
@@ -96,7 +108,8 @@ pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
         let _ = fs::rename(&real, &script);
         return Err(error);
     }
-    atomic_write(
+    // The launcher's record lives in OUT_DIR with the launcher itself: a build output.
+    atomic_write_output(
         &out_dir.join(RECORD),
         &serde_json::to_vec(&LauncherRecord { real: real_name })?,
     )
@@ -875,7 +888,7 @@ fn restore(
     fs::create_dir_all(out_dir)?;
     for (relative, executable, bytes) in files {
         let destination = super::safe_destination(out_dir, &relative)?;
-        atomic_write(&destination, bytes)?;
+        atomic_write_output(&destination, bytes)?;
         super::set_file_executable(&destination, executable)?;
     }
     std::io::stdout().write_all(&identity.normalizer.localize_bytes(&stdout))?;
@@ -921,6 +934,15 @@ mod tests {
     }
 
     #[test]
+    fn only_bellows_build_scripts_zero_turns_the_launcher_off() {
+        // The caller's environment decides for live builds; the decision itself is pure, so this never reads it.
+        assert!(!build_scripts_enabled(Some("0")));
+        assert!(build_scripts_enabled(None));
+        assert!(build_scripts_enabled(Some("1")));
+        assert!(build_scripts_enabled(Some("")));
+    }
+
+    #[test]
     fn launchers_are_private_copies_and_removed_before_recompiling() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("build_script_build-abc");
@@ -932,7 +954,7 @@ mod tests {
             .unwrap()
             .set_modified(old)
             .unwrap();
-        install_launcher(temp.path(), "build_script_build-abc").unwrap();
+        install_launcher_always(temp.path(), "build_script_build-abc").unwrap();
         assert_eq!(fs::metadata(&script).unwrap().modified().unwrap(), old);
         // Writing through the installed launcher must not touch this
         // process's executable (an in-place linker write).
