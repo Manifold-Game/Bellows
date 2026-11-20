@@ -237,6 +237,37 @@ fn virtual_roots_are_told_apart_from_real_bellows_directories() {
 }
 
 #[test]
+fn local_mode_caches_when_cargo_config_turns_the_l1_off() {
+    // A daemon host's Cargo `[env]` turns the L1 off for every wrapper (Manifold's build host: `BELLOWS_L1 = "0"` and
+    // a `BELLOWS_STATE_DIR`). Local mode's only store is the L1, so it must stay on there: before, every compile
+    // missed with "built before, but its entry was evicted or never saved" and nothing was stored.
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let elsewhere = f.temp.path().join("daemon state");
+    fs::create_dir_all(f.workspace.join(".cargo")).unwrap();
+    fs::write(
+        f.workspace.join(".cargo/config.toml"),
+        format!(
+            "[env]\nBELLOWS_L1 = \"0\"\nBELLOWS_STATE_DIR = {:?}\n",
+            elsewhere.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    f.build();
+    f.clean();
+    let warm = stderr(&f.build());
+    assert!(warm.contains("LOCAL HIT"), "{warm}");
+    assert_eq!(f.value("target"), "42");
+    assert!(
+        !elsewhere
+            .join(format!("store-v{PROTOCOL_VERSION}"))
+            .exists()
+    );
+}
+
+#[test]
 fn explicit_target_directories_share_verified_library_outputs() {
     let f = Fixture::new(
         "pub fn value() -> u32 { 42 }",
@@ -3320,4 +3351,480 @@ fn the_same_compile_under_another_hold_label_is_a_hit() {
     );
     assert!(!log.contains("CARGO_HOLD"), "{log}");
     assert_eq!(f.value("target"), "42");
+}
+
+#[test]
+fn profile_environment_keys_a_compile_only_through_its_arguments() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 7 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.build();
+    f.clean();
+    // Release's own debuginfo setting, spelled as a variable: Cargo passes rustc the same arguments, so the units
+    // stored without it serve this build (a lane without CI's CARGO_PROFILE_*_DEBUG missed them, Manifold #100916).
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "0"),
+    );
+    // The gain: these hit only because the variable left the compile key (the old key missed them).
+    let same = f.explain(&["--latest", "--summary"]);
+    assert_eq!(same["decisions"]["l1_hit"], 2, "{same}");
+    assert!(same["decisions"].get("miss").is_none(), "{same}");
+    assert_eq!(f.value("target"), "7");
+    f.clean();
+    // A setting that changes the arguments never hits the old units: no stale hit. (This half held before the
+    // change too; it guards that dropping the variable didn't drop what it controls.)
+    let changed = stderr(&checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "1"),
+    ));
+    assert!(changed.contains("argument -C opt-level"), "{changed}");
+    let summary = f.explain(&["--latest", "--summary"]);
+    assert_eq!(summary["decisions"]["miss"], 2, "{summary}");
+    assert_eq!(f.value("target"), "7");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_library_path_that_finds_other_libraries_still_misses() {
+    // The session's checkout is normalized in a compile's LD_LIBRARY_PATH ($SESSION), so lanes share results; a
+    // value that names other directories, which could make a proc macro load other libraries, keeps its own key.
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 7 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let build = |libs: &Path| {
+        stderr(&checked(
+            f.local()
+                .args(["cargo", "build", "--release", "--offline"])
+                .env("LD_LIBRARY_PATH", libs),
+        ))
+    };
+    let outside_a = f.temp.path().join("libs-a");
+    let outside_b = f.temp.path().join("libs-b");
+    let inside_a = f.workspace.join("vendor").join("a");
+    let inside_b = f.workspace.join("vendor").join("b");
+    for dir in [&outside_a, &outside_b, &inside_a, &inside_b] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    build(&outside_a);
+    f.clean();
+    build(&outside_a);
+    let same = f.explain(&["--latest", "--summary"]);
+    assert!(same["decisions"].get("miss").is_none(), "{same}");
+    f.clean();
+    let other = build(&outside_b);
+    assert!(
+        other.contains("environment changed: LD_LIBRARY_PATH"),
+        "{other}"
+    );
+    f.clean();
+    build(&inside_a);
+    f.clean();
+    let moved = build(&inside_b);
+    assert!(
+        moved.contains("environment changed: LD_LIBRARY_PATH"),
+        "{moved}"
+    );
+    assert_eq!(f.value("target"), "7");
+}
+
+/// A build script may read any variable, so its run keeps CARGO_PROFILE_* in its key: unlike the compiles (which
+/// hit, their arguments being the same), the run misses when one changes.
+#[test]
+fn a_build_script_run_misses_on_a_profile_variable() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]
+name=\"fixture\"
+version=\"0.1.0\"
+edition=\"2024\"
+build=\"build.rs\"
+[workspace]
+",
+            ),
+            (
+                "build.rs",
+                "fn main() {
+    let out = std::env::var(\"OUT_DIR\").unwrap();
+    std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap();
+}
+",
+            ),
+        ],
+    );
+    f.lock();
+    let kinds = |name: &str| {
+        events(&f)
+            .into_iter()
+            .filter(|e| e.crate_name == name)
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    let build = |profile: Option<&str>| {
+        let mut command = f.local();
+        command.args(["cargo", "build", "--release", "--offline"]);
+        if let Some(value) = profile {
+            command.env("CARGO_PROFILE_RELEASE_DEBUG", value);
+        }
+        checked(&mut command);
+        f.clean();
+        kinds("build-script:fixture").len()
+    };
+    let first = build(None);
+    let again = build(None);
+    assert_eq!(kinds("build-script:fixture")[first..again], ["l1_hit"]);
+    let compiles_before = kinds("fixture").len();
+    let changed = build(Some("0"));
+    assert_eq!(
+        kinds("build-script:fixture")[again..changed]
+            .first()
+            .map(String::as_str),
+        Some("miss")
+    );
+    // The crate's own compiles still hit: their arguments are the same.
+    let compiles = kinds("fixture")[compiles_before..].to_vec();
+    assert!(
+        compiles.iter().any(|k| k == "l1_hit") && !compiles.iter().any(|k| k == "miss"),
+        "{compiles:?}"
+    );
+}
+
+/// A nested build (here a crate built by `--manifest-path` from outside its own checkout, as trybuild's project or a
+/// build script's `cargo install` is) inherits paths from the session that started it. `$SESSION` normalizes the
+/// session's checkout in them, so two sessions in different directories share the crate's results; a different
+/// directory inside the session still keys differently. Without `$SESSION` (the compile's own `$CHECKOUT` is the
+/// nested crate's directory, which those paths don't name) the two sessions miss each other.
+#[cfg(not(windows))]
+#[test]
+fn a_nested_builds_library_path_keys_the_session_not_its_location() {
+    let f = Fixture::new("pub fn value() -> u32 { 7 }", "fn main() {}");
+    let nested = f.temp.path().join("nested crate");
+    write_files(
+        &nested,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"nested\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+            ),
+            ("src/lib.rs", "pub fn nested() -> u32 { 3 }"),
+        ],
+    );
+    let manifest = nested.join("Cargo.toml");
+    let sessions = [
+        f.temp.path().join("lanes").join("horde"),
+        f.temp.path().join("lanes").join("ops"),
+    ];
+    for session in &sessions {
+        fs::create_dir_all(session.join("vendor").join("libs")).unwrap();
+        fs::create_dir_all(session.join("vendor").join("other")).unwrap();
+    }
+    let build = |session: &Path, libs: &str| {
+        let output = checked(
+            f.local()
+                .current_dir(session)
+                .args([
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--offline",
+                    "--manifest-path",
+                ])
+                .arg(&manifest)
+                .env("LD_LIBRARY_PATH", session.join("vendor").join(libs)),
+        );
+        let _ = fs::remove_dir_all(nested.join("target"));
+        stderr(&output)
+    };
+    build(&sessions[0], "libs");
+    let across = build(&sessions[1], "libs");
+    assert!(across.contains("LOCAL HIT nested"), "{across}");
+    assert!(!across.contains("MISS nested"), "{across}");
+    let other = build(&sessions[1], "other");
+    assert!(
+        other.contains("environment changed: LD_LIBRARY_PATH"),
+        "{other}"
+    );
+}
+
+/// Serves the package `dep` 0.1.0 from a local registry at `<temp>/registry`
+/// and makes the fixture's binary depend on it, with line tables so its
+/// library records the directory it was compiled in. Cargo unpacks the
+/// package into the `registry/src` of whichever home it is given, and runs
+/// rustc in the unpacked directory, as for any crates.io package.
+#[cfg(unix)]
+fn depend_on_registry_package(f: &Fixture) {
+    let source = f.temp.path().join("dep-source");
+    write_files(
+        &source,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\ndescription=\"fixture\"\nlicense=\"MIT\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod inner;\npub fn value() -> u32 { inner::value() }\npub fn here() -> &'static str { file!() }\n",
+            ),
+            ("src/inner.rs", "pub fn value() -> u32 { 7 }\n"),
+        ],
+    );
+    checked(f.command("cargo").current_dir(&source).args([
+        "package",
+        "--offline",
+        "--no-verify",
+        "--allow-dirty",
+    ]));
+    let registry = f.temp.path().join("registry");
+    let packaged = registry.join("dep-0.1.0.crate");
+    fs::create_dir_all(registry.join("index/3/d")).unwrap();
+    fs::copy(source.join("target/package/dep-0.1.0.crate"), &packaged).unwrap();
+    let sum = checked(f.command("sha256sum").arg(&packaged));
+    let sum = String::from_utf8(sum.stdout).unwrap();
+    let cksum = sum.split_whitespace().next().unwrap();
+    fs::write(
+        registry.join("index/3/d/dep"),
+        format!(
+            "{{\"name\":\"dep\",\"vers\":\"0.1.0\",\"deps\":[],\"cksum\":\"{cksum}\",\"features\":{{}},\"yanked\":false}}\n"
+        ),
+    )
+    .unwrap();
+    write_files(
+        &f.workspace,
+        &[(
+            ".cargo/config.toml",
+            &format!(
+                "[source.crates-io]\nreplace-with = \"fixture-registry\"\n[source.fixture-registry]\nlocal-registry = \"{}\"\n",
+                registry.display()
+            ),
+        )],
+    );
+    let manifest = f.workspace.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[workspace]",
+            "[dependencies]\ndep = \"0.1.0\"\n[profile.release]\ndebug = \"line-tables-only\"\n[workspace]",
+        ),
+    )
+    .unwrap();
+}
+
+/// The fixture's build with `home` as Cargo's home.
+#[cfg(unix)]
+fn build_in_home(f: &Fixture, home: &Path) -> Output {
+    checked(
+        f.local()
+            .env("CARGO_HOME", home)
+            .args(["cargo", "build", "--release", "--offline"]),
+    )
+}
+
+/// The library Cargo links the fixture's binary with for its dependency `dep`.
+#[cfg(unix)]
+fn dependency_library(f: &Fixture) -> Vec<u8> {
+    let deps = f.workspace.join("target/release/deps");
+    let path = fs::read_dir(&deps)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            name.starts_with("libdep-") && name.ends_with(".rlib")
+        })
+        .unwrap();
+    fs::read(path).unwrap()
+}
+
+/// Makes the fixture's binary depend on the package `dep` from a git
+/// repository at `<temp>/dep-repo`, with line tables as in
+/// `depend_on_registry_package`. The package sits in the repository's `dep`
+/// directory and reads a file beside it, outside its own directory, so its
+/// compile reads a file of the git checkout that only Cargo's home holds.
+#[cfg(unix)]
+fn depend_on_git_package(f: &Fixture) {
+    let repository = f.temp.path().join("dep-repo");
+    write_files(
+        &repository,
+        &[
+            (
+                "dep/Cargo.toml",
+                "[package]\nname=\"dep\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            (
+                "dep/src/lib.rs",
+                "pub fn value() -> u32 { include_str!(\"../../value.txt\").trim().parse().unwrap() }\npub fn here() -> &'static str { file!() }\n",
+            ),
+            ("value.txt", "7\n"),
+        ],
+    );
+    let git = |args: &[&str]| {
+        checked(
+            f.command("git")
+                .current_dir(&repository)
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "fixture"]);
+    let manifest = f.workspace.join("Cargo.toml");
+    let text = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        text.replace(
+            "[workspace]",
+            &format!(
+                "[dependencies]\ndep = {{ git = \"file://{}\" }}\n[profile.release]\ndebug = \"line-tables-only\"\n[workspace]",
+                repository.display()
+            ),
+        ),
+    )
+    .unwrap();
+}
+
+/// The build host gives each lane a Cargo home of its own, so that lanes stop
+/// waiting on one another's package-cache lock, with its registry and git
+/// directories linked to one shared home. A package that only Cargo's home
+/// holds (`dep`, set up by `depend`) compiled through a lane's home is the
+/// same compile as through the shared home: one key, and the same library,
+/// embedded paths included, so every lane and the shared home serve one
+/// another. `here` is the start and end of the path `dep::here()` reports.
+#[cfg(unix)]
+fn homes_serve_each_other(depend: fn(&Fixture), here: (&str, &str)) {
+    use std::os::unix::fs::symlink;
+
+    let mut f = Fixture::new(
+        "",
+        "fn main() { println!(\"{} {}\", dep::value(), dep::here()); }",
+    );
+    depend(&f);
+    let shared = f.temp.path().join("shared-home");
+    let lane = f.temp.path().join("lane-home");
+    let entries = ["registry/index", "registry/cache", "registry/src", "git"];
+    for entry in entries {
+        fs::create_dir_all(shared.join(entry)).unwrap();
+    }
+    fs::create_dir_all(lane.join("registry")).unwrap();
+    for entry in entries {
+        symlink(shared.join(entry), lane.join(entry)).unwrap();
+    }
+    // A git dependency is fetched (from a local repository) into the shared
+    // home here; a registry one is read from its local registry.
+    checked(
+        f.command("cargo")
+            .env("CARGO_HOME", &shared)
+            .args(["generate-lockfile"]),
+    );
+    // On the build host only the prepare's fetch writes the shared sources,
+    // before any build (pipeline-speed, wall-prepare). Unpack them the same
+    // way here, with plain Cargo into a target of its own, so that no source
+    // is written during the builds measured below: one written within
+    // `changed_during_compile`'s slack is rightly kept local, and on a fast
+    // machine Cargo unpacks `dep` just before compiling it (CI on #50).
+    checked(
+        f.command("cargo")
+            .env("CARGO_HOME", &shared)
+            .args(["build", "--release", "--offline", "--target-dir"])
+            .arg(f.temp.path().join("unpack-target")),
+    );
+    let shared_cache = f.temp.path().join("cache-shared");
+    let lane_cache = f.temp.path().join("cache-lane");
+
+    // Each home, with nothing cached, compiles the package itself.
+    f.cache = shared_cache.clone();
+    let cold = build_in_home(&f, &shared);
+    assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"], "{}", stderr(&cold));
+    let value = f.value("target");
+    assert!(
+        value.starts_with(&format!("7 {}", here.0)) && value.ends_with(here.1),
+        "{value}"
+    );
+    let library = dependency_library(&f);
+    let shared_info = dependency_dep_info(&f);
+    assert!(
+        shared_info.contains(&*shared.to_string_lossy()),
+        "{shared_info}"
+    );
+    f.clean();
+    f.cache = lane_cache.clone();
+    let cold = build_in_home(&f, &lane);
+    assert!(
+        !stderr(&cold).contains("symlinked compiler input"),
+        "{}",
+        stderr(&cold)
+    );
+    assert_eq!(decisions(&cold, "dep"), ["CACHE MISS"], "{}", stderr(&cold));
+    assert_eq!(f.value("target"), value);
+    // rustc was given the package through the lane's home.
+    let lane_info = dependency_dep_info(&f);
+    assert!(lane_info.contains(&*lane.to_string_lossy()), "{lane_info}");
+    // Byte for byte the same library: no path in it names the home.
+    assert!(
+        dependency_library(&f) == library,
+        "the lane's library differs from the shared home's"
+    );
+    f.clean();
+
+    // Each is served by the other's result, and runs as if it compiled. The
+    // restored dep-info names the files as rustc named them in that home, so
+    // Cargo watches what that home reads.
+    f.cache = shared_cache;
+    let warm = build_in_home(&f, &lane);
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    assert_eq!(f.value("target"), value);
+    assert!(dependency_library(&f) == library);
+    assert_eq!(
+        dependency_dep_info(&f).lines().next(),
+        lane_info.lines().next()
+    );
+    f.clean();
+    f.cache = lane_cache;
+    let warm = build_in_home(&f, &shared);
+    assert_eq!(decisions(&warm, "dep"), ["LOCAL HIT"], "{}", stderr(&warm));
+    assert_eq!(f.value("target"), value);
+    assert!(dependency_library(&f) == library);
+    assert_eq!(
+        dependency_dep_info(&f).lines().next(),
+        shared_info.lines().next()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lane_home_linked_to_the_shared_registry_shares_its_results_and_their_paths() {
+    homes_serve_each_other(
+        depend_on_registry_package,
+        ("/bellows/cargo-home/registry/src/", "/dep-0.1.0/src/lib.rs"),
+    );
+}
+
+/// A git dependency's checkout has a `.git` of its own: through either home
+/// it is Cargo's, never the compile's checkout, and the file it reads beside
+/// the package is named under `$CARGO_HOME` both ways.
+#[cfg(unix)]
+#[test]
+fn a_lane_home_linked_to_the_shared_git_checkouts_shares_their_results_and_paths() {
+    homes_serve_each_other(
+        depend_on_git_package,
+        ("/bellows/cargo-home/git/checkouts/", "/dep/src/lib.rs"),
+    );
 }

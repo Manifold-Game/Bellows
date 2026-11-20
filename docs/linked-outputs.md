@@ -274,7 +274,34 @@ Each one keeps the guarantees above.
   directory while Cargo passes the crate root through the link; that spelling
   is not remapped, so such a result embeds it and is pinned. There, a file
   outside the package directory (a sibling crate's) still bypasses. A link in
-  the path of the target directory or of Cargo's home bypasses as before.
+  the path of the target directory or of Cargo's home bypasses as before,
+  except at the entries a Cargo home shares (next item).
+- **A Cargo home that links to a shared one (0.3.17).** A build host may give
+  each concurrent build a Cargo home of its own, so that builds stop waiting on
+  one another's package-cache lock (`.package-cache`), with `registry/index`,
+  `registry/cache`, `registry/src` and `git` linked to one shared home. Every
+  registry package then reached the compiler through a link, and bypassed. A
+  link at one of the entries a home may share (`registry`, `registry/index`,
+  `registry/cache`, `registry/src`, `git`, `git/db`, `git/checkouts`, resolved
+  once per compile) is now followed, and a compile through such a home is the
+  same compile as through the shared home, with one key and the same output:
+  - An input below such an entry, outside the compile's own roots, keeps its
+    spelling through the link, so the record names it under `$CARGO_HOME`
+    (`$CARGO_HOME/git/checkouts/…`), exactly as a compile in the shared home
+    names it. Every compile derives its home from its own `CARGO_HOME`, and
+    inputs are compared by content, so a home whose link leads elsewhere is
+    checked against the files it reads itself. Below the entry the rule is
+    unchanged: a further link, or a `..` straight after the entry's link,
+    bypasses. A link at any other entry of the home bypasses as before.
+  - rustc runs in a registry package's directory, which the kernel reports by
+    its canonical path in the shared home. Its remapped working directory
+    (debuginfo's compilation directory) is its place in the compile's home
+    through the entry's link (`/bellows/cargo-home/registry/src/…`), the same
+    as through the shared home; it was `/bellows/checkout`, so one key held two
+    different libraries. Sources keep Cargo's spelling through the compile's
+    own home, which is remapped as `/bellows/cargo-home` as always.
+  - A git dependency's checkout in the shared home is never the compile's
+    checkout, through either home.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler

@@ -201,7 +201,9 @@ named the link's target would be trusted after the link moved. The exception
 is a link at or above the compile's own working directory or checkout, such
 as a project that reaches another checkout's packages through a linked folder.
 Those inputs are named relative to that root, which every compile derives for
-itself (see [linked outputs](docs/linked-outputs.md)). Unmodeled emit kinds and
+itself (see [linked outputs](docs/linked-outputs.md)). So are inputs below a
+Cargo home's registry or git entries linked to a shared home: they are named
+under `$CARGO_HOME`, and such a home shares the shared home's results. Unmodeled emit kinds and
 custom output destinations
 also bypass, so a successful hit always supplies the requested output set.
 Search paths that can supply crates (bare `-L`, `-L all=`, `-L crate=`), custom

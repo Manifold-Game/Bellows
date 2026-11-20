@@ -988,6 +988,10 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
         .args(arguments)
         .env("RUSTC_WRAPPER", &wrapper)
         .env("BELLOWS_LOCAL_ONLY", "1")
+        // Local mode's only store is the L1: `BELLOWS_L1=0` (a daemon setup's Cargo `[env]`, which Cargo applies to
+        // every wrapper, or the caller's environment) would make every compile publish nowhere, silently. Set here,
+        // it wins over `[env]`, which never replaces a variable the process already has.
+        .env("BELLOWS_L1", "1")
         .env("BELLOWS_WORKSPACE", &workspace)
         .env("BELLOWS_STATE_DIR", &state_dir)
         .env_remove("BELLOWS_SERVER")
@@ -2140,6 +2144,12 @@ struct Identity {
     /// This compile's working directory and checkout under every spelling
     /// that reaches them (see `own_roots`).
     own_roots: Vec<PathBuf>,
+    /// The known entries of this compile's Cargo home that link to a shared
+    /// home's (see `cargo_home_links`).
+    home_links: Vec<HomeLink>,
+    /// Those entries under every spelling of the home (see
+    /// `canonical_compiler_input`).
+    home_link_roots: Vec<PathBuf>,
     /// The `--diagnostic-width` rustc was given, if any.
     diagnostic_width: Option<String>,
 }
@@ -2672,19 +2682,75 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
 }
 
 fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNormalizer {
+    PathNormalizer::new(normalizer_bases(workspace, out_dir, source))
+}
+
+fn normalizer_bases(
+    workspace: &Path,
+    out_dir: &Path,
+    source: Option<&Path>,
+) -> Vec<(String, PathBuf)> {
     let mut bases = root_bases(workspace, out_dir, source);
-    let home = bellows_core::user_home();
-    if let Some(cargo_home) = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
-    {
+    if let Some(cargo_home) = cargo_home() {
         bases.push(("$CARGO_HOME".into(), canonical_base(cargo_home)));
     }
     bases.push(("$RUSTUP_HOME".into(), canonical_base(rustup_home())));
-    if let Some(home) = home {
+    if let Some(home) = bellows_core::user_home() {
         bases.push(("$HOME".into(), canonical_base(home)));
     }
+    bases
+}
+
+/// The normalizer for the environment a compile is keyed on: the compile's
+/// own bases, and the session's checkout as `$SESSION`.
+///
+/// A nested Cargo build inherits the outer build's paths. trybuild's project
+/// is built by a Cargo that a test started, and nextest gave that test an
+/// `LD_LIBRARY_PATH` naming the outer target's `deps` and build-script
+/// directories; a build script's `cargo install` inherits its own. A registry
+/// crate in the nested build has no checkout of its own (Cargo runs its rustc
+/// in the registry source), so those paths kept the checkout's location and
+/// every checkout keyed the same crate differently. Only the location is
+/// normalized: the rest of the value, and a path outside the session's
+/// checkout, stay keyed. Where the compile's own checkout is the session's,
+/// `$CHECKOUT` keeps naming it and the key does not change.
+///
+/// A compile reads a variable's value only through `env!` and
+/// `option_env!`, which dep-info records and the action key holds as given.
+/// A build-script run keeps its environment as it was: it may print a path
+/// it found there, and its restored output is localized without `$SESSION`.
+fn environment_normalizer(
+    workspace: &Path,
+    out_dir: &Path,
+    source: Option<&Path>,
+) -> PathNormalizer {
+    environment_normalizer_with(
+        normalizer_bases(workspace, out_dir, source),
+        session_checkout_of(env::var_os("BELLOWS_WORKSPACE")),
+    )
+}
+
+fn environment_normalizer_with(
+    mut bases: Vec<(String, PathBuf)>,
+    session: Option<PathBuf>,
+) -> PathNormalizer {
+    if let Some(session) = session {
+        bases.push(("$SESSION".into(), session));
+    }
     PathNormalizer::new(bases)
+}
+
+/// The checkout the session was launched in: the git checkout containing
+/// `BELLOWS_WORKSPACE` (which `bellows run` sets, and a build host that sets
+/// `RUSTC_WRAPPER` itself sets the same way), else that directory itself.
+/// None when it is unset or relative.
+fn session_checkout_of(launch: Option<OsString>) -> Option<PathBuf> {
+    let launch = PathBuf::from(launch?);
+    if !launch.is_absolute() {
+        return None;
+    }
+    let launch = canonical_base(launch);
+    Some(git_root(&launch).unwrap_or(launch))
 }
 
 /// The per-checkout roots: the workspace and the Cargo target directory.
@@ -2743,15 +2809,14 @@ fn root_bases(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> Vec<(S
 /// contains `dir`. Sources under Cargo's or rustup's home are never part of
 /// a checkout.
 fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    checkout_root_outside(dir, &managed_roots(cargo_home(), rustup_home()))
+}
+
+/// The checkout containing `dir` (see `checkout_root`), with `managed` the
+/// canonical directories that Cargo and rustup manage.
+fn checkout_root_outside(dir: &Path, managed: &[PathBuf]) -> Option<PathBuf> {
     let dir = canonical_base(dir.to_path_buf());
-    let cargo_home = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| bellows_core::user_home().map(|home| home.join(".cargo")));
-    if cargo_home
-        .into_iter()
-        .chain([rustup_home()])
-        .any(|managed| dir.starts_with(canonical_base(managed)))
-    {
+    if managed.iter().any(|managed| dir.starts_with(managed)) {
         return None;
     }
     git_root(&dir).or_else(|| {
@@ -2761,6 +2826,86 @@ fn checkout_root(dir: &Path) -> Option<PathBuf> {
             .map(canonical_base)
             .filter(|launch| dir.starts_with(launch))
     })
+}
+
+/// The directories Cargo and rustup manage, canonical: their homes, and each
+/// shared directory a known entry of Cargo's home links to (see
+/// `cargo_home_links`). A git dependency's checkout there has a `.git` of its
+/// own, and must not become the compile's checkout through one home and stay
+/// a Cargo-home package through another.
+fn managed_roots(cargo_home: Option<PathBuf>, rustup_home: PathBuf) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = cargo_home.map(canonical_base) {
+        roots.extend(cargo_home_links(&home).into_iter().map(|link| link.target));
+        roots.push(home);
+    }
+    roots.push(canonical_base(rustup_home));
+    roots
+}
+
+/// Cargo's home as Cargo finds it: `CARGO_HOME`, else `~/.cargo`.
+fn cargo_home() -> Option<PathBuf> {
+    env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| bellows_core::user_home().map(|home| home.join(".cargo")))
+}
+
+/// The entries of Cargo's home that one home may share with another by a
+/// link: the registry's index, package cache and unpacked sources, and git
+/// dependencies' databases and checkouts, or the directories holding them.
+/// The build host gives each lane a home of its own, so that lanes stop
+/// waiting on one another's package-cache lock (`.package-cache`, which stays
+/// in each home), with these linked to one shared home.
+const SHARED_CARGO_HOME_ENTRIES: [&str; 7] = [
+    "registry",
+    "registry/index",
+    "registry/cache",
+    "registry/src",
+    "git",
+    "git/db",
+    "git/checkouts",
+];
+
+/// A known entry of Cargo's home (see `SHARED_CARGO_HOME_ENTRIES`) that is a
+/// link to a directory right now.
+#[derive(Clone, Debug, PartialEq)]
+struct HomeLink {
+    entry: &'static str,
+    /// The canonical directory the link leads to.
+    target: PathBuf,
+}
+
+/// The entry `entry` (`/`-separated) of the Cargo home `home`.
+fn home_entry(home: &Path, entry: &str) -> PathBuf {
+    entry
+        .split('/')
+        .fold(home.to_path_buf(), |path, part| path.join(part))
+}
+
+/// The known entries of the canonical Cargo home `home` that link to a
+/// directory, resolved once per compile. A home that links none (the shared
+/// home itself, or any ordinary one) pays seven `lstat`s.
+fn cargo_home_links(home: &Path) -> Vec<HomeLink> {
+    SHARED_CARGO_HOME_ENTRIES
+        .into_iter()
+        .filter_map(|entry| {
+            let path = home_entry(home, entry);
+            if !fs::symlink_metadata(&path).ok()?.file_type().is_symlink() {
+                return None;
+            }
+            let target = path.canonicalize().ok().filter(|target| target.is_dir())?;
+            Some(HomeLink { entry, target })
+        })
+        .collect()
+}
+
+/// Each of `links` under each spelling of Cargo's home: the paths at which
+/// `canonical_compiler_input` follows a link.
+fn home_link_roots(home_spellings: &[PathBuf], links: &[HomeLink]) -> Vec<PathBuf> {
+    home_spellings
+        .iter()
+        .flat_map(|home| links.iter().map(|link| home_entry(home, link.entry)))
+        .collect()
 }
 
 /// The checkout a compile belongs to: the one containing its working
@@ -2916,11 +3061,27 @@ fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
 /// from its own working directory. A compile whose link points elsewhere is
 /// then checked against the files it reads itself. Below the root the rule is
 /// unchanged, so the rest of the path holds no link.
-fn canonical_compiler_input(path: &Path, own_roots: &[PathBuf]) -> Result<PathBuf> {
+///
+/// The other exception is a link at one of `home_links`: a known entry of this
+/// compile's Cargo home that leads to a shared home's (see
+/// `SHARED_CARGO_HOME_ENTRIES`). The input keeps the spelling through the
+/// link, so the record names it under `$CARGO_HOME`
+/// (`$CARGO_HOME/registry/src/…`), exactly as a compile in the shared home
+/// names it, and every compile derives its home afresh from its own
+/// `CARGO_HOME`: a compile whose link leads elsewhere is checked against the
+/// files it reads itself. Below the link the rule is unchanged.
+fn canonical_compiler_input(
+    path: &Path,
+    own_roots: &[PathBuf],
+    home_links: &[PathBuf],
+) -> Result<PathBuf> {
     let path = without_dot_segments(path)?;
     for ancestor in path.ancestors() {
         if own_roots.iter().any(|root| root == ancestor) {
             break;
+        }
+        if home_links.iter().any(|link| link == ancestor) {
+            return Ok(path);
         }
         if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
             bail!(
@@ -3228,8 +3389,15 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "remap",
         b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
-    let path_use = path_use(invocation, host_triple(&compiler.stdout).as_deref());
-    for (name, value) in compile_environment(&normalizer, &path_use) {
+    let host = host_triple(&compiler.stdout);
+    let path_use = path_use(invocation, host.as_deref());
+    let own_target = option_value(&invocation.args, "--target").or(host);
+    let environment_normalizer =
+        environment_normalizer(&workspace, &invocation.out_dir, crate_root);
+    for (name, value) in without_other_targets(
+        compile_environment(&environment_normalizer, &path_use),
+        own_target.as_deref(),
+    ) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
             format!("environment changed: {name}"),
@@ -3249,13 +3417,28 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         );
     }
     let own_roots = own_roots(&workspace, checkout.as_deref(), &root_normalizer);
+    let home_links = cargo_home()
+        .map(|home| cargo_home_links(&canonical_base(home)))
+        .unwrap_or_default();
+    let home_link_roots = home_link_roots(
+        &normalizer
+            .spellings("$CARGO_HOME")
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>(),
+        &home_links,
+    );
     let mut inputs = invocation.explicit_inputs.clone();
     inputs.extend(resolve_static_libraries(invocation, &workspace)?);
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace), &own_roots)
-            .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
+        let absolute = canonical_compiler_input(
+            &absolute_path(&path, &workspace),
+            &own_roots,
+            &home_link_roots,
+        )
+        .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
         let input_digest = digests.file(&absolute)?;
         components.insert(
             format!(
@@ -3307,6 +3490,8 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         diagnostic_width: diagnostic_width(&invocation.args),
         checkout,
         own_roots,
+        home_links,
+        home_link_roots,
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -3516,6 +3701,24 @@ fn without_shell(
         environment.remove("LD_LIBRARY_PATH");
         environment.remove("DYLD_LIBRARY_PATH");
     }
+    // Cargo's profile settings reach a compile only as the rustc arguments
+    // Cargo derives from them (`-C opt-level`, `-C debuginfo`,
+    // `-C debug-assertions`, `-C strip`, `-C codegen-units`, ...), and those
+    // are keyed; rustc never reads `CARGO_PROFILE_*`, and a crate that reads
+    // one with env!/option_env! is still tracked through dep-info. Keyed as
+    // well, a lane without CI's `CARGO_PROFILE_*_DEBUG=0` missed every unit
+    // whose arguments came out the same anyway (Manifold #100916: 12.9 h of
+    // missed compiles in four days). Build-script runs keep them.
+    //
+    // Untracked here, the same class as HOME and LANG above: a proc macro or a
+    // linker wrapper that reads CARGO_PROFILE_* (or another target's CC_*, see
+    // `own_target_environment`) at run time without env!/option_env!. A
+    // compile with a custom `--target` JSON spec bypasses the cache, so these
+    // rules never meet one. And since `$SESSION` normalizes a lane's own
+    // checkout in PATH and LD_LIBRARY_PATH, lane-local PATH shims (a wrapper
+    // directory inside the checkout) key the same in every lane: two lanes
+    // whose shims differ share results.
+    environment.retain(|name, _| !name.starts_with("CARGO_PROFILE_"));
     if !matches!(path_use, PathUse::Whole) {
         environment.remove("PATH");
     }
@@ -3523,6 +3726,55 @@ fn without_shell(
 }
 
 const SHELL_ENVIRONMENT: &[&str] = &["HOME", "LANG", "LC_ALL", "TZ"];
+
+/// The compile's environment without the variables Cargo and the cc crate scope to another target triple:
+/// `CARGO_TARGET_<TRIPLE>_{RUSTFLAGS,LINKER,RUNNER,RUSTDOCFLAGS}` and `AR_`, `CC_`, `CXX_`, `CFLAGS_`,
+/// `CXXFLAGS_`, `CPPFLAGS_`, `RANLIB_` with a lower-case `<triple>` (either `-` or `_` spelling). Cargo turns the
+/// unit's own target's flags into rustc arguments, which are keyed; another target's never reach this compile.
+/// Keyed, a Windows cross-check's `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS` split every Linux unit of a lane
+/// that sets it from the same unit elsewhere (Manifold #100054: 625 compile-minutes over 46 jobs, 2026-10-31). Its
+/// own target's variables stay: a proc macro may read one. Without a known target nothing is dropped. Build-script
+/// runs keep every variable.
+fn without_other_targets(
+    mut environment: BTreeMap<String, String>,
+    own_target: Option<&str>,
+) -> BTreeMap<String, String> {
+    let Some(own) = own_target else {
+        return environment;
+    };
+    environment.retain(|name, _| !scoped_to_another_target(name, own));
+    environment
+}
+
+const TARGET_SCOPED_CARGO: &[&str] = &["_RUSTFLAGS", "_LINKER", "_RUNNER", "_RUSTDOCFLAGS"];
+const TARGET_SCOPED_TOOLS: &[&str] = &[
+    "AR_",
+    "CC_",
+    "CXX_",
+    "CFLAGS_",
+    "CXXFLAGS_",
+    "CPPFLAGS_",
+    "RANLIB_",
+];
+
+fn scoped_to_another_target(name: &str, own: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("CARGO_TARGET_") {
+        let own_upper = own.to_ascii_uppercase().replace(['-', '.'], "_");
+        return TARGET_SCOPED_CARGO
+            .iter()
+            .any(|suffix| rest.ends_with(suffix) && rest.len() > suffix.len())
+            && !rest.starts_with(&format!("{own_upper}_"));
+    }
+    TARGET_SCOPED_TOOLS.iter().any(|prefix| {
+        name.strip_prefix(prefix).is_some_and(|triple| {
+            let looks_like_triple = triple.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')
+            }) && triple.chars().filter(|c| matches!(c, '-' | '_')).count()
+                >= 2;
+            looks_like_triple && triple.replace(['-', '.'], "_") != own.replace(['-', '.'], "_")
+        })
+    })
+}
 
 /// Where Cargo puts its outputs never changes what the compiler writes: the
 /// target directory is normalized out of the compile, and a crate that reads
@@ -3653,11 +3905,13 @@ fn is_relevant_environment_name(name: &str) -> bool {
     // started in, so keying it gave every checkout folder a cache of its own.
     const EXCLUDED_CARGO_CONTROL: &[&str] = &[
         "CARGO_BUILD_JOBS",
+        "CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY",
         "CARGO_HOLD_ACTIVE",
         "CARGO_HOLD_LABEL",
         "CARGO_HOLD_SKIP",
         "CARGO_HTTP_DEBUG",
         "CARGO_INCREMENTAL",
+        "CARGO_INSTALL_ROOT",
         "CARGO_LOG",
         "CARGO_LOG_PROFILE",
         "CARGO_LOG_PROFILE_CAPTURE",
@@ -3686,6 +3940,21 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "RUST_RECURSION_COUNT",
         "RUST_TEST_THREADS",
     ];
+    // Whole families of Cargo's own settings that steer how Cargo fetches, talks to registries, prints or caches,
+    // and never reach rustc's output: the sources they fetch are hashed as inputs anyway. Keyed, a lane that builds
+    // offline (CARGO_NET_OFFLINE, Manifold's build host, 2026-11-19) or behind a proxy split every unit from the
+    // same unit elsewhere, and a registry token would have entered a key's hash.
+    const EXCLUDED_CARGO_CONTROL_PREFIXES: &[&str] = &[
+        "CARGO_ALIAS_",
+        "CARGO_CACHE_",
+        "CARGO_CARGO_NEW_",
+        "CARGO_GC_",
+        "CARGO_HTTP_",
+        "CARGO_NET_",
+        "CARGO_REGISTRIES_",
+        "CARGO_REGISTRY_",
+        "CARGO_TERM_",
+    ];
     const PREFIXES: &[&str] = &[
         "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
         "LDFLAGS", "RUST",
@@ -3702,6 +3971,9 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     !BELLOWS_CONTROL.contains(&name)
         && !EXCLUDED_CARGO_CONTROL.contains(&name)
+        && !EXCLUDED_CARGO_CONTROL_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
         && (EXACT_ENVIRONMENT.contains(&name)
             || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
 }
@@ -4674,8 +4946,9 @@ fn capture_outputs(
                 absolute.display()
             )
         }
-        let absolute = canonical_compiler_input(&absolute, &identity.own_roots)
-            .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
+        let absolute =
+            canonical_compiler_input(&absolute, &identity.own_roots, &identity.home_link_roots)
+                .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         record(&absolute, true)?;
     }
     if let Some(text) = link_command {
@@ -4927,35 +5200,16 @@ fn remap_plan(identity: &Identity) -> Vec<(String, String)> {
             .iter()
             .find_map(|spelling| Path::new(spelling).canonicalize().ok())
     };
-    let relative = |path: &Path, root: &Path| {
-        path.strip_prefix(root).ok().map(|rest| {
-            rest.components()
-                .map(|part| part.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-        })
-    };
-    // Native separators below the virtual root, as rustc joins them.
-    let under = |base: &str, parts: Vec<String>| {
-        std::iter::once(base.to_owned())
-            .chain(parts)
-            .collect::<Vec<_>>()
-            .join(std::path::MAIN_SEPARATOR_STR)
-    };
     let cargo_home = usable(identity.normalizer.spellings("$CARGO_HOME"));
     let checkout = usable(identity.root_normalizer.spellings("$CHECKOUT"));
     let workspace = &identity.workspace;
     let checkout_root = canonical(&checkout);
-    let workspace_virtual = match (&checkout_root, canonical(&cargo_home)) {
-        (Some(root), _) if relative(workspace, root).is_some() => {
-            under("/bellows/checkout", relative(workspace, root).unwrap())
-        }
-        (_, Some(root)) if relative(workspace, &root).is_some() => {
-            under("/bellows/cargo-home", relative(workspace, &root).unwrap())
-        }
-        // Without a session checkout the working directory is the checkout.
-        (None, _) => "/bellows/checkout".to_owned(),
-        _ => "/bellows/workspace".to_owned(),
-    };
+    let workspace_virtual = workspace_virtual(
+        workspace,
+        checkout_root.as_deref(),
+        canonical(&cargo_home).as_deref(),
+        &identity.home_links,
+    );
     // rustc's working directory is exactly the wrapper's; the checkout is the
     // matching ancestor of it.
     let workspace_spelling = cwd
@@ -4983,6 +5237,62 @@ fn remap_plan(identity: &Identity) -> Vec<(String, String)> {
     .into_iter()
     .filter_map(|(spelling, virtual_root)| spelling.map(|spelling| (spelling, virtual_root)))
     .collect()
+}
+
+/// The virtual path of the compiler's working directory `workspace`
+/// (canonical): its place in the checkout, else in Cargo's canonical `home`,
+/// else the checkout itself when there is none. A package in a shared home
+/// that `home` reaches through one of its `links` (a registry package
+/// unpacked there: the compiler runs in it, and the kernel reports it by its
+/// canonical path) has its place in `home` through that link, the same
+/// virtual path as through the shared home itself, so neither home's output
+/// embeds a working directory of its own.
+fn workspace_virtual(
+    workspace: &Path,
+    checkout: Option<&Path>,
+    home: Option<&Path>,
+    links: &[HomeLink],
+) -> String {
+    let relative = |path: &Path, root: &Path| {
+        path.strip_prefix(root).ok().map(|rest| {
+            rest.components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+    };
+    // Native separators below the virtual root, as the compiler joins them.
+    let under = |base: &str, parts: Vec<String>| {
+        std::iter::once(base.to_owned())
+            .chain(parts)
+            .collect::<Vec<_>>()
+            .join(std::path::MAIN_SEPARATOR_STR)
+    };
+    if let Some(parts) = checkout.and_then(|root| relative(workspace, root)) {
+        return under("/bellows/checkout", parts);
+    }
+    let in_home = home.and_then(|home| {
+        relative(workspace, home).or_else(|| {
+            links.iter().find_map(|link| {
+                let rest = relative(workspace, &link.target)?;
+                Some(
+                    link.entry
+                        .split('/')
+                        .map(str::to_owned)
+                        .chain(rest)
+                        .collect(),
+                )
+            })
+        })
+    });
+    if let Some(parts) = in_home {
+        return under("/bellows/cargo-home", parts);
+    }
+    // Without a session checkout the working directory is the checkout.
+    if checkout.is_none() {
+        "/bellows/checkout".to_owned()
+    } else {
+        "/bellows/workspace".to_owned()
+    }
 }
 
 /// Remapping keeps checkout paths out of objects and debuginfo, but rustc
@@ -7152,6 +7462,8 @@ mod tests {
             virtual_env: BTreeMap::new(),
             checkout: None,
             own_roots: vec![workspace.to_path_buf()],
+            home_links: Vec::new(),
+            home_link_roots: Vec::new(),
             diagnostic_width: None,
         }
     }
@@ -7309,7 +7621,7 @@ mod tests {
         let spelled = link.join("pkg");
         let source = package.join("src").join("lib.rs");
         let refused = |path: &Path, roots: &[PathBuf]| {
-            let error = canonical_compiler_input(path, roots).unwrap_err();
+            let error = canonical_compiler_input(path, roots, &[]).unwrap_err();
             assert!(
                 format!("{error:#}").contains("symlinked compiler input is not cacheable"),
                 "{error:#}"
@@ -7317,18 +7629,19 @@ mod tests {
         };
 
         // No link on the way: as it always was, whatever the roots.
-        assert_eq!(canonical_compiler_input(&source, &[]).unwrap(), source);
+        assert_eq!(canonical_compiler_input(&source, &[], &[]).unwrap(), source);
         // Reached through the spelling of the compile's own root: the record
         // names the file under that root, so the link is the root's affair.
         let own = vec![package.clone(), spelled.clone()];
         assert_eq!(
-            canonical_compiler_input(&spelled.join("src").join("lib.rs"), &own).unwrap(),
+            canonical_compiler_input(&spelled.join("src").join("lib.rs"), &own, &[]).unwrap(),
             source
         );
         assert_eq!(
             canonical_compiler_input(
                 &spelled.join("src").join("..").join("src").join("lib.rs"),
-                &own
+                &own,
+                &[]
             )
             .unwrap(),
             source
@@ -7353,7 +7666,7 @@ mod tests {
         refused(&sibling, &own);
         let with_checkout = [own, vec![real.clone(), link.clone()]].concat();
         assert_eq!(
-            canonical_compiler_input(&sibling, &with_checkout).unwrap(),
+            canonical_compiler_input(&sibling, &with_checkout, &[]).unwrap(),
             real.join("shared").join("data.txt")
         );
         // `..` straight after a link is not judged by its spelling.
@@ -7417,6 +7730,203 @@ mod tests {
         let plain = PathNormalizer::new(vec![("$WORKSPACE".into(), package.clone())]);
         assert_eq!(link_spelling(&plain, "$WORKSPACE", &package), None);
         assert_eq!(own_roots(&package, None, &plain).len(), 2);
+    }
+
+    /// A shared Cargo home `<root>/shared` holding a registry package and a
+    /// git checkout, and a lane's home `<root>/lane` whose registry index,
+    /// cache and sources and git directory link to the shared ones, as the
+    /// build host gives each lane a home of its own. The lane's home also has
+    /// a link at an entry Cargo's homes never share (`vendor`), and the shared
+    /// package a link of its own (`selected`). Returns the canonical shared
+    /// and lane homes.
+    #[cfg(unix)]
+    fn lane_home(temp: &Path) -> (PathBuf, PathBuf) {
+        let root = temp.canonicalize().unwrap();
+        let shared = root.join("shared");
+        let lane = root.join("lane");
+        let package = shared.join("registry/src/index-1/pkg-0.1.0");
+        let checkout = shared.join("git/checkouts/repo-1/abc");
+        for (directory, file) in [
+            (package.join("src"), "lib.rs"),
+            (checkout.join("crate/src"), "lib.rs"),
+            (checkout.clone(), "README.md"),
+            (root.join("outside"), "value.rs"),
+        ] {
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join(file), "contents").unwrap();
+        }
+        fs::create_dir_all(checkout.join(".git")).unwrap();
+        for entry in ["registry/index", "registry/cache"] {
+            fs::create_dir_all(shared.join(entry)).unwrap();
+        }
+        fs::create_dir_all(lane.join("registry")).unwrap();
+        for entry in ["registry/index", "registry/cache", "registry/src", "git"] {
+            link_dir(&shared.join(entry), &lane.join(entry));
+        }
+        link_dir(&root.join("outside"), &lane.join("vendor"));
+        link_dir(&root.join("outside"), &package.join("selected"));
+        (shared, lane)
+    }
+
+    /// How a compile whose Cargo home is `home` names `file` (a path below
+    /// the home) in its records.
+    #[cfg(unix)]
+    fn recorded_in_home(home: &Path, file: &str) -> Result<String> {
+        let links = home_link_roots(&[home.to_path_buf()], &cargo_home_links(home));
+        let input = canonical_compiler_input(&home.join(file), &[], &links)?;
+        Ok(
+            PathNormalizer::new(vec![("$CARGO_HOME".into(), home.to_path_buf())])
+                .normalize(&input.to_string_lossy()),
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lane_home_names_the_shared_registry_as_the_shared_home_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let (shared, lane) = lane_home(temp.path());
+        // The lane's links are found, each with the directory it leads to;
+        // the shared home has none.
+        let links = cargo_home_links(&lane);
+        assert_eq!(
+            links.iter().map(|link| link.entry).collect::<Vec<_>>(),
+            ["registry/index", "registry/cache", "registry/src", "git"]
+        );
+        for link in &links {
+            assert_eq!(link.target, shared.join(link.entry));
+        }
+        assert!(cargo_home_links(&shared).is_empty());
+        // A file read through the lane's links is recorded under the lane's
+        // `$CARGO_HOME`, by the path that reaches it, exactly as the shared
+        // home records it: one record serves both, and each compile reads
+        // the file its own home leads to when the record is checked.
+        for file in [
+            "registry/src/index-1/pkg-0.1.0/src/lib.rs",
+            "git/checkouts/repo-1/abc/README.md",
+        ] {
+            let through_shared = recorded_in_home(&shared, file).unwrap();
+            assert_eq!(through_shared, format!("$CARGO_HOME/{file}"));
+            assert_eq!(recorded_in_home(&lane, file).unwrap(), through_shared);
+            assert_eq!(
+                canonical_compiler_input(
+                    &lane.join(file),
+                    &[],
+                    &home_link_roots(std::slice::from_ref(&lane), &links)
+                )
+                .unwrap(),
+                lane.join(file)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_elsewhere_in_a_lane_homes_path_still_bypasses() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, lane) = lane_home(temp.path());
+        let refused = |file: &str| {
+            let error = recorded_in_home(&lane, file).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("symlinked compiler input is not cacheable"),
+                "{file}: {error:#}"
+            );
+        };
+        // A link below a shared entry loses what it pointed at, as before.
+        refused("registry/src/index-1/pkg-0.1.0/selected/value.rs");
+        // `..` straight after a shared entry's link is not judged by its
+        // spelling.
+        refused("registry/src/../src/index-1/pkg-0.1.0/src/lib.rs");
+        // Outside Cargo's home the shared entries mean nothing: a link in a
+        // checkout's path bypasses as before.
+        let checkout = temp.path().canonicalize().unwrap().join("checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        link_dir(&lane.join("registry/src"), &checkout.join("registry"));
+        let links = home_link_roots(std::slice::from_ref(&lane), &cargo_home_links(&lane));
+        let error = canonical_compiler_input(
+            &checkout.join("registry/index-1/pkg-0.1.0/src/lib.rs"),
+            &[],
+            &links,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("symlinked compiler input is not cacheable"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_at_an_entry_cargo_never_shares_still_bypasses() {
+        let temp = tempfile::tempdir().unwrap();
+        let (_, lane) = lane_home(temp.path());
+        // `vendor` leads out of every home; only the registry's and git's
+        // entries are a home's to share.
+        assert!(
+            !cargo_home_links(&lane)
+                .iter()
+                .any(|link| link.entry == "vendor")
+        );
+        let error = recorded_in_home(&lane, "vendor/value.rs").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("symlinked compiler input is not cacheable"),
+            "{error:#}"
+        );
+        // A known entry that leads to a file, or nowhere, is no shared
+        // directory either.
+        let other = temp.path().canonicalize().unwrap().join("other-home");
+        fs::create_dir_all(&other).unwrap();
+        std::os::unix::fs::symlink(lane.join("vendor/value.rs"), other.join("registry")).unwrap();
+        std::os::unix::fs::symlink(other.join("missing"), other.join("git")).unwrap();
+        assert!(cargo_home_links(&other).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_package_reached_through_a_lane_home_remaps_as_through_the_shared_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let (shared, lane) = lane_home(temp.path());
+        // rustc runs in a registry package's directory, which the kernel
+        // reports by its canonical path: inside the shared home, whichever
+        // home Cargo was given. Its virtual path must be the same either
+        // way, or each home's output embeds a different working directory
+        // (debuginfo's compilation directory) under one key.
+        for (workspace, virtual_path) in [
+            (
+                shared.join("registry/src/index-1/pkg-0.1.0"),
+                "/bellows/cargo-home/registry/src/index-1/pkg-0.1.0",
+            ),
+            (
+                shared.join("git/checkouts/repo-1/abc/crate"),
+                "/bellows/cargo-home/git/checkouts/repo-1/abc/crate",
+            ),
+        ] {
+            for home in [&shared, &lane] {
+                assert_eq!(
+                    workspace_virtual(
+                        &workspace,
+                        None,
+                        Some(home.as_path()),
+                        &cargo_home_links(home)
+                    ),
+                    virtual_path,
+                    "{home:?}"
+                );
+                // Nor is a git dependency's checkout ever the compile's own.
+                let managed = managed_roots(Some(home.clone()), temp.path().join("rustup"));
+                assert_eq!(checkout_root_outside(&workspace, &managed), None);
+            }
+        }
+        // A directory outside both homes keeps the virtual root it had.
+        let outside = temp.path().canonicalize().unwrap().join("outside");
+        assert_eq!(
+            workspace_virtual(
+                &outside,
+                None,
+                Some(lane.as_path()),
+                &cargo_home_links(&lane)
+            ),
+            "/bellows/checkout"
+        );
     }
 
     #[test]
@@ -8511,6 +9021,87 @@ release: 1.92.0
     }
 
     #[test]
+    fn a_nested_builds_inherited_paths_key_the_same_in_every_checkout() {
+        // Two build-host lanes under one home, each a git checkout. A registry
+        // crate in trybuild's nested build sees nextest's LD_LIBRARY_PATH:
+        // the nested target's deps, then the outer target's build-script
+        // and deps directories inside the lane.
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let lane = |name: &str| {
+            let root = home.join("lanes").join(name);
+            fs::create_dir_all(root.join(".git")).unwrap();
+            fs::create_dir_all(root.join("target/test-fast/deps")).unwrap();
+            root
+        };
+        let (horde, ops) = (lane("horde"), lane("gameplay-ops"));
+        let library_path = |root: &Path, build_dir: &str| {
+            let root = root.display();
+            format!(
+                "/nested/debug/deps:{root}/target/test-fast/build/{build_dir}/out:\
+                 {root}/target/test-fast/deps:{root}/target/test-fast"
+            )
+        };
+        let key = |root: &Path, build_dir: &str, launch: Option<&Path>| {
+            let normalizer = environment_normalizer_with(
+                vec![("$HOME".into(), home.clone())],
+                session_checkout_of(launch.map(|launch| launch.as_os_str().to_owned())),
+            );
+            relevant_environment_of(
+                [("LD_LIBRARY_PATH".to_string(), library_path(root, build_dir))],
+                &normalizer,
+                false,
+            )
+        };
+        // Without a session each lane keyed its own location below $HOME.
+        assert_ne!(key(&horde, "ring-1", None), key(&ops, "ring-1", None));
+        // With the session's checkout named, every lane keys the same value,
+        // also when the session was launched in a subdirectory.
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde)),
+            key(&ops, "ring-1", Some(&ops))
+        );
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde.join("target"))),
+            key(&ops, "ring-1", Some(&ops))
+        );
+        assert_eq!(
+            key(&horde, "ring-1", Some(&horde))["LD_LIBRARY_PATH"],
+            "/nested/debug/deps:$SESSION/target/test-fast/build/ring-1/out:\
+             $SESSION/target/test-fast/deps:$SESSION/target/test-fast"
+        );
+        // Only the location is normalized: a different directory inside the
+        // checkout still keys differently.
+        assert_ne!(
+            key(&horde, "ring-1", Some(&horde)),
+            key(&ops, "ring-2", Some(&ops))
+        );
+        // Another checkout's path stays absolute.
+        assert_ne!(
+            key(&horde, "ring-1", Some(&ops)),
+            key(&ops, "ring-1", Some(&ops))
+        );
+    }
+
+    #[test]
+    fn the_session_checkout_leaves_a_compiles_own_checkout_as_it_was() {
+        let temp = tempfile::tempdir().unwrap();
+        let lane = temp.path().canonicalize().unwrap().join("lane");
+        fs::create_dir_all(lane.join(".git")).unwrap();
+        let own = environment_normalizer_with(
+            vec![("$CHECKOUT".into(), lane.clone())],
+            session_checkout_of(Some(lane.clone().into_os_string())),
+        );
+        let value = format!("{}/target/test-fast/deps", lane.display());
+        assert_eq!(own.normalize(&value), "$CHECKOUT/target/test-fast/deps");
+        // No session, or a relative one, adds nothing.
+        assert_eq!(session_checkout_of(None), None);
+        assert_eq!(session_checkout_of(Some("lanes/horde".into())), None);
+        let none = environment_normalizer_with(Vec::new(), None);
+        assert_eq!(none.normalize(&value), value);
+    }
+
+    #[test]
     fn windows_keys_each_variable_in_one_spelling() {
         let normalizer = PathNormalizer::new(Vec::new());
         let vars = || {
@@ -8544,6 +9135,89 @@ release: 1.92.0
     }
 
     #[test]
+    fn profile_settings_leave_a_compile_key_but_not_a_build_script_run() {
+        let environment: BTreeMap<String, String> = [
+            ("CARGO_PROFILE_TEST_DEBUG", "0"),
+            ("CARGO_PROFILE_DEV_DEBUG", "0"),
+            ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "1"),
+            ("CARGO_PKG_NAME", "demo"),
+            ("RUSTFLAGS", "-Dwarnings"),
+        ]
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .into_iter()
+        .collect();
+        // A compile's key: the arguments Cargo derived from them are keyed instead.
+        let compile = without_shell(environment.clone(), &PathUse::None);
+        assert_eq!(
+            compile.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["CARGO_PKG_NAME", "RUSTFLAGS"]
+        );
+        // A build script may read them at run time: its run keeps them.
+        for name in environment.keys() {
+            assert!(is_relevant_environment_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_compile_keeps_only_its_own_targets_scoped_variables() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let all = env(&[
+            (
+                "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+                "-D warnings",
+            ),
+            ("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER", "lld-link"),
+            (
+                "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+                "-D warnings",
+            ),
+            ("AR_x86_64_pc_windows_msvc", "llvm-lib"),
+            ("CC_x86_64-pc-windows-msvc", "clang-cl"),
+            ("CC_x86_64_unknown_linux_gnu", "cc"),
+            ("CC_ENABLE_DEBUG_OUTPUT", "1"),
+            ("CARGO_TARGET_DIR", "/t"),
+            ("CARGO_ENCODED_RUSTFLAGS", "-Dwarnings"),
+            ("RUSTFLAGS", "-Dwarnings"),
+        ]);
+        let linux = without_other_targets(all.clone(), Some("x86_64-unknown-linux-gnu"));
+        // Another target's flags and tools never reach a Linux unit.
+        for gone in [
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+            "AR_x86_64_pc_windows_msvc",
+            "CC_x86_64-pc-windows-msvc",
+        ] {
+            assert!(!linux.contains_key(gone), "{gone}");
+        }
+        // Its own target's, the unscoped lint flags and anything that isn't a triple stay.
+        for kept in [
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            "CC_x86_64_unknown_linux_gnu",
+            "CC_ENABLE_DEBUG_OUTPUT",
+            "CARGO_TARGET_DIR",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "RUSTFLAGS",
+        ] {
+            assert!(linux.contains_key(kept), "{kept}");
+        }
+        // The Windows unit keeps the Windows variables and drops the Linux ones.
+        let windows = without_other_targets(all.clone(), Some("x86_64-pc-windows-msvc"));
+        assert!(windows.contains_key("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"));
+        assert!(windows.contains_key("CC_x86_64-pc-windows-msvc"));
+        assert!(!windows.contains_key("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
+        // wasm32 keeps neither host's.
+        let wasm = without_other_targets(all.clone(), Some("wasm32-unknown-unknown"));
+        assert!(!wasm.contains_key("CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS"));
+        // Without a known target nothing is dropped.
+        assert_eq!(without_other_targets(all.clone(), None), all);
+    }
+
+    #[test]
     fn excludes_per_run_ci_environment_from_static_keys() {
         assert!(!is_relevant_environment_name("GITHUB_RUN_ID"));
         assert!(!is_relevant_environment_name("GITHUB_ENV"));
@@ -8563,8 +9237,47 @@ release: 1.92.0
         assert!(!is_relevant_environment_name(
             "CARGO_NET_GIT_FETCH_WITH_CLI"
         ));
+        // How Cargo fetches, talks to registries, prints and caches never keys a unit: an offline lane, a proxy
+        // or a registry token must not split a cache (Manifold's build host, 2026-11-19).
+        for control in [
+            "CARGO_NET_OFFLINE",
+            "CARGO_NET_RETRY",
+            "CARGO_NET_SSH_KNOWN_HOSTS",
+            "CARGO_HTTP_PROXY",
+            "CARGO_HTTP_TIMEOUT",
+            "CARGO_HTTP_MULTIPLEXING",
+            "CARGO_REGISTRIES_CRATES_IO_PROTOCOL",
+            "CARGO_REGISTRY_TOKEN",
+            "CARGO_TERM_UNICODE",
+            "CARGO_TERM_HYPERLINKS",
+            "CARGO_CACHE_AUTO_CLEAN_FREQUENCY",
+            "CARGO_GC_AUTO_FREQUENCY",
+            "CARGO_ALIAS_B",
+            "CARGO_CARGO_NEW_VCS",
+            "CARGO_INSTALL_ROOT",
+            "CARGO_FUTURE_INCOMPAT_REPORT_FREQUENCY",
+        ] {
+            assert!(
+                !is_relevant_environment_name(control),
+                "{control} never reaches rustc"
+            );
+        }
+        // Cargo's settings that do reach rustc's output, and the variables Cargo sets for a crate, stay keyed.
+        for keyed in [
+            "CARGO_PKG_VERSION",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_CRATE_NAME",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_CFG_TARGET_OS",
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER",
+            "CARGO_HOME",
+            "CARGO_UNSTABLE_BUILD_STD",
+        ] {
+            assert!(is_relevant_environment_name(keyed), "{keyed} stays keyed");
+        }
         // What changes rustc's output stays in the key: flags (lints included, since a cached result replays its
-        // diagnostics) and profile settings.
+        // diagnostics) and profile settings (a build-script run's key; a compile keys the arguments Cargo derives
+        // from them, see without_shell).
         for compile in [
             "CARGO_ENCODED_RUSTFLAGS",
             "CARGO_PROFILE_DEV_DEBUG",

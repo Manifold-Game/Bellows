@@ -478,6 +478,9 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
         // A build script's inputs are found by walking its package, never
         // through `canonical_compiler_input`.
         own_roots: Vec::new(),
+        // Nor does it remap paths (see `remap_plan`).
+        home_links: Vec::new(),
+        home_link_roots: Vec::new(),
         checkout,
         diagnostic_width: None,
     })
