@@ -7811,7 +7811,7 @@ mod tests {
                 canonical_compiler_input(
                     &lane.join(file),
                     &[],
-                    &home_link_roots(&[lane.clone()], &links)
+                    &home_link_roots(std::slice::from_ref(&lane), &links)
                 )
                 .unwrap(),
                 lane.join(file)
@@ -7841,7 +7841,7 @@ mod tests {
         let checkout = temp.path().canonicalize().unwrap().join("checkout");
         fs::create_dir_all(&checkout).unwrap();
         link_dir(&lane.join("registry/src"), &checkout.join("registry"));
-        let links = home_link_roots(&[lane.clone()], &cargo_home_links(&lane));
+        let links = home_link_roots(std::slice::from_ref(&lane), &cargo_home_links(&lane));
         let error = canonical_compiler_input(
             &checkout.join("registry/index-1/pkg-0.1.0/src/lib.rs"),
             &[],
