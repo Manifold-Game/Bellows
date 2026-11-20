@@ -3734,6 +3734,18 @@ fn homes_serve_each_other(depend: fn(&Fixture), here: (&str, &str)) {
             .env("CARGO_HOME", &shared)
             .args(["generate-lockfile"]),
     );
+    // On the build host only the prepare's fetch writes the shared sources,
+    // before any build (pipeline-speed, wall-prepare). Unpack them the same
+    // way here, with plain Cargo into a target of its own, so that no source
+    // is written during the builds measured below: one written within
+    // `changed_during_compile`'s slack is rightly kept local, and on a fast
+    // machine Cargo unpacks `dep` just before compiling it (CI on #50).
+    checked(
+        f.command("cargo")
+            .env("CARGO_HOME", &shared)
+            .args(["build", "--release", "--offline", "--target-dir"])
+            .arg(f.temp.path().join("unpack-target")),
+    );
     let shared_cache = f.temp.path().join("cache-shared");
     let lane_cache = f.temp.path().join("cache-lane");
 
