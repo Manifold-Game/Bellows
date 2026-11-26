@@ -324,3 +324,25 @@ establish parity for every downstream workflow or Windows configuration.
 
 The wire and on-disk formats are versioned but not yet stable. Review the
 [protocol policy](docs/protocol.md) before upgrading a running service.
+
+## Unit tests live under `tests/src`
+
+A Rust file under `src/` holds product code only. The unit tests of `src/<path>/<file>.rs`
+are in `tests/src/<path>/<file>_test.rs` of the same crate, and the source file ends with a
+pointer to them:
+
+```rust
+#[cfg(test)]
+#[path = "../tests/src/<path>/<file>_test.rs"]
+mod tests;
+```
+
+The path climbs one `../` per folder between the source file and the crate. The tests stay a
+child module of the source file, so `use super::*;` and private items work as in an in-file
+module. A test module inside an inline module (`mod store { .. }`) points the same way, and
+the inline module carries `#[path = "."]`.
+
+`python3 scripts/split_tests.py <paths>` moves a file's test modules there, and corrects the pointer and
+the test file's place after a source file moves. Run `cargo fmt` afterwards. `python3 scripts/split_tests.py --check crates`
+only reports and exits 1 when something would move; CI runs it. The script is a copy of the
+engine's `tools/dev/split_tests.py` (Manifold-Game/manifold); change it there.
