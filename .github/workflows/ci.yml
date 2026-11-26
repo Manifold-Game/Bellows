@@ -38,6 +38,7 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
+      - run: python3 scripts/split_tests.py --check crates
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --bins --release --locked
